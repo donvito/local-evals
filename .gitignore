@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.evalforge/
+*.db
+*.db-shm
+*.db-wal
+
+# Local data, exports, and credentials (never source-control these).
+datasets/
+my-results/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.credentials.key
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Local tooling state and generated diagnostics.
+.codex/
+.playwright-mcp/
+.tmp-*/
+coverage/
+playwright-report/
+test-results/
+*.log
+*.tsbuildinfo
+.DS_Store

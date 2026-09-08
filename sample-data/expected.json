@@ -1,0 +1,74 @@
+{
+  "invoice-001": {
+    "vendor": "PINECONE OFFICE CO.",
+    "invoiceNumber": "SYN-1001",
+    "date": "2025-01-15",
+    "billTo": "Harbor Labs",
+    "purchaseOrder": "PO-77",
+    "lineItems": [
+      {
+        "description": "Notebook",
+        "quantity": 4,
+        "unitPrice": 7.5,
+        "amount": 30
+      },
+      {
+        "description": "Desk Lamp",
+        "quantity": 2,
+        "unitPrice": 18,
+        "amount": 36
+      }
+    ],
+    "subtotal": 66,
+    "tax": 6.6,
+    "total": 72.6
+  },
+  "invoice-002": {
+    "vendor": "RIVERSTONE GOODS",
+    "invoiceNumber": "SYN-2048",
+    "date": "2025-06-30",
+    "billTo": null,
+    "purchaseOrder": "",
+    "lineItems": [
+      {
+        "description": "Packing Tape",
+        "quantity": 10,
+        "unitPrice": 3.25,
+        "amount": 32.5
+      },
+      {
+        "description": "Shipping Labels",
+        "quantity": 5,
+        "unitPrice": 4.4,
+        "amount": 22
+      }
+    ],
+    "subtotal": 54.5,
+    "tax": null,
+    "total": 54.5
+  },
+  "invoice-003": {
+    "vendor": "ORBITAL RESEARCH SUPPLY",
+    "invoiceNumber": "SYN-3099",
+    "date": "2026-02-03",
+    "billTo": "Northwind Analytics",
+    "purchaseOrder": "PO-902",
+    "lineItems": [
+      {
+        "description": "Calibration Kit",
+        "quantity": 1,
+        "unitPrice": 125,
+        "amount": 125
+      },
+      {
+        "description": "Sensor Cable",
+        "quantity": 6,
+        "unitPrice": 14.75,
+        "amount": 88.5
+      }
+    ],
+    "subtotal": 213.5,
+    "tax": 21.35,
+    "total": 234.85
+  }
+}

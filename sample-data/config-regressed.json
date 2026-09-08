@@ -1,0 +1,16 @@
+{
+  "datasetVersion": "synthetic-invoices-v2",
+  "schemaVersion": "synthetic-invoice-schema-draft7-v2",
+  "schemaPath": "schema.json",
+  "outputMode": "schema-constrained-json",
+  "stagePrompts": {
+    "ocr": "Transcribe every visible word, number, and table value from this synthetic invoice. Return plain text only.",
+    "extraction": "Extract the invoice from the transcription into JSON. Preserve null and empty-string optional values exactly."
+  },
+  "ocrTarget": { "name": "local-mock-vision", "baseUrl": "http://127.0.0.1:8099/v1", "model": "mock-vision-extraction", "supportsVision": true },
+  "extractionTarget": { "name": "local-mock-regressed-extraction", "baseUrl": "http://127.0.0.1:8099/v1", "model": "mock-regressed", "supportsStructuredOutput": true },
+  "fieldRules": [
+    { "path": "vendor", "match": "normalized" }, { "path": "invoiceNumber", "match": "exact" }, { "path": "date", "match": "date" }, { "path": "billTo", "match": "exact" }, { "path": "purchaseOrder", "match": "exact" }, { "path": "lineItems", "match": "exact" }, { "path": "subtotal", "match": "number", "tolerance": 0.01 }, { "path": "tax", "match": "number", "tolerance": 0.01 }, { "path": "total", "match": "number", "tolerance": 0.01 }
+  ],
+  "crossFieldRules": [{ "name": "line item amounts equal subtotal", "type": "sum_equals", "fields": ["lineItems.0.amount", "lineItems.1.amount"], "total": "subtotal", "tolerance": 0.01 }]
+}

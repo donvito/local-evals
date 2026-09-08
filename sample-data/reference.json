@@ -1,0 +1,5 @@
+{
+  "invoice-001": "EVALFORGE / SYNTHETIC FIXTURE\nPINECONE OFFICE CO.\nSYNTHETIC INVOICE\nInvoice No: SYN-1001\nDate: 2025-01-15\nBill To: Harbor Labs\nPurchase Order: PO-77\nItem | Quantity | Unit Price | Amount\nNotebook | 4 | $7.50 | $30.00\nDesk Lamp | 2 | $18.00 | $36.00\nSubtotal: $66.00\nTax: $6.60\nTotal: $72.60",
+  "invoice-002": "EVALFORGE / SYNTHETIC FIXTURE\nRIVERSTONE GOODS\nSYNTHETIC INVOICE\nInvoice No: SYN-2048\nDate: 2025-06-30\nBill To: \nPurchase Order: \nItem | Quantity | Unit Price | Amount\nPacking Tape | 10 | $3.25 | $32.50\nShipping Labels | 5 | $4.40 | $22.00\nSubtotal: $54.50\nTax: \nTotal: $54.50",
+  "invoice-003": "EVALFORGE / SYNTHETIC FIXTURE\nORBITAL RESEARCH SUPPLY\nSYNTHETIC INVOICE\nInvoice No: SYN-3099\nDate: 2026-02-03\nBill To: Northwind Analytics\nPurchase Order: PO-902\nItem | Quantity | Unit Price | Amount\nCalibration Kit | 1 | $125.00 | $125.00\nSensor Cable | 6 | $14.75 | $88.50\nSubtotal: $213.50\nTax: $21.35\nTotal: $234.85"
+}

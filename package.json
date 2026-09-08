@@ -1,0 +1,38 @@
+{
+  "name": "evalforge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build && tsx src/cli.ts serve",
+    "start": "tsx src/cli.ts serve",
+    "fixtures": "tsx scripts/generate-fixtures.ts",
+    "receipts:prepare": "tsx scripts/prepare-receipts.ts",
+    "mock": "tsx scripts/mock-provider.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "demo": "npm run build && tsx scripts/smoke.ts .evalforge/demo.db && tsx src/cli.ts serve --db .evalforge/demo.db --port 4180",
+    "build": "tsc -p tsconfig.json && vite build",
+    "test": "vitest run --config vitest.config.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "evalforge": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "better-sqlite3": "^11.10.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.15.21",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "prettier": "^3.9.6",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.1.3"
+  }
+}
