@@ -618,6 +618,84 @@ const supportedMetrics = (metrics?: Record<string, unknown>) =>
         kind: "percent" | "count" | "ms" | "text";
       } => Boolean(item.label),
     );
+const numericRunMetric = (run: Run, key: string) => {
+  const value = run.metrics?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+};
+const runSampleCount = (run: Run) =>
+  Math.max(
+    0,
+    Math.round(
+      numericRunMetric(run, "sampleCount") ??
+        run.totalCases ??
+        run.caseCount ??
+        0,
+    ),
+  );
+const runPassedCount = (run: Run) =>
+  Math.max(
+    0,
+    Math.round(numericRunMetric(run, "passed") ?? run.passedCount ?? 0),
+  );
+const runCompletedCount = (run: Run) =>
+  Math.max(
+    0,
+    Math.round(
+      numericRunMetric(run, "completed") ?? run.caseCount ?? 0,
+    ),
+  );
+const runPassRate = (run: Run) => {
+  const value = numericRunMetric(run, "passRate");
+  if (value !== undefined) return Math.max(0, Math.min(1, value));
+  if (run.inferenceOnly) return undefined;
+  const total = runSampleCount(run);
+  return total ? runPassedCount(run) / total : undefined;
+};
+const runAverageStageTime = (run: Run) => {
+  const values = [
+    numericRunMetric(run, "meanOcrMs"),
+    numericRunMetric(run, "meanExtractionMs"),
+  ].filter((value): value is number => value !== undefined);
+  return values.length
+    ? values.reduce((sum, value) => sum + value, 0)
+    : undefined;
+};
+const failedRunStatuses = new Set([
+  "failed",
+  "error",
+  "interrupted",
+  "stopped",
+  "cancelled",
+  "canceled",
+  "aborted",
+]);
+const isOverviewScoredRun = (run: Run) => {
+  const status = run.status?.toLowerCase();
+  return (
+    !run.inferenceOnly &&
+    runSampleCount(run) > 0 &&
+    runPassRate(run) !== undefined &&
+    status !== "running" &&
+    status !== "pending" &&
+    !failedRunStatuses.has(status || "")
+  );
+};
+const isOverviewPerformanceRun = (run: Run) => {
+  const status = run.status?.toLowerCase();
+  return (
+    runAverageStageTime(run) !== undefined &&
+    status !== "running" &&
+    status !== "pending" &&
+    !failedRunStatuses.has(status || "")
+  );
+};
+const newestRuns = (runs: Run[]) =>
+  runs
+    .slice()
+    .sort(
+      (left, right) =>
+        (Date.parse(right.createdAt) || 0) - (Date.parse(left.createdAt) || 0),
+    );
 const deltaLabel = (key: string, left: unknown, right: unknown) => {
   if (typeof left !== "number" || typeof right !== "number")
     return "No baseline";
@@ -949,7 +1027,7 @@ function App() {
       setError(e instanceof Error ? e.message : "Could not load run");
     }
   };
-  const latest = runs[0];
+  const latest = newestRuns(runs)[0];
   const passRate =
     latest &&
     !latest.inferenceOnly &&
@@ -1283,6 +1361,300 @@ function RunRow({ run, onClick }: { run: Run; onClick: () => void }) {
     </button>
   );
 }
+function AnalyticsBar({
+  label,
+  value,
+}: {
+  label: string;
+  value?: number;
+}) {
+  const percentage =
+    value === undefined ? 0 : Math.max(0, Math.min(1, value)) * 100;
+  return (
+    <div className="analytics-bar">
+      <div className="analytics-bar-label">
+        <span>{label}</span>
+        <strong>{value === undefined ? "Unavailable" : metric(value)}</strong>
+      </div>
+      <div
+        className="analytics-bar-track"
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={value === undefined ? undefined : percentage}
+      >
+        <span style={{ width: `${percentage}%` }} />
+      </div>
+    </div>
+  );
+}
+function PassRateTrend({
+  runs,
+  onRun,
+}: {
+  runs: Run[];
+  onRun: (id: string) => void;
+}) {
+  const width = 360;
+  const height = 148;
+  const left = 30;
+  const right = 12;
+  const top = 12;
+  const bottom = 26;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const points = runs.map((run, index) => {
+    const value = runPassRate(run) ?? 0;
+    return {
+      run,
+      value,
+      x:
+        runs.length === 1
+          ? left + plotWidth / 2
+          : left + (plotWidth * index) / (runs.length - 1),
+      y: top + (1 - value) * plotHeight,
+    };
+  });
+  return (
+    <>
+      {points.length ? (
+        <>
+          <div className="analytics-chart-wrap">
+            <svg
+              className="analytics-chart"
+              viewBox={`0 0 ${width} ${height}`}
+              role="img"
+              aria-label="Pass rate by recent scored run"
+            >
+              <title>Pass rate by run</title>
+              <desc>
+                Recent scored runs shown as independent bars. Inference-only and
+                failed runs are excluded.
+              </desc>
+              {[0, 0.5, 1].map((value) => {
+                const y = top + (1 - value) * plotHeight;
+                return (
+                  <g key={value}>
+                    <line
+                      className="analytics-chart-grid"
+                      x1={left}
+                      x2={width - right}
+                      y1={y}
+                      y2={y}
+                    />
+                    <text className="analytics-chart-label" x="0" y={y + 4}>
+                      {Math.round(value * 100)}%
+                    </text>
+                  </g>
+                );
+              })}
+              {points.map((point) => (
+                <g key={point.run.runId}>
+                  <rect
+                    className="analytics-chart-bar"
+                    x={point.x - Math.min(16, plotWidth / Math.max(points.length * 2, 2))}
+                    y={point.y}
+                    width={Math.min(32, plotWidth / Math.max(points.length * 1.5, 1))}
+                    height={top + plotHeight - point.y}
+                    rx="1"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${point.run.runId.slice(0, 12)} pass rate ${metric(point.value)}`}
+                    onClick={() => onRun(point.run.runId)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onRun(point.run.runId);
+                      }
+                    }}
+                  />
+                  <title>
+                    {point.run.runId.slice(0, 12)} · {metric(point.value)}
+                  </title>
+                </g>
+              ))}
+            </svg>
+          </div>
+          <div className="analytics-run-list" aria-label="Recent scored runs">
+            {runs
+              .slice()
+              .reverse()
+              .slice(0, 4)
+              .map((run) => {
+                const passRate = runPassRate(run);
+                const stageTime = runAverageStageTime(run);
+                return (
+                  <button
+                    type="button"
+                    className="analytics-run-row"
+                    key={run.runId}
+                    onClick={() => onRun(run.runId)}
+                  >
+                    <span className="analytics-run-name">
+                      <code>{run.runId.slice(0, 12)}</code>
+                      <small>{date(run.createdAt)}</small>
+                    </span>
+                    <span>
+                      <b>{passRate === undefined ? "—" : metric(passRate)}</b>
+                      <small>pass rate</small>
+                    </span>
+                    <span>
+                      <b>{stageTime === undefined ? "—" : `${Math.round(stageTime)} ms`}</b>
+                      <small>avg latency</small>
+                    </span>
+                    <span className="row-arrow" aria-hidden="true">
+                      →
+                    </span>
+                  </button>
+                );
+              })}
+          </div>
+        </>
+      ) : (
+        <div className="analytics-empty">
+          <strong>Scored run data will appear here</strong>
+          <span>Inference-only and incomplete runs are excluded from this trend.</span>
+        </div>
+      )}
+    </>
+  );
+}
+function LatencyTrend({
+  runs,
+  onRun,
+}: {
+  runs: Run[];
+  onRun: (id: string) => void;
+}) {
+  const width = 360;
+  const height = 148;
+  const left = 42;
+  const right = 12;
+  const top = 12;
+  const bottom = 26;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const values = runs.map((run) => runAverageStageTime(run) ?? 0);
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const range = Math.max(maximum - minimum, maximum * 0.4, 1);
+  const domainMin = Math.max(0, minimum - range * 0.5);
+  const domainMax = maximum + range * 0.5;
+  const points = runs.map((run, index) => {
+    const value = runAverageStageTime(run) ?? 0;
+    return {
+      run,
+      value,
+      x:
+        runs.length === 1
+          ? left + plotWidth / 2
+          : left + (plotWidth * index) / (runs.length - 1),
+      y: top + ((domainMax - value) / (domainMax - domainMin)) * plotHeight,
+    };
+  });
+  return points.length ? (
+    <>
+      <div className="analytics-chart-wrap">
+        <svg
+          className="analytics-chart"
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label="Average stage latency by recent run"
+        >
+          <title>Average latency by run</title>
+          <desc>
+            Recent completed runs with timing data shown as independent bars.
+            Inference-only runs can be included.
+          </desc>
+          {[domainMax, (domainMax + domainMin) / 2, domainMin].map(
+            (value) => {
+              const y =
+                top + ((domainMax - value) / (domainMax - domainMin)) * plotHeight;
+              return (
+                <g key={value}>
+                  <line
+                    className="analytics-chart-grid"
+                    x1={left}
+                    x2={width - right}
+                    y1={y}
+                    y2={y}
+                  />
+                  <text className="analytics-chart-label" x="0" y={y + 4}>
+                    {Math.round(value)} ms
+                  </text>
+                </g>
+              );
+            },
+          )}
+          {points.map((point) => (
+            <g key={point.run.runId}>
+              <rect
+                className="analytics-chart-bar"
+                x={point.x - Math.min(16, plotWidth / Math.max(points.length * 2, 2))}
+                y={point.y}
+                width={Math.min(32, plotWidth / Math.max(points.length * 1.5, 1))}
+                height={top + plotHeight - point.y}
+                rx="1"
+                role="button"
+                tabIndex={0}
+                aria-label={`${point.run.runId.slice(0, 12)} average latency ${Math.round(point.value)} milliseconds`}
+                onClick={() => onRun(point.run.runId)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onRun(point.run.runId);
+                  }
+                }}
+              />
+              <title>
+                {point.run.runId.slice(0, 12)} · {Math.round(point.value)} ms
+              </title>
+            </g>
+          ))}
+        </svg>
+      </div>
+      <div className="analytics-run-list" aria-label="Recent timed runs">
+        {runs
+          .slice()
+          .reverse()
+          .slice(0, 4)
+          .map((run) => {
+            const stageTime = runAverageStageTime(run);
+            return (
+              <button
+                type="button"
+                className="analytics-run-row"
+                key={run.runId}
+                onClick={() => onRun(run.runId)}
+              >
+                <span className="analytics-run-name">
+                  <code>{run.runId.slice(0, 12)}</code>
+                  <small>{date(run.createdAt)}</small>
+                </span>
+                <span>
+                  <b>{stageTime === undefined ? "—" : `${Math.round(stageTime)} ms`}</b>
+                  <small>avg latency</small>
+                </span>
+                <span>
+                  <b>{runSampleCount(run)}</b>
+                  <small>cases</small>
+                </span>
+                <span className="row-arrow" aria-hidden="true">
+                  →
+                </span>
+              </button>
+            );
+          })}
+      </div>
+    </>
+  ) : (
+    <div className="analytics-empty">
+      <strong>Timing data will appear here</strong>
+      <span>Completed runs with recorded stage timings will populate this trend.</span>
+    </div>
+  );
+}
 function Overview({
   runs,
   latest,
@@ -1298,6 +1670,39 @@ function Overview({
   onRun: (id: string) => void;
   onTab: (tab: Tab) => void;
 }) {
+  const orderedRuns = newestRuns(runs);
+  const qualityRuns = orderedRuns.filter(isOverviewScoredRun);
+  const scoredCases = qualityRuns.reduce(
+    (total, run) => total + runSampleCount(run),
+    0,
+  );
+  const scoredPasses = qualityRuns.reduce(
+    (total, run) => total + runPassedCount(run),
+    0,
+  );
+  const overallPassRate = scoredCases ? scoredPasses / scoredCases : undefined;
+  const failedRuns = orderedRuns.filter((run) =>
+    failedRunStatuses.has(run.status?.toLowerCase() || ""),
+  ).length;
+  const activeRuns = orderedRuns.filter(
+    (run) => run.status === "running" || run.status === "pending",
+  ).length;
+  const trendRuns = qualityRuns.slice(0, 8).reverse();
+  const performanceRuns = orderedRuns
+    .filter(isOverviewPerformanceRun)
+    .slice(0, 8)
+    .reverse();
+  const latestPassRate = latest ? runPassRate(latest) : passRate;
+  const latestSampleCount = latest ? runSampleCount(latest) : 0;
+  const latestCompleted = latest
+    ? runCompletedCount(latest)
+    : 0;
+  const latestStageTime = latest ? runAverageStageTime(latest) : undefined;
+  const latestCost = latest
+    ? numericRunMetric(latest, "knownCostUsd")
+    : undefined;
+  const latestQuality = latest && isOverviewScoredRun(latest);
+  const latestScoredRun = qualityRuns[0];
   return (
     <>
       <PageTitle
@@ -1313,27 +1718,43 @@ function Overview({
       <section className="stats">
         <Stat
           label="Latest pass rate"
-          value={latest ? metric(passRate) : "—"}
+          value={
+            latest ? metric(latestQuality ? latestPassRate : undefined) : "—"
+          }
           note={
             latest
               ? latest.inferenceOnly
                 ? "Inference-only; outputs stored, not scored"
-                : `${latest.passedCount} of ${latest.totalCases ?? latest.caseCount} cases`
+                : latestQuality
+                  ? `${runPassedCount(latest)} of ${latestSampleCount} cases`
+                  : "Quality score unavailable for this run"
               : "No runs yet"
           }
         />
         <Stat
+          label="Overall pass rate"
+          value={metric(overallPassRate)}
+          note={
+            qualityRuns.length
+              ? `${scoredCases} scored cases across ${qualityRuns.length} completed runs`
+              : "Awaiting a completed scored run"
+          }
+        />
+        <Stat
           label="Cases evaluated"
-          value={String(runs.reduce((n, r) => n + (r.caseCount || 0), 0))}
+          value={String(
+            runs.reduce((total, run) => total + runCompletedCount(run), 0),
+          )}
           note={`${runs.length} recorded run${runs.length === 1 ? "" : "s"}`}
         />
         <Stat
           label="Active runs"
-          value={String(
-            runs.filter((r) => r.status === "running" || r.status === "pending")
-              .length,
-          )}
-          note="Dashboard or terminal"
+          value={String(activeRuns)}
+          note={
+            failedRuns
+              ? `${failedRuns} failed run${failedRuns === 1 ? "" : "s"}`
+              : "Dashboard or terminal"
+          }
         />
       </section>
       {latest?.metrics && (
@@ -1344,6 +1765,125 @@ function Overview({
               <strong>{item.display}</strong>
             </span>
           ))}
+        </section>
+      )}
+      <section className="overview-analytics">
+        <section className="panel analytics-panel analytics-trend-panel">
+          <div className="panel-head">
+            <div>
+              <h3>{trendRuns.length ? "Pass rate by run" : "Average latency by run"}</h3>
+              <p>
+                {trendRuns.length
+                  ? "Recent completed scored runs · click a run to inspect its cases"
+                  : "Completed runs with timing data · inference-only runs can be included"}
+              </p>
+            </div>
+            <span className="analytics-scope">
+              {trendRuns.length ? `${qualityRuns.length} scored` : `${performanceRuns.length} timed`}
+            </span>
+          </div>
+          {trendRuns.length ? (
+            <PassRateTrend runs={trendRuns} onRun={onRun} />
+          ) : (
+            <LatencyTrend runs={performanceRuns} onRun={onRun} />
+          )}
+        </section>
+        <section className="panel analytics-panel analytics-breakdown-panel">
+          <div className="panel-head">
+            <div>
+              <h3>Latest quality signals</h3>
+              <p>Checks available from the latest completed scored run</p>
+            </div>
+          </div>
+          {latestScoredRun ? (
+            <div className="analytics-bars">
+              <AnalyticsBar label="Pass rate" value={runPassRate(latestScoredRun)} />
+              <AnalyticsBar
+                label="JSON parse success"
+                value={numericRunMetric(latestScoredRun, "parseRate")}
+              />
+              <AnalyticsBar
+                label="Schema compliance"
+                value={numericRunMetric(latestScoredRun, "schemaRate")}
+              />
+              <AnalyticsBar
+                label="Field accuracy"
+                value={numericRunMetric(latestScoredRun, "fieldAccuracy")}
+              />
+            </div>
+          ) : (
+            <div className="analytics-empty analytics-empty-compact">
+              <strong>No quality score available yet</strong>
+              <span>
+                Complete a scored run to see pass, parse, schema, and field
+                accuracy here.
+              </span>
+            </div>
+          )}
+          {latest && (
+            <button
+              type="button"
+              className="text-button analytics-open-button"
+              onClick={() => onRun((latestScoredRun || latest).runId)}
+            >
+              Open latest run details →
+            </button>
+          )}
+        </section>
+      </section>
+      {latest && (
+        <section className="panel analytics-detail-panel">
+          <div className="panel-head">
+            <div>
+              <h3>Latest run detail</h3>
+              <p>
+                <code>{latest.runId.slice(0, 12)}</code> ·{" "}
+                {date(latest.createdAt)}
+              </p>
+            </div>
+            <span className="analytics-status">
+              {latest.status || "Complete"}
+              {latest.inferenceOnly ? " · Inference only" : ""}
+            </span>
+          </div>
+          <div className="analytics-detail-grid">
+            <div>
+              <span>Cases complete</span>
+              <strong>
+                {latestCompleted}/{latestSampleCount || "—"}
+              </strong>
+              <small>Outputs recorded for this run</small>
+            </div>
+            <div>
+              <span>Pass rate</span>
+              <strong>
+                {latestQuality ? metric(latestPassRate) : "Unavailable"}
+              </strong>
+              <small>
+                {latest.inferenceOnly
+                  ? "Inference-only run"
+                  : "Requires scored cases"}
+              </small>
+            </div>
+            <div>
+              <span>Average stage time</span>
+              <strong>
+                {latestStageTime === undefined
+                  ? "Unavailable"
+                  : `${Math.round(latestStageTime)} ms`}
+              </strong>
+              <small>OCR plus extraction mean</small>
+            </div>
+            <div>
+              <span>Known cost</span>
+              <strong>
+                {latestCost === undefined
+                  ? "Not reported"
+                  : `$${latestCost.toFixed(4)}`}
+              </strong>
+              <small>Provider usage when available</small>
+            </div>
+          </div>
         </section>
       )}
       <section className="panel recent">
@@ -3968,9 +4508,6 @@ function Targets({
           {targets.length ? (
             targets.map((t) => (
               <div className="target-row" key={t.name}>
-                <div className="target-badge">
-                  {t.name.slice(0, 2).toUpperCase()}
-                </div>
                 <div className="target-info">
                   <strong>{t.name}</strong>
                   <span>
