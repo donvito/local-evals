@@ -2,6 +2,7 @@
   "name": "evalforge",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "npm run build && tsx src/cli.ts serve",
@@ -11,7 +12,7 @@
     "mock": "tsx scripts/mock-provider.ts",
     "smoke": "tsx scripts/smoke.ts",
     "smoke:modes": "tsx scripts/smoke-modes.ts",
-    "demo": "npm run build && tsx scripts/smoke.ts .evalforge/demo.db && tsx src/cli.ts serve --db .evalforge/demo.db --port 4180",
+    "demo": "npm run build && tsx scripts/smoke.ts .localevals/demo.db && tsx src/cli.ts serve --db .localevals/demo.db --port 4180",
     "build": "tsc -p tsconfig.json && vite build",
     "test": "vitest run --config vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",

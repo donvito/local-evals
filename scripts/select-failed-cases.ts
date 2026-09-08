@@ -5,7 +5,7 @@ const [
   dbPath,
   runId,
   sourcePath,
-  outputPath = ".evalforge/receipts-retry.jsonl",
+  outputPath = ".localevals/receipts-retry.jsonl",
 ] = process.argv.slice(2);
 if (!dbPath || !runId || !sourcePath) {
   throw new Error(

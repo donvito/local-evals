@@ -33,7 +33,7 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   const { positionals: p, flags: f } = parse(rest);
-  const dbPath = path.resolve(f.db ?? ".evalforge/evalforge.db"),
+  const dbPath = path.resolve(f.db ?? ".localevals/evalforge.db"),
     assetRoot = path.join(path.dirname(dbPath), "assets");
   if (command === "serve") {
     await startServer(

@@ -1,4 +1,4 @@
-# EvalForge synthetic invoice fixtures
+# Local Evals synthetic invoice fixtures
 
 This directory contains three deterministic invoice cases. The PNGs are rendered locally from SVG with `@resvg/resvg-js` and system fonts; they contain only synthetic data. Each case has exactly two line items, while optional bill-to, purchase-order, and tax values vary between normal, empty-string, and `null` values.
 
