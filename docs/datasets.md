@@ -96,7 +96,7 @@ In Datasets, choose **Create with a provider**, select a configured provider/mod
 ## Import from the command line
 
 ```bash
-npm run evalforge -- import datasets/receipts/inference.jsonl --db .localevals/receipts.db
+npm run localevals -- import datasets/receipts/inference.jsonl --db .localevals/receipts.db
 ```
 
 Use the same database when serving the dashboard or running evaluations. After import, the dataset browser supports search, row inspection, an expanded viewer, and raw JSONL viewing/export.

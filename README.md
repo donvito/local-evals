@@ -17,6 +17,20 @@ Open [localhost:4173](http://127.0.0.1:4173). Configure a provider, import a dat
 
 For an offline demo with synthetic data and mock model responses, run `npm run demo` and open [localhost:4180](http://127.0.0.1:4180).
 
+## CLI
+
+Run CLI commands from the repository directory:
+
+```bash
+npm run localevals -- --help
+npm run localevals -- run sample-data/manifest.jsonl sample-data/config.json --db .localevals/example.db
+npm run localevals -- inspect --db .localevals/example.db
+```
+
+For the synthetic evaluation above, start `npm run mock` in another terminal first.
+
+The CLI command is now `npm run localevals --` (formerly `npm run evalforge --`).
+
 ## Guides
 
 - [Prepare datasets](docs/datasets.md) — images, text, tool-call expectations, and sample data.

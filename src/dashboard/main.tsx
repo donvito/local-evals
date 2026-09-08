@@ -5346,7 +5346,8 @@ function SetupPanel({
     await saveConfig();
   };
   const command =
-    setup.runCommand || "evalforge run --config evalforge.config.json";
+    setup.runCommand ||
+    "npm run localevals -- run sample-data/manifest.jsonl sample-data/config.json";
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(command);

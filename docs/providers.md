@@ -66,9 +66,9 @@ Use provider **OpenAI-compatible**, base URL `http://127.0.0.1:8099/v1`, and mod
 ## Target commands
 
 ```bash
-npm run evalforge -- target add target.json
-npm run evalforge -- target list
-npm run evalforge -- target test local-vision --vision true
+npm run localevals -- target add target.json
+npm run localevals -- target list
+npm run localevals -- target test local-vision --vision true
 ```
 
 All commands accept `--db path/to/results.db`. A target saved in one database is available to the dashboard using that database.

@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-The dashboard opens at [localhost:4173](http://127.0.0.1:4173), with data in `.localevals/evalforge.db`. The dev command builds the UI before starting the server; rerun it after frontend changes.
+The dashboard opens at [localhost:4173](http://127.0.0.1:4173), with data in `.localevals/evalforge.db`. This legacy database filename is retained so existing saved runs remain available. The dev command builds the UI before starting the server; rerun it after frontend changes.
 
 To choose a database and port:
 
@@ -83,9 +83,9 @@ An optional semantic judge records a verdict and evidence without changing deter
 For this synthetic example, first start `npm run mock` in another terminal:
 
 ```bash
-npm run evalforge -- run sample-data/manifest.jsonl sample-data/config.json --db .localevals/example.db --concurrency 2 --threshold 0.9
-npm run evalforge -- inspect --db .localevals/example.db
-npm run evalforge -- serve --db .localevals/example.db --port 4182
+npm run localevals -- run sample-data/manifest.jsonl sample-data/config.json --db .localevals/example.db --concurrency 2 --threshold 0.9
+npm run localevals -- inspect --db .localevals/example.db
+npm run localevals -- serve --db .localevals/example.db --port 4182
 ```
 
 The first argument to `run` may also be an imported dataset version. Use the same database for running, inspection, comparison, and serving. CLI concurrency is limited to 32. Ctrl+C cancels a run while retaining completed cases and attempts.
@@ -104,7 +104,7 @@ Without a threshold, incorrect model output is stored as an evaluation result an
 After building, explicitly enable LAN access:
 
 ```bash
-npm run evalforge -- serve --db .localevals/receipts.db --port 4182 --host 0.0.0.0
+npm run localevals -- serve --db .localevals/receipts.db --port 4182 --host 0.0.0.0
 ```
 
 Use the printed Wi-Fi URL on a device connected to the same trusted network. LAN clients can use dashboard run controls. Keep the host awake; restart the server if its network address changes. By default, the server is localhost-only.

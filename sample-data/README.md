@@ -22,7 +22,7 @@ To inspect the passing pipeline manually:
 
 ```bash
 npm exec -- tsx scripts/mock-provider.ts
-npm run evalforge -- run sample-data/manifest.jsonl sample-data/config.json --db /tmp/evalforge-demo.db
+npm run localevals -- run sample-data/manifest.jsonl sample-data/config.json --db /tmp/localevals-demo.db
 ```
 
 `mock-provider.ts` is a synthetic OpenAI-compatible server. It maps OCR responses by SHA-256 image bytes and maps extraction responses by invoice ID in the transcription. `mock-regressed` intentionally adds 1.00 to each extracted total so comparison output has a known regression. The smoke test also asserts threshold exit code `2` for that run and verifies JSON plus Markdown exports. None of these responses represent a real model.

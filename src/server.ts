@@ -130,7 +130,7 @@ export async function startServer(
   const command = (version?: string) => {
     const dataset = version ? db.getDataset(version) : db.listDatasets()[0];
     return (
-      "npm run evalforge -- run " +
+      "npm run localevals -- run " +
       shellQuote(dataset?.version ?? "sample-data/manifest.json") +
       " " +
       shellQuote(configPath) +
@@ -705,7 +705,7 @@ export async function startServer(
         );
         res.setHeader(
           "content-disposition",
-          'attachment; filename="evalforge-' +
+          'attachment; filename="localevals-' +
             run.runId +
             "." +
             (markdown ? "md" : "json") +
@@ -810,7 +810,7 @@ export async function startServer(
     );
   }
   const address = server.address() as { port: number };
-  console.log("EvalForge dashboard: http://127.0.0.1:" + address.port);
+  console.log("Local Evals dashboard: http://127.0.0.1:" + address.port);
   if (host === "0.0.0.0")
     for (const hostname of allowedHosts)
       if (hostname !== "127.0.0.1" && hostname !== "localhost")

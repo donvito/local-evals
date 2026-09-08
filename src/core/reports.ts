@@ -166,7 +166,7 @@ export function markdownReport(run: any) {
     ) +
     "\n```\n";
   return (
-    "# EvalForge run " +
+    "# Local Evals run " +
     run.runId +
     "\n\nStatus: " +
     run.status +

@@ -24,7 +24,7 @@ function parse(args: string[]) {
 }
 const usage = () =>
   console.log(
-    "EvalForge\n  init\n  import <manifest.jsonl>\n  target add <target.json>\n  target list\n  target test <name> [--vision true]\n  run <manifest-or-dataset-version> <config.json> [--concurrency 1] [--threshold 0.9]\n  inspect [run-id]\n  compare <left-run> <right-run>\n  export <run-id> [--format json|markdown] [--out report.json]\n  serve [--port 4173]\nAll commands accept --db <path>.",
+    "localevals\nUsage: npm run localevals -- <command> [options]\n  init\n  import <manifest.jsonl>\n  target add <target.json>\n  target list\n  target test <name> [--vision true]\n  run <manifest-or-dataset-version> <config.json> [--concurrency 1] [--threshold 0.9]\n  inspect [run-id]\n  compare <left-run> <right-run>\n  export <run-id> [--format json|markdown] [--out report.json]\n  serve [--port 4173]\nAll commands accept --db <path>.",
   );
 export async function main(args = process.argv.slice(2)) {
   const [command, ...rest] = args;

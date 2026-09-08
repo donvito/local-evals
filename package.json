@@ -1,5 +1,5 @@
 {
-  "name": "evalforge",
+  "name": "localevals",
   "version": "0.1.0",
   "private": true,
   "license": "Apache-2.0",
@@ -16,7 +16,7 @@
     "build": "tsc -p tsconfig.json && vite build",
     "test": "vitest run --config vitest.config.ts",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "evalforge": "tsx src/cli.ts"
+    "localevals": "tsx src/cli.ts"
   },
   "dependencies": {
     "ajv": "^8.17.1",

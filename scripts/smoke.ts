@@ -164,7 +164,7 @@ try {
   if (
     report.metrics?.passRate !== 1 ||
     !JSON.parse(compare.stdout).regressed ||
-    !markdown.includes(`# EvalForge run ${leftRun}`)
+    !markdown.includes(`# Local Evals run ${leftRun}`)
   )
     throw new Error("Smoke assertions failed.");
   console.log(

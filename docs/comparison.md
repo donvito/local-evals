@@ -25,10 +25,10 @@ The Compare action rejects inference-only runs because they have no deterministi
 ## CLI comparison and exports
 
 ```bash
-npm run evalforge -- inspect --db .localevals/receipts.db
-npm run evalforge -- compare BASELINE_RUN_ID CANDIDATE_RUN_ID --db .localevals/receipts.db
-npm run evalforge -- export RUN_ID --format json --out report.json --db .localevals/receipts.db
-npm run evalforge -- export RUN_ID --format markdown --out report.md --db .localevals/receipts.db
+npm run localevals -- inspect --db .localevals/receipts.db
+npm run localevals -- compare BASELINE_RUN_ID CANDIDATE_RUN_ID --db .localevals/receipts.db
+npm run localevals -- export RUN_ID --format json --out report.json --db .localevals/receipts.db
+npm run localevals -- export RUN_ID --format markdown --out report.md --db .localevals/receipts.db
 ```
 
 Replace the run ID placeholders with IDs from `inspect`. Export commands write reports for an individual run; they refuse to overwrite an existing file. The Runs toolbar also offers JSON and Markdown downloads.
