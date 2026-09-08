@@ -10,6 +10,7 @@
     "receipts:prepare": "tsx scripts/prepare-receipts.ts",
     "mock": "tsx scripts/mock-provider.ts",
     "smoke": "tsx scripts/smoke.ts",
+    "smoke:modes": "tsx scripts/smoke-modes.ts",
     "demo": "npm run build && tsx scripts/smoke.ts .evalforge/demo.db && tsx src/cli.ts serve --db .evalforge/demo.db --port 4180",
     "build": "tsc -p tsconfig.json && vite build",
     "test": "vitest run --config vitest.config.ts",

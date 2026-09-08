@@ -1,0 +1,41 @@
+{
+  "datasetVersion": "synthetic-text-json-v1",
+  "schemaVersion": "synthetic-text-json-schema-v1",
+  "taskKind": "text-json",
+  "stagePrompts": {
+    "ocr": "",
+    "extraction": "Read the supplied fictional record and return exactly one JSON object. Preserve missing fields as missing, preserve explicit null values as null, and preserve dates and numbers as typed JSON values. Do not add commentary."
+  },
+  "extractionTarget": {
+    "name": "local-mock-text-json",
+    "baseUrl": "http://127.0.0.1:8099/v1",
+    "model": "mock-text-json",
+    "provider": "openai-compatible"
+  },
+  "fieldRules": [],
+  "outputMode": "prompted-json",
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "customer": { "type": "string" },
+      "nickname": { "type": ["string", "null"] },
+      "opened": { "type": "string", "format": "date" },
+      "dueDate": { "type": ["string", "null"], "format": "date" },
+      "seats": { "type": "integer" },
+      "monthlyRate": { "type": "number" },
+      "balance": { "type": ["number", "null"] },
+      "active": { "type": "boolean" },
+      "offset": { "type": "number" },
+      "attempts": { "type": "integer" },
+      "note": { "type": ["string", "null"] },
+      "annualLimit": { "type": "number" },
+      "ratio": { "type": "number" },
+      "count": { "type": "integer" },
+      "unitPrice": { "type": "number" },
+      "total": { "type": "number" },
+      "comment": { "type": ["string", "null"] }
+    }
+  }
+}

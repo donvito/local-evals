@@ -36,6 +36,22 @@ const CONNECTION: RunErrorDescription = {
   action: "Check the provider URL and network connection, then retry.",
 };
 
+const ENDPOINT: RunErrorDescription = {
+  title: "Provider endpoint needs attention",
+  message:
+    "The provider answered, but the configured URL is not its OpenAI-compatible API endpoint.",
+  action:
+    "For LM Studio, set the Base URL to http://127.0.0.1:1234/v1, test the target, then retry.",
+};
+
+const TOOL_CALLING: RunErrorDescription = {
+  title: "Model did not return a tool call",
+  message:
+    "The selected model did not produce a native tool call during the capability check.",
+  action:
+    "Choose a model with tool/function calling support, keep the target on its /v1 endpoint, and retry.",
+};
+
 const UNAVAILABLE: RunErrorDescription = {
   title: "Provider unavailable",
   message: "The provider returned a temporary server error.",
@@ -134,6 +150,18 @@ const hasConnectionError = (text: string): boolean =>
     text,
   );
 
+const hasEndpointError = (text: string): boolean =>
+  /\b(?:unexpected\s+endpoint|unexpected\s+method|invalid\s+endpoint)\b/.test(
+    text,
+  ) ||
+  (/post\s+\/chat\/completions/.test(text) &&
+    /\b(?:base\s*url|endpoint|\/v1)\b/.test(text));
+
+const hasToolCallingError = (text: string): boolean =>
+  /\b(?:required\s+tool\s+preflight\s+call|did\s+not\s+return\s+(?:a\s+)?tool\s+call|tool[- ]calling\s+support)\b/.test(
+    text,
+  );
+
 const hasRunnerExit = (text: string): boolean =>
   /\b(?:foreground\s+)?runner\s+exited\s+before\s+completion\b/.test(text) ||
   /\b(?:process|evaluation)\s+(?:runner\s+)?(?:stopped|exited)\s+before\s+completion\b/.test(
@@ -151,6 +179,8 @@ export function describeRunError(raw: string): RunErrorDescription {
   if (hasRateLimitError(text)) return RATE_LIMIT;
   if (hasUnavailableError(text)) return UNAVAILABLE;
   if (hasTimeoutError(text)) return TIMEOUT;
+  if (hasEndpointError(text)) return ENDPOINT;
+  if (hasToolCallingError(text)) return TOOL_CALLING;
   if (hasConnectionError(text)) return CONNECTION;
   if (hasRunnerExit(text)) return RUNNER_EXITED;
   return UNKNOWN;

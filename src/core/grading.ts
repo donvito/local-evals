@@ -378,7 +378,7 @@ function schemaErrorPath(error: any): string {
   return path;
 }
 
-function compileSchema(schema: object): any {
+export function compileSchema(schema: object): any {
   const schemaId = (schema as { $schema?: unknown }).$schema;
   const Ajv2020Ctor = (Ajv2020Module as any).default ?? Ajv2020Module;
   const AjvCtor = (AjvModule as any).default ?? AjvModule;

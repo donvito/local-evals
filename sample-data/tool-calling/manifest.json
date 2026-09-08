@@ -1,0 +1,86 @@
+{
+  "name": "Synthetic fictional tool-call intents",
+  "taskKind": "tool-calling",
+  "cases": [
+    {
+      "caseId": "tool-calling-001",
+      "inputText": "CASE_ID=tool-calling-001\nFor the fictional place Lumen City, look up the weather forecast for 2025-07-12.",
+      "expected": [
+        {
+          "name": "lookup_fictional_weather",
+          "arguments": {
+            "city": "Lumen City",
+            "date": "2025-07-12"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "tool-calling-002",
+      "inputText": "CASE_ID=tool-calling-002\nFirst look up the weather in Nova Harbor on 2025-08-03, then search the fictional catalog for copper widgets with at most 3 results.",
+      "expected": [
+        {
+          "name": "lookup_fictional_weather",
+          "arguments": {
+            "city": "Nova Harbor",
+            "date": "2025-08-03"
+          }
+        },
+        {
+          "name": "search_fictional_catalog",
+          "arguments": {
+            "query": "copper widgets",
+            "maxResults": 3
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "tool-calling-003",
+      "inputText": "CASE_ID=tool-calling-003\nExplain in one sentence what the fictional tools can do. Do not look anything up or create a preview.",
+      "expected": []
+    },
+    {
+      "caseId": "tool-calling-004",
+      "inputText": "CASE_ID=tool-calling-004\nPlease handle the issue for me. No destination, title, or other details are provided, so ask a clarifying question instead of proposing a tool call.",
+      "expected": []
+    },
+    {
+      "caseId": "tool-calling-005",
+      "inputText": "CASE_ID=tool-calling-005\nPreview a fictional support ticket in the orbit queue with title 'Printer calibration' and normal priority. Details: recalibrate the demo printer.",
+      "expected": [
+        {
+          "name": "preview_fictional_ticket",
+          "arguments": {
+            "queue": "orbit",
+            "title": "Printer calibration",
+            "priority": "normal",
+            "details": "recalibrate the demo printer"
+          }
+        }
+      ]
+    },
+    {
+      "caseId": "tool-calling-006",
+      "inputText": "CASE_ID=tool-calling-006\nCheck weather for Solace Point on 2025-11-20 and preview a high-priority fictional ticket titled 'Demo outage' in the atlas queue with details 'inspect the sandbox service'. Keep the calls in that order.",
+      "expected": [
+        {
+          "name": "lookup_fictional_weather",
+          "arguments": {
+            "city": "Solace Point",
+            "date": "2025-11-20"
+          }
+        },
+        {
+          "name": "preview_fictional_ticket",
+          "arguments": {
+            "queue": "atlas",
+            "title": "Demo outage",
+            "priority": "high",
+            "details": "inspect the sandbox service"
+          }
+        }
+      ]
+    }
+  ]
+}

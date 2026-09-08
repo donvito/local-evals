@@ -3,6 +3,8 @@ import { writeFile } from "node:fs/promises";
 import {
   callOpenAICompatible,
   ProviderError,
+  testToolCallingTarget,
+  TOOL_PREFLIGHT_PROBE,
   testTarget,
 } from "../src/core/providers.js";
 
@@ -113,6 +115,68 @@ describe("OpenAI-compatible provider", () => {
     await expect(testTarget(target, { schema })).rejects.toThrow(
       /did not honor/,
     );
+  });
+
+  it("reports provider error envelopes returned with HTTP 2xx and hints at /v1", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: "Unexpected endpoint or method. (POST /chat/completions)",
+            }),
+            { status: 200 },
+          ),
+      ),
+    );
+    await expect(
+      callOpenAICompatible(
+        { ...target, baseUrl: "http://mock.local" },
+        "extract",
+      ),
+    ).rejects.toThrow(/provider error.*\/v1/i);
+  });
+
+  it("uses a reasoning-safe token budget and validates the tool preflight call", async () => {
+    let request: any;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        request = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: null,
+                  tool_calls: [
+                    {
+                      type: "function",
+                      function: {
+                        name: "evalforge_probe",
+                        arguments: "{}",
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    await expect(testToolCallingTarget(target)).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(request.max_tokens).toBe(512);
+    expect(request.messages[0].content).toContainEqual({
+      type: "text",
+      text: expect.stringContaining("evalforge_probe"),
+    });
+    expect(request.messages[0].content[0].text).toMatch(/exactly once/i);
+    expect(request.tools).toEqual([TOOL_PREFLIGHT_PROBE]);
   });
 
   it("retries rate limits but never retries authentication errors or leaks secrets", async () => {

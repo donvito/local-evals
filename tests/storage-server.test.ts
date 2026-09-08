@@ -195,8 +195,27 @@ describe("storage and server integration", () => {
     db.finishRun("a", "failed", "Connection refused");
     const expected = db.getRun("a")!.metrics;
     db.saveTarget({ ...config.ocrTarget, supportsVision: true });
+    db.saveDataset({
+      version: "same",
+      cases: [{ caseId: "a", imagePath: "unused.png", expected: {} }],
+    });
     db.close();
-    const server = await startServer(file, 0);
+    await writeFile(
+      path.join(dir, "fixture.json"),
+      JSON.stringify({
+        ...config,
+        schema: {
+          type: "object",
+          required: ["merchant", "date", "total"],
+          properties: {
+            merchant: { type: "string" },
+            date: { type: "string" },
+            total: { type: "number" },
+          },
+        },
+      }),
+    );
+    const server = await startServer(file, 0, dir);
     const address = server.address() as { port: number };
     const url = "http://127.0.0.1:" + address.port;
     try {
@@ -204,7 +223,8 @@ describe("storage and server integration", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          baseConfigPath: "datasets/receipts/config.local.example.json",
+          baseConfigPath: "fixture.json",
+          datasetVersion: "same",
           ocrTarget: "x",
           extractionTarget: "x",
           extractionSource: "ocr",

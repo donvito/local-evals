@@ -1,0 +1,72 @@
+{
+  "datasetVersion": "synthetic-tool-calling-v1",
+  "schemaVersion": "synthetic-tool-calling-schema-v1",
+  "taskKind": "tool-calling",
+  "stagePrompts": {
+    "ocr": "",
+    "extraction": "Read the supplied request and propose only the ordered tool calls needed to satisfy it. Use only the fictional tools supplied by the caller. Never execute a tool and do not invent missing details; if the request is informational or ambiguous, propose no calls."
+  },
+  "extractionTarget": {
+    "name": "local-mock-tool-calling",
+    "baseUrl": "http://127.0.0.1:8099/v1",
+    "model": "mock-tool-calling",
+    "provider": "openai-compatible",
+    "supportsTools": true
+  },
+  "fieldRules": [],
+  "outputMode": "prompted-json",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_fictional_weather",
+        "description": "Read a weather forecast for a fictional city and date. This function has no external side effects.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "city": { "type": "string" },
+            "date": { "type": "string", "format": "date" }
+          },
+          "required": ["city", "date"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "preview_fictional_ticket",
+        "description": "Preview a ticket in a fictional queue without sending or creating anything.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "queue": { "type": "string" },
+            "title": { "type": "string" },
+            "priority": { "type": "string", "enum": ["low", "normal", "high"] },
+            "details": { "type": "string" }
+          },
+          "required": ["queue", "title", "priority", "details"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_fictional_catalog",
+        "description": "Search a fictional product catalog. This function is read-only and has no external side effects.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "query": { "type": "string" },
+            "maxResults": { "type": "integer", "minimum": 1, "maximum": 10 }
+          },
+          "required": ["query", "maxResults"]
+        }
+      }
+    }
+  ],
+  "toolChoice": "auto",
+  "toolCallOrder": "ordered"
+}

@@ -24,7 +24,9 @@ describe("describeRunError", () => {
   });
 
   it("ignores malformed unicode escapes without throwing", () => {
-    expect(() => describeRunError(String.raw`provider: \\u{ffffff}`)).not.toThrow();
+    expect(() =>
+      describeRunError(String.raw`provider: \\u{ffffff}`),
+    ).not.toThrow();
     expect(describeRunError(String.raw`provider: \\u{ffffff}`).title).toBe(
       "Run failed",
     );
@@ -37,9 +39,29 @@ describe("describeRunError", () => {
     ["request timed out", "Request timed out"],
     ["TypeError: fetch failed", "Provider connection failed"],
     ["provider returned 503 Internal Server Error", "Provider unavailable"],
-    ["Foreground runner exited before completion.", "Runner exited before completion"],
+    [
+      "Foreground runner exited before completion.",
+      "Runner exited before completion",
+    ],
   ])("classifies %s", (raw, title) => {
     expect(describeRunError(raw).title).toBe(title);
+  });
+
+  it("explains an LM Studio endpoint configured without /v1", () => {
+    const description = describeRunError(
+      "Target lm studio returned API error: Unexpected endpoint or method. (POST /chat/completions)",
+    );
+
+    expect(description.title).toBe("Provider endpoint needs attention");
+    expect(description.action).toContain("127.0.0.1:1234/v1");
+  });
+
+  it("explains a model that does not produce native tool calls", () => {
+    expect(
+      describeRunError(
+        "Target lfm did not return the required tool preflight call.",
+      ).title,
+    ).toBe("Model did not return a tool call");
   });
 
   it("returns safe generic copy for an unknown error", () => {
@@ -49,7 +71,8 @@ describe("describeRunError", () => {
     expect(description).toEqual({
       title: "Run failed",
       message: "The run could not be completed.",
-      action: "Consult the technical details for more context, then retry the run.",
+      action:
+        "Consult the technical details for more context, then retry the run.",
     });
     expect(Object.values(description).join(" ")).not.toContain(secret);
   });
@@ -66,7 +89,11 @@ describe("describeRunError", () => {
       "<400> image length and width do not meet the model restrictions",
     );
 
-    expect(Object.values(description).join(" ")).not.toMatch(/\b\d+\s*[x×]\s*\d+\b/);
-    expect(Object.values(description).join(" ")).not.toMatch(/larger than \d+/i);
+    expect(Object.values(description).join(" ")).not.toMatch(
+      /\b\d+\s*[x×]\s*\d+\b/,
+    );
+    expect(Object.values(description).join(" ")).not.toMatch(
+      /larger than \d+/i,
+    );
   });
 });

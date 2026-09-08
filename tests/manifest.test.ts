@@ -9,7 +9,13 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { loadManifest, importManifest, hash } from "../src/core/manifest.js";
+import {
+  datasetJsonl,
+  generatedManifest,
+  loadManifest,
+  importManifest,
+  hash,
+} from "../src/core/manifest.js";
 it("imports PNG bytes, hashes content, rejects duplicates and path escapes", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "evalforge-manifest-"));
   try {
@@ -42,4 +48,54 @@ it("imports PNG bytes, hashes content, rejects duplicates and path escapes", asy
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+it("builds generated datasets and exports canonical JSONL without internal paths", () => {
+  const dataset = generatedManifest(
+    {
+      cases: [
+        {
+          caseId: "text-001",
+          inputText: "Priority: high",
+          expected: { priority: "high" },
+          metadata: { source: "synthetic" },
+        },
+      ],
+    },
+    { taskKind: "text-json", name: "Synthetic text" },
+  );
+  expect(dataset.version).toMatch(/^[a-f0-9]{64}$/);
+  const raw = datasetJsonl({
+    ...dataset,
+    cases: [
+      {
+        ...dataset.cases[0],
+        imagePath: "/private/internal/assets/a.png",
+        originalImagePath: "fixtures/a.png",
+        imageHash: "private-hash",
+      },
+    ],
+  });
+  expect(raw).toContain('"imagePath":"fixtures/a.png"');
+  expect(raw).not.toContain("/private/internal");
+  expect(raw).not.toContain("private-hash");
+  expect(() =>
+    generatedManifest(
+      {
+        cases: [
+          {
+            caseId: "duplicate",
+            inputText: "a",
+            expected: {},
+          },
+          {
+            caseId: "duplicate",
+            inputText: "b",
+            expected: {},
+          },
+        ],
+      },
+      { taskKind: "text-json", name: "Invalid" },
+    ),
+  ).toThrow(/Duplicate/);
 });

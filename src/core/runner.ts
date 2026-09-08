@@ -6,12 +6,14 @@ import type {
   RunConfig,
   CaseResult,
   TargetConfig,
+  TaskKind,
 } from "./types.js";
 import {
   callOpenAICompatible,
   discoverTargetMetadata,
   ProviderError,
   testTarget,
+  testToolCallingTarget,
   PREFLIGHT_SCHEMA,
   type ModelResponse,
 } from "./providers.js";
@@ -21,8 +23,10 @@ import {
   GRADER_VERSION,
   validateSchemaDefinition,
 } from "./grading.js";
+import { gradeToolCalls } from "./tool-grading.js";
+import { validateRunConfig } from "./project.js";
 import type { DatabaseStore } from "../storage/db.js";
-import { registerSecrets, sanitize, validateTarget } from "./security.js";
+import { registerSecrets, sanitize } from "./security.js";
 
 type AttemptRecord = {
   attempt: number;
@@ -102,6 +106,83 @@ function stable(value: unknown): string {
       .join(",")}}`;
   return JSON.stringify(value ?? null);
 }
+
+export function inferTaskKind(manifest: DatasetManifest): TaskKind {
+  return (
+    manifest.taskKind ??
+    (manifest.cases.some((item) => item.inputText !== undefined)
+      ? "text-json"
+      : "document-json")
+  );
+}
+
+export function resolveTaskKind(
+  manifest: DatasetManifest,
+  config: RunConfig,
+): TaskKind {
+  if (
+    config.taskKind !== undefined &&
+    manifest.taskKind !== undefined &&
+    config.taskKind !== manifest.taskKind
+  )
+    throw new Error(
+      `Run taskKind ${config.taskKind} does not match dataset taskKind ${manifest.taskKind}.`,
+    );
+  return config.taskKind ?? inferTaskKind(manifest);
+}
+
+/** Validate requirements that can only be checked once a dataset is present. */
+export function validateRunRequirements(
+  manifest: DatasetManifest,
+  config: RunConfig,
+  taskKind = resolveTaskKind(manifest, config),
+): void {
+  if (!Array.isArray(manifest.cases) || manifest.cases.length === 0)
+    throw new Error("Manifest must contain a non-empty cases array.");
+  for (const item of manifest.cases) {
+    if (taskKind === "document-json" && typeof item.imagePath !== "string")
+      throw new Error(`Case ${item.caseId}: document-json requires imagePath.`);
+    if (
+      (taskKind === "text-json" || taskKind === "tool-calling") &&
+      typeof item.inputText !== "string"
+    )
+      throw new Error(`Case ${item.caseId}: ${taskKind} requires inputText.`);
+    if (
+      taskKind === "tool-calling" &&
+      item.expected !== undefined &&
+      (!Array.isArray(item.expected) ||
+        item.expected.some(
+          (call: any) =>
+            !call ||
+            typeof call.name !== "string" ||
+            !call.name.trim() ||
+            !call.arguments ||
+            typeof call.arguments !== "object" ||
+            Array.isArray(call.arguments),
+        ))
+    )
+      throw new Error(
+        `Case ${item.caseId}: tool-calling expected must be an array of name/arguments objects.`,
+      );
+    if (
+      !config.inferenceOnly &&
+      item.expected === undefined
+    )
+      throw new Error(
+        "Evaluation mode requires expected JSON for every case. Set inferenceOnly to true for unlabeled data.",
+      );
+  }
+  if (
+    taskKind === "document-json" &&
+    config.extractionSource === "reference" &&
+    manifest.cases.some(
+      (item) => typeof item.referenceTranscription !== "string",
+    )
+  )
+    throw new Error(
+      "Extraction-only mode requires a reference transcription for every case.",
+    );
+}
 function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   const abort = () => controller.abort(parent?.reason);
@@ -124,6 +205,10 @@ async function hashAssets(manifest: DatasetManifest) {
   const hashes: Record<string, string> = {};
   await Promise.all(
     manifest.cases.map(async (item) => {
+      if (!item.imagePath) {
+        hashes[item.caseId] = item.imageHash ?? "not-applicable";
+        return;
+      }
       try {
         hashes[item.caseId] = createHash("sha256")
           .update(await readFile(item.imagePath))
@@ -229,6 +314,62 @@ async function requestStage(
 function generationFor(config: RunConfig, target: TargetConfig) {
   return { ...(config.generation ?? {}), ...(target.generation ?? {}) };
 }
+
+function toolCallsFromResponse(response: ModelResponse): unknown[] {
+  const responseRecord = response as unknown as Record<string, unknown>;
+  const raw = response.raw as unknown;
+  const rawRecord =
+    raw !== null && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : undefined;
+  const message =
+    Array.isArray(rawRecord?.choices) &&
+    rawRecord.choices[0] !== null &&
+    typeof rawRecord.choices[0] === "object" &&
+    !Array.isArray(rawRecord.choices[0]) &&
+    (rawRecord.choices[0] as Record<string, unknown>).message !== null &&
+    typeof (rawRecord.choices[0] as Record<string, unknown>).message ===
+      "object" &&
+    !Array.isArray((rawRecord.choices[0] as Record<string, unknown>).message)
+      ? ((rawRecord.choices[0] as Record<string, unknown>)
+          .message as Record<string, unknown>)
+      : undefined;
+  const candidates: Array<{
+    label: string;
+    present: boolean;
+    value: unknown;
+  }> = [
+    {
+      label: "response.toolCalls",
+      present: Object.hasOwn(responseRecord, "toolCalls"),
+      value: responseRecord.toolCalls,
+    },
+    {
+      label: "response.raw.toolCalls",
+      present: rawRecord !== undefined && Object.hasOwn(rawRecord, "toolCalls"),
+      value: rawRecord?.toolCalls,
+    },
+    {
+      label: "response.raw.tool_calls",
+      present: rawRecord !== undefined && Object.hasOwn(rawRecord, "tool_calls"),
+      value: rawRecord?.tool_calls,
+    },
+    {
+      label: "response.raw.choices[0].message.tool_calls",
+      present: message !== undefined && Object.hasOwn(message, "tool_calls"),
+      value: message?.tool_calls,
+    },
+  ];
+  for (const candidate of candidates) {
+    if (candidate.present && !Array.isArray(candidate.value))
+      throw new Error(
+        `Provider returned malformed ${candidate.label}; expected an array.`,
+      );
+  }
+  const calls = candidates.find((candidate) => Array.isArray(candidate.value));
+  return (calls?.value as unknown[] | undefined) ?? [];
+}
+
 async function runCase(
   item: DatasetManifest["cases"][number],
   runId: string,
@@ -238,13 +379,19 @@ async function runCase(
 ): Promise<CaseResult> {
   const caseStarted = Date.now();
   event(db, runId, "case_started", { caseId: item.caseId });
+  const taskKind = config.taskKind ?? "document-json";
   const result: CaseResult & Record<string, unknown> = {
     caseId: item.caseId,
-    imagePath: item.imagePath,
+    ...(item.imagePath !== undefined ? { imagePath: item.imagePath } : {}),
+    ...(item.inputText !== undefined ? { inputText: item.inputText } : {}),
     ...(item.expected !== undefined ? { expected: item.expected } : {}),
-    referenceTranscription: item.referenceTranscription,
-    originalImagePath: item.originalImagePath,
-    imageHash: item.imageHash,
+    ...(item.referenceTranscription !== undefined
+      ? { referenceTranscription: item.referenceTranscription }
+      : {}),
+    ...(item.originalImagePath !== undefined
+      ? { originalImagePath: item.originalImagePath }
+      : {}),
+    ...(item.imageHash !== undefined ? { imageHash: item.imageHash } : {}),
     timings: {},
   };
   const provider = options.provider ?? callOpenAICompatible;
@@ -253,7 +400,10 @@ async function runCase(
     options.runtimeTargets?.extraction ?? config.extractionTarget;
   const judgeTarget = options.runtimeTargets?.judge ?? config.judgeTarget;
   try {
-    if (config.extractionSource !== "reference") {
+    if (taskKind === "document-json" && config.extractionSource !== "reference") {
+      const ocrPrompt = config.stagePrompts.ocr;
+      if (!ocrTarget || !ocrPrompt)
+        throw new Error("document-json OCR mode requires an OCR target and prompt.");
       const started = Date.now();
       const ocr = await requestStage(
         db,
@@ -263,7 +413,7 @@ async function runCase(
         (signal) =>
           provider(
             ocrTarget,
-            config.stagePrompts.ocr,
+            ocrPrompt,
             item.imagePath,
             "prompted-json",
             signal,
@@ -279,32 +429,54 @@ async function runCase(
       result.ocrRaw = ocr.raw;
     }
     const extractionText =
-      config.extractionSource === "reference"
-        ? item.referenceTranscription
-        : result.ocrText;
+      taskKind === "document-json"
+        ? config.extractionSource === "reference"
+          ? item.referenceTranscription
+          : result.ocrText
+        : item.inputText;
     if (typeof extractionText !== "string")
-      throw new Error(`Case ${item.caseId} cannot extract without OCR text.`);
+      throw new Error(
+        taskKind === "document-json"
+          ? `Case ${item.caseId} cannot extract without OCR text.`
+          : `Case ${item.caseId} cannot extract without inputText.`,
+      );
     const schema = options.schema ?? config.schema;
     const schemaPrompt =
-      config.outputMode === "prompted-json" && schema
+      taskKind !== "tool-calling" &&
+      (config.outputMode ?? "prompted-json") === "prompted-json" &&
+      schema
         ? `\n\nSchema:\n${JSON.stringify(schema)}`
         : "";
+    const extractionPrompt =
+      taskKind === "document-json"
+        ? `${config.stagePrompts.extraction}${schemaPrompt}\n\nTranscription:\n${extractionText}`
+        : `${config.stagePrompts.extraction}${schemaPrompt}\n\nInput:\n${extractionText}`;
+    const toolRequest =
+      taskKind === "tool-calling"
+        ? {
+            tools: config.tools,
+            toolChoice: config.toolChoice ?? "auto",
+          }
+        : undefined;
     const started = Date.now();
     const extraction = await requestStage(
       db,
       runId,
       item.caseId,
       "extraction",
-      (signal) =>
-        provider(
-          extractionTarget,
-          `${config.stagePrompts.extraction}${schemaPrompt}\n\nTranscription:\n${extractionText}`,
-          undefined,
-          config.outputMode,
-          signal,
-          schema,
-          generationFor(config, extractionTarget),
-        ),
+        (signal) =>
+          provider(
+            extractionTarget,
+            extractionPrompt,
+            undefined,
+            taskKind === "tool-calling"
+              ? "prompted-json"
+              : (config.outputMode ?? "prompted-json"),
+            signal,
+            taskKind === "tool-calling" ? undefined : schema,
+            generationFor(config, extractionTarget),
+            toolRequest,
+          ),
       options,
       config,
     );
@@ -312,20 +484,38 @@ async function runCase(
     result.rawExtraction = extraction.text;
     result.extractionUsage = extraction.usage;
     result.extractionRaw = extraction.raw;
-    try {
-      result.parsedJson = JSON.parse(extraction.text) as Json;
-    } catch {
-      result.parsedJson = undefined;
+    if (taskKind === "tool-calling") {
+      const toolCalls = toolCallsFromResponse(extraction);
+      result.toolCalls = toolCalls;
+      result.rawToolCalls = toolCalls;
+      if (!config.inferenceOnly)
+        result.grade = gradeToolCalls(
+          item.expected,
+          toolCalls,
+          config.tools ?? [],
+          config.toolCallOrder ?? "ordered",
+        );
+    } else {
+      try {
+        result.parsedJson = JSON.parse(extraction.text) as Json;
+      } catch {
+        result.parsedJson = undefined;
+      }
+      if (!config.inferenceOnly)
+        result.grade = gradeJson(
+          item.expected as Json,
+          result.parsedJson,
+          schema,
+          config.fieldRules,
+          config.crossFieldRules,
+        );
     }
-    if (!config.inferenceOnly)
-      result.grade = gradeJson(
-        item.expected,
-        result.parsedJson,
-        schema,
-        config.fieldRules,
-        config.crossFieldRules,
-      );
-    if (!config.inferenceOnly && judgeTarget && config.judgeRubric)
+    if (
+      taskKind !== "tool-calling" &&
+      !config.inferenceOnly &&
+      judgeTarget &&
+      config.judgeRubric
+    )
       try {
         const judge = await requestStage(
           db,
@@ -394,15 +584,23 @@ export async function runEvaluation(
 ) {
   const runId = randomUUID();
   const db = options.db as ExtendedDb;
-  const extractionOnly = config.extractionSource === "reference";
+  const taskKind = resolveTaskKind(manifest, config);
+  const suppliedSchema = options.schema ?? config.schema;
+  const normalizedConfig = {
+    ...config,
+    taskKind,
+    ...(suppliedSchema !== undefined ? { schema: suppliedSchema } : {}),
+  } as RunConfig;
+  validateRunConfig(normalizedConfig);
+  config = normalizedConfig;
+  validateRunRequirements(manifest, config, taskKind);
+  const extractionOnly =
+    taskKind === "document-json" && config.extractionSource === "reference";
   registerSecrets(
     [config.ocrTarget, config.extractionTarget, config.judgeTarget].filter(
       Boolean,
     ) as TargetConfig[],
   );
-  if (!extractionOnly) validateTarget(config.ocrTarget);
-  validateTarget(config.extractionTarget);
-  if (config.judgeTarget) validateTarget(config.judgeTarget);
   if (
     !Number.isInteger(config.concurrency ?? 1) ||
     (config.concurrency ?? 1) < 1
@@ -413,26 +611,13 @@ export async function runEvaluation(
     (!Number.isFinite(config.requestTimeoutMs) || config.requestTimeoutMs <= 0)
   )
     throw new Error("requestTimeoutMs must be positive.");
-  const schema = options.schema ?? config.schema;
+  const schema = config.schema;
   if (schema && typeof schema === "object") validateSchemaDefinition(schema);
-  if (
-    config.outputMode === "schema-constrained-json" &&
-    (!schema || typeof schema !== "object")
-  )
-    throw new Error("Schema-constrained mode requires an extraction schema.");
-  if (
-    extractionOnly &&
-    manifest.cases.some(
-      (item) => typeof item.referenceTranscription !== "string",
-    )
-  )
-    throw new Error(
-      "Extraction-only mode requires a reference transcription for every case.",
-    );
   const runtimeTargets = {
-    ocr: extractionOnly
+    ocr:
+      taskKind !== "document-json" || extractionOnly
       ? undefined
-      : (db.resolveTarget?.(config.ocrTarget) ?? config.ocrTarget),
+      : (db.resolveTarget?.(config.ocrTarget!) ?? config.ocrTarget),
     extraction:
       db.resolveTarget?.(config.extractionTarget) ?? config.extractionTarget,
     judge: config.judgeTarget
@@ -447,7 +632,13 @@ export async function runEvaluation(
   };
   const effectiveConfig: RunConfig = {
     ...config,
-    ocrTarget: credentialFreeTarget(runtimeTargets.ocr ?? config.ocrTarget)!,
+    ...(config.ocrTarget
+      ? {
+          ocrTarget: credentialFreeTarget(
+            runtimeTargets.ocr ?? config.ocrTarget,
+          ),
+        }
+      : {}),
     extractionTarget: credentialFreeTarget(runtimeTargets.extraction)!,
     ...(runtimeTargets.judge || config.judgeTarget
       ? {
@@ -464,13 +655,6 @@ export async function runEvaluation(
       runtimeTargets.judge,
     ].filter(Boolean) as TargetConfig[],
   );
-  if (
-    !config.inferenceOnly &&
-    manifest.cases.some((item) => item.expected === undefined)
-  )
-    throw new Error(
-      "Evaluation mode requires expected JSON for every case. Set inferenceOnly to true for unlabeled data.",
-    );
   const assetHashes = await hashAssets(manifest);
   const hash = (value: unknown) =>
     createHash("sha256").update(stable(value)).digest("hex");
@@ -489,7 +673,9 @@ export async function runEvaluation(
     : {
         ocr: extractionOnly
           ? targetSnapshot()
-          : await discoverTargetMetadata(runtimeTargets.ocr!, options.signal),
+          : taskKind !== "document-json"
+            ? targetSnapshot()
+            : await discoverTargetMetadata(runtimeTargets.ocr!, options.signal),
         extraction: await discoverTargetMetadata(
           runtimeTargets.extraction,
           options.signal,
@@ -516,6 +702,14 @@ export async function runEvaluation(
     fieldRulesHash: hash(config.fieldRules),
     judgeRubricHash: hash(config.judgeRubric),
     graderVersion: GRADER_VERSION,
+    taskKind,
+    ...(taskKind === "tool-calling"
+      ? {
+          tools: config.tools,
+          toolChoice: config.toolChoice ?? "auto",
+          toolCallOrder: config.toolCallOrder ?? "ordered",
+        }
+      : {}),
     stagePrompts: config.stagePrompts,
     targets,
   };
@@ -566,7 +760,7 @@ export async function runEvaluation(
   }
   try {
     if (!options.provider) {
-      if (!extractionOnly)
+      if (taskKind === "document-json" && !extractionOnly)
         await requestStage(
           db,
           runId,
@@ -579,7 +773,10 @@ export async function runEvaluation(
           executionOptions,
           config,
         );
-      if (config.outputMode === "schema-constrained-json")
+      if (
+        taskKind !== "tool-calling" &&
+        config.outputMode === "schema-constrained-json"
+      )
         await requestStage(
           db,
           runId,
@@ -591,6 +788,19 @@ export async function runEvaluation(
               { schema: PREFLIGHT_SCHEMA },
               signal,
             ).then((r) => r.response),
+          executionOptions,
+          config,
+        );
+      if (taskKind === "tool-calling")
+        await requestStage(
+          db,
+          runId,
+          "__preflight__",
+          "tool-preflight",
+          (signal) =>
+            testToolCallingTarget(runtimeTargets.extraction, signal).then(
+              (r) => r.response,
+            ),
           executionOptions,
           config,
         );

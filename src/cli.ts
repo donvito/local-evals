@@ -52,7 +52,7 @@ export async function main(args = process.argv.slice(2)) {
     }
     if (command === "import") {
       if (!p[0]) throw new Error("Provide a manifest path.");
-      const m = await importManifest(p[0], assetRoot);
+      const m = await importManifest(p[0], assetRoot, { allowMissingExpected: true });
       db.saveDataset(m);
       console.log(
         JSON.stringify({ version: m.version, cases: m.cases.length }, null, 2),
@@ -152,6 +152,7 @@ export async function main(args = process.argv.slice(2)) {
       for (const [stage, target] of [
         [
           "OCR",
+          (config.taskKind && config.taskKind !== "document-json") ||
           config.extractionSource === "reference"
             ? undefined
             : config.ocrTarget,
@@ -162,9 +163,13 @@ export async function main(args = process.argv.slice(2)) {
         if (target)
           console.log(stage + ": " + target.baseUrl + " / " + target.model);
       console.log(
-        config.extractionSource === "reference"
-          ? "Extraction consumes reference transcription."
-          : "OCR receives document image bytes. Remote/cloud endpoints receive document content.",
+        config.taskKind === "tool-calling"
+          ? "Tool-call evaluation sends text and tool definitions; proposed tools are never executed. Remote endpoints receive this content."
+          : config.taskKind === "text-json"
+            ? "Text-to-JSON evaluation sends input text. Remote endpoints receive this content."
+            : config.extractionSource === "reference"
+              ? "Extraction consumes reference transcription."
+              : "OCR receives document image bytes. Remote/cloud endpoints receive document content.",
       );
       const controller = new AbortController();
       const cancel = () => {

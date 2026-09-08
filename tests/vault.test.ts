@@ -52,10 +52,14 @@ describe("CredentialVault", () => {
     const { keyPath } = makeVault();
     const vault = new CredentialVault(keyPath);
     for (const malformed of ["not-json", JSON.stringify({ v: 2 }), "{}"])
-      expect(() => vault.decrypt(malformed)).toThrow("Invalid vault ciphertext.");
+      expect(() => vault.decrypt(malformed)).toThrow(
+        "Invalid vault ciphertext.",
+      );
 
     const envelope = JSON.parse(vault.encrypt("secret"));
-    envelope.ciphertext = `${envelope.ciphertext.slice(0, -1)}A`;
+    const bytes = Buffer.from(envelope.ciphertext, "base64");
+    bytes[0] ^= 1;
+    envelope.ciphertext = bytes.toString("base64");
     expect(() => vault.decrypt(JSON.stringify(envelope))).toThrow(
       "Invalid vault ciphertext.",
     );

@@ -1,6 +1,6 @@
 # EvalForge
 
-Local evaluation of **document image → OCR transcription → structured JSON**. Node 22+, TypeScript, React, SQLite.
+Local evaluation of **document → JSON**, **unstructured text → JSON**, and **tool-call proposals**, using local OpenAI-compatible servers or OpenRouter. Node 22+, TypeScript, React, SQLite.
 
 ## Try the offline demo
 
@@ -11,13 +11,55 @@ npm run demo
 
 This runs the included synthetic invoice suite against a local mock endpoint, creates a passing run and a deliberately regressed run, verifies comparison/export, and serves the dashboard at **http://127.0.0.1:4180**. The demo database is separate: `.evalforge/demo.db`. These are fixture responses, not measurements of a real model.
 
+## Synthetic text and tool-call suites
+
+Two small, offline fixtures exercise the native non-document modes. They contain
+only fictional data and have no personal information:
+
+- `sample-data/text-json/manifest.json` contains six natural-language and structured-text cases, including missing fields, `null`, ISO dates, zero/negative/large numbers, and decimals. Its config is `sample-data/text-json/config.json`.
+- `sample-data/tool-calling/manifest.json` contains six tool-intent cases covering one call, ordered multiple calls, no call, and ambiguous requests that should remain unanswered. Its config is `sample-data/tool-calling/config.json`.
+
+The `CASE_ID=...` line in each input is a deterministic fixture-oracle marker used
+only by the local mock. It makes the smoke test reproducible; these runs are not
+model-quality benchmarks.
+
+To use the fixtures in the dashboard, start `npm run dev`, open **Datasets**, and
+use the **Import Text → JSON** or **Import Tool calling** quick sample button.
+The equivalent project-relative paths in the **Import a dataset** field are
+`sample-data/text-json/manifest.json` and
+`sample-data/tool-calling/manifest.json`. Then open **Setup**, choose the matching
+evaluation type and dataset, then click **Load sample settings** to populate the
+editable schema, prompts, or tool definitions. Advanced users can instead enter
+the corresponding file in **Evaluation configuration**; an active file owns its
+schema, prompts, and grading definitions until **Use native editors** is selected.
+For the mock target, open **Targets → Add target** and use
+`http://127.0.0.1:8099/v1`, model `mock-text-json` or `mock-tool-calling`, and
+**OpenAI-compatible**; mark **Tool calling** for the tool suite. Run the mock in
+another terminal with `npm run mock` before testing the target.
+
+The command-line path is deterministic and does not require a dashboard target:
+for the two direct `run` commands, start `npm run mock` in another terminal
+first. `npm run smoke:modes` starts and stops its own mock automatically.
+
+```bash
+npm run smoke:modes
+npm exec -- tsx src/cli.ts run sample-data/text-json/manifest.json sample-data/text-json/config.json --db /tmp/evalforge-text-json.db --threshold 1
+npm exec -- tsx src/cli.ts run sample-data/tool-calling/manifest.json sample-data/tool-calling/config.json --db /tmp/evalforge-tool-calling.db --threshold 1
+```
+
+The mode smoke starts the local mock, runs both passing suites, and then changes
+the mock model name to produce deliberate failures. Tool calls are proposed and
+recorded for grading only; EvalForge never executes a real tool.
+
 For your regular workspace:
 
 ```bash
 npm run dev
 ```
 
-The dashboard prints its URL (default port 4173). Use Targets to save/test endpoints, Datasets to import a manifest, and Setup to save stage selections and copy the run command. Evaluation executes in your terminal; the dashboard polls persisted progress. Credentials entered in Targets are encrypted locally and resolved by runs using the same database; environment-variable references remain supported for file-based configurations.
+The dashboard prints its URL (default port 4173). Use Targets to save/test endpoints, Datasets to import a manifest or a sample, and Setup to start an evaluation directly in the UI. Progress, stop controls, logs, and results are available in the dashboard; the terminal command remains an option. Credentials entered in Targets are encrypted locally and resolved by runs using the same database; environment-variable references remain supported for file-based configurations.
+
+For OpenRouter targets, search the model catalog and filter by Vision, Structured JSON, Tools, Free, or minimum context. Selecting a result fills the model ID and advertised capabilities. Public metadata is cached server-side; credentials and dataset content are never sent with catalog requests. Capability metadata is advisory: actual support also depends on the provider endpoint. Manual model entry remains available for local endpoints or catalog failures.
 
 ## Real evaluations
 
@@ -71,6 +113,10 @@ One JSON object per line:
 
 JSON manifests with `{ "cases": [...] }` are also supported. Image paths are relative to the manifest's directory and must remain within it. PNG/JPEG signatures and extensions are checked. Import copies assets beside the selected database, hashes their bytes, and computes a content-derived dataset version from cases, expected JSON, references, metadata, and hashes. Existing run history is migrated without deletion.
 
+Native text manifests declare `taskKind: "text-json"` and cases with `inputText` instead of `imagePath`. Tool manifests declare `taskKind: "tool-calling"`; each case's `expected` is an array of `{ "name": "function_name", "arguments": { ... } }`, or `[]` when no call is expected. Tool configurations supply OpenAI-format `tools`, `toolChoice` (`auto`, `required`, or `none`), and `toolCallOrder` (`ordered` or `unordered`). The matching `taskKind` belongs in the run config too. Existing image configurations without a task kind continue to work.
+
+Tool evaluations are single-turn and side-effect-free. They check names, call counts, JSON arguments, and argument schemas; they do not run functions or continue a conversation with tool results. Tool calls use their own response protocol, not JSON output mode or the optional semantic judge.
+
 ## Configuration and grading
 
 Supply a JSON Schema inline as `schema` or in `schema.json` next to the config (`schemaPath` overrides this). Invalid schemas block startup. Draft 7 and 2020-12 are supported.
@@ -117,14 +163,14 @@ Parse rate, schema rate, deterministic field accuracy, and case pass rate are se
 
 Comparisons require compatible dataset, schema, grader, field rules, and extraction source; matching cases determine the reported sample count. Stage models/prompts may differ. Request attempts, raw outputs, hashes, prompts, schema, usage, and available cost are retained. Unavailable server/quantization/routing metadata is labeled unknown. Secrets are encrypted with AES-256-GCM in the local credential vault (`<database>.credentials.key`, mode `0600`), never returned by the API, and redacted from stored/exported responses. The vault key is local to that database; protect it with the database file.
 
-## Your real receipts
+## Private datasets
 
-The supplied receipt folder has been staged under `datasets/receipts`: 61 source
-images, 56 unique images, one assistant-image-reviewed three-field starter case,
-and 55 cases awaiting annotation. Originals are unchanged. See
-[receipt dataset instructions](datasets/receipts/README.md) for importing, labeling,
-and running against real model endpoints. The starter labels need human review;
-these images have not been used to claim any model-quality results.
+Keep real receipts and other private input data under the ignored `datasets/`
+directory. Import their manifests through the dataset library. Use
+inference-only mode for unlabeled inputs, and human-review expected outputs
+before treating a run as a model-quality benchmark. Local databases, vault keys,
+run exports, and private datasets are excluded from Git; synthetic sample data
+is included.
 
 ## Verification
 
@@ -133,6 +179,7 @@ npm run lint
 npm test
 npm run build
 npm run smoke
+npm run smoke:modes
 ```
 
 Tests cover grading edge cases, provider payloads, run execution, dataset integrity, SQLite migration, metrics parity, and local API safety. The offline smoke exercises both stages and paired exports. A real 50-image llama.cpp/OpenRouter benchmark needs those endpoints, credentials, and a 50-case dataset; mock runs cannot establish model quality.

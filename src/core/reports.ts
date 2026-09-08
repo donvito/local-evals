@@ -49,15 +49,46 @@ export function metrics(
   };
 }
 export function compatibility(config: any, snapshot: any) {
+  const snapshotConfig = snapshot?.config ?? {};
+  const taskKind =
+    config.taskKind ??
+    snapshot?.taskKind ??
+    snapshotConfig.taskKind ??
+    "document-json";
+  const schema = snapshot?.schema ?? snapshotConfig.schema ?? config.schema;
+  const tools =
+    taskKind === "tool-calling"
+      ? config.tools ?? snapshotConfig.tools ?? snapshot?.tools ?? []
+      : [];
   return hash(
     stable({
       dataset: config.datasetVersion,
-      schema: snapshot.schema ?? config.schema,
+      schema,
+      schemaHash: snapshot?.schemaHash ?? hash(stable(schema)),
       schemaVersion: config.schemaVersion,
-      grader: snapshot.graderVersion ?? "legacy",
+      grader: snapshot?.graderVersion ?? "legacy",
       rules: config.fieldRules,
       cross: config.crossFieldRules,
-      source: config.extractionSource ?? "ocr",
+      taskKind,
+      tools,
+      toolChoice:
+        taskKind === "tool-calling"
+          ? config.toolChoice ??
+            snapshotConfig.toolChoice ??
+            snapshot?.toolChoice ??
+            "auto"
+          : undefined,
+      toolCallOrder:
+        taskKind === "tool-calling"
+          ? config.toolCallOrder ??
+            snapshotConfig.toolCallOrder ??
+            snapshot?.toolCallOrder ??
+            "ordered"
+          : undefined,
+      source:
+        taskKind === "document-json"
+          ? config.extractionSource ?? "ocr"
+          : "native",
     }),
   );
 }
@@ -68,7 +99,7 @@ export function compareRuns(left: any, right: any) {
     compatibility(right.config, right.snapshot)
   )
     throw new Error(
-      "Runs have incompatible dataset, schema, grader, field rules, or extraction source.",
+      "Runs have incompatible dataset, schema, grader, field rules, extraction source, task kind, tools, tool order, or tool choice.",
     );
   if (left.config.inferenceOnly || right.config.inferenceOnly)
     throw new Error(
@@ -122,6 +153,10 @@ export function compareRuns(left: any, right: any) {
 }
 export function markdownReport(run: any) {
   const m = run.metrics;
+  const taskKind =
+    run.config?.taskKind ?? run.snapshot?.taskKind ?? "document-json";
+  const passRate =
+    m.passRate == null ? "unavailable" : (m.passRate * 100).toFixed(2) + "%";
   const evidence =
     "\n\n## Configuration, snapshot and request attempts\n\n```json\n" +
     JSON.stringify(
@@ -140,8 +175,10 @@ export function markdownReport(run: any) {
     "; passed: " +
     m.passed +
     "; pass rate: " +
-    (m.passRate * 100).toFixed(2) +
-    "%\n\nJSON parse: " +
+    passRate +
+    "\n\nTask kind: " +
+    taskKind +
+    "\n\nJSON parse: " +
     m.parseRate +
     "; schema: " +
     m.schemaRate +

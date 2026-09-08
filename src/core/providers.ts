@@ -1,11 +1,13 @@
 import { readFile } from "node:fs/promises";
-import type { TargetConfig } from "./types.js";
+import type { TargetConfig, ToolChoice, ToolDefinition } from "./types.js";
 import { registerSecrets, sanitize } from "./security.js";
 import AjvModule from "ajv";
 import Ajv2020Module from "ajv/dist/2020.js";
 
 export type ModelResponse = {
   text: string;
+  /** Raw OpenAI-compatible message.tool_calls, including malformed arguments. */
+  toolCalls?: unknown[];
   usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
   raw: unknown;
 };
@@ -20,7 +22,22 @@ export class ProviderError extends Error {
 }
 
 export type ProviderTestResult = { ok: true; response: ModelResponse };
-export type ProviderTestOptions = { vision?: boolean; schema?: object };
+export type ProviderRequestOptions = {
+  imagePath?: string;
+  outputMode?: "prompted-json" | "schema-constrained-json";
+  signal?: AbortSignal;
+  schema?: object;
+  generation?: Record<string, unknown>;
+  tools?: ToolDefinition[];
+  toolChoice?: ToolChoice;
+};
+export type ProviderTestOptions = {
+  vision?: boolean;
+  schema?: object;
+  tools?: ToolDefinition[];
+  toolChoice?: ToolChoice;
+  maxTokens?: number;
+};
 export const PREFLIGHT_SCHEMA = {
   type: "object",
   properties: { ok: { type: "boolean" } },
@@ -65,6 +82,19 @@ function validateStructuredResponse(
 const PREFLIGHT_PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAkklEQVR4nO3QMQEAIACEQO0fWq/Hw8IM9+EM0wD9DeBZGqC/ATxLA/Q3gGdpgP4G8CwN0N8AnqUB+hvAszRAfwN4lgbobwDP0gD9DeBZGqC/ATxLA/Q3gGdpgP4G8CwN0N8AnqUB+hvAszRAfwN4lgbobwDP0gD9DeBZGqC/ATxLA/Q3gGdpgP4G8CwN0N8AnuUDskn/QYWtf4YAAAAASUVORK5CYII=";
 
+export const TOOL_PREFLIGHT_PROBE: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "evalforge_probe",
+    description: "EvalForge capability probe. Do not perform external work.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
 function imageMime(path: string): string {
   return path.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
 }
@@ -76,6 +106,9 @@ function responseText(raw: any): string | undefined {
     return content
       .map((part) => (typeof part?.text === "string" ? part.text : ""))
       .join("");
+  // OpenAI tool calls conventionally set content to null. Treat that as an
+  // empty text response instead of rejecting an otherwise valid call.
+  if (content === null) return "";
   return undefined;
 }
 
@@ -87,6 +120,35 @@ function usageFrom(raw: any): ModelResponse["usage"] {
     outputTokens: usage.completion_tokens ?? usage.output_tokens,
     costUsd: usage.cost_usd ?? usage.cost,
   };
+}
+
+function providerErrorDetail(raw: any): string | undefined {
+  if (!raw || typeof raw !== "object" || !Object.hasOwn(raw, "error"))
+    return undefined;
+  const error = raw?.error;
+  if (error == null) return undefined;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    for (const key of ["message", "detail", "code"]) {
+      if (typeof error[key] === "string") return error[key];
+    }
+    return "unknown provider error";
+  }
+  return String(error);
+}
+
+function providerErrorMessage(
+  target: TargetConfig,
+  raw: any,
+): string | undefined {
+  const detail = providerErrorDetail(raw);
+  if (!detail) return undefined;
+  const safeDetail = sanitize(detail);
+  const endpointHint =
+    /unexpected endpoint|endpoint or method|\/chat\/completions/i.test(detail)
+      ? " Check that the provider base URL includes /v1."
+      : "";
+  return `${target.name} returned a provider error: ${safeDetail}.${endpointHint}`;
 }
 
 async function postChat(
@@ -138,27 +200,93 @@ async function postChat(
       safeRaw,
     );
   }
+  const providerError = providerErrorMessage(target, raw);
+  if (providerError)
+    throw new ProviderError(providerError, false, sanitize(raw));
   const text = responseText(raw);
-  if (typeof text !== "string")
-    throw new ProviderError(`Target ${target.name} returned no text content.`);
-  return { text, raw, usage: usageFrom(raw) };
+  const message = raw?.choices?.[0]?.message;
+  const toolCalls = Array.isArray(message?.tool_calls)
+    ? (message.tool_calls as unknown[])
+    : undefined;
+  if (typeof text !== "string" && !toolCalls) {
+    const choices = Array.isArray(raw?.choices) ? raw.choices.length : 0;
+    const finishReason =
+      typeof raw?.choices?.[0]?.finish_reason === "string"
+        ? raw.choices[0].finish_reason
+        : "unknown";
+    throw new ProviderError(
+      `Target ${target.name} returned no text content or tool calls (choices=${choices}, finish_reason=${finishReason}). Check the provider response and that the base URL targets its OpenAI-compatible /v1 endpoint.`,
+    );
+  }
+  return {
+    text: text ?? "",
+    ...(toolCalls ? { toolCalls } : {}),
+    raw,
+    usage: usageFrom(raw),
+  };
+}
+
+export function providerRequestOptions(
+  imagePathOrOptions?: string | ProviderRequestOptions,
+  outputMode: "prompted-json" | "schema-constrained-json" = "prompted-json",
+  signal?: AbortSignal,
+  schema?: object,
+  generation?: Record<string, unknown>,
+  requestOptions?: ProviderRequestOptions,
+): ProviderRequestOptions {
+  if (imagePathOrOptions && typeof imagePathOrOptions === "object")
+    return { ...imagePathOrOptions };
+  return {
+    ...(requestOptions ?? {}),
+    imagePath: imagePathOrOptions,
+    outputMode,
+    signal,
+    schema,
+    generation,
+  };
 }
 
 export async function callOpenAICompatible(
   target: TargetConfig,
   prompt: string,
+  options?: ProviderRequestOptions,
+): Promise<ModelResponse>;
+export async function callOpenAICompatible(
+  target: TargetConfig,
+  prompt: string,
   imagePath?: string,
+  outputMode?: "prompted-json" | "schema-constrained-json",
+  signal?: AbortSignal,
+  schema?: object,
+  generation?: Record<string, unknown>,
+  requestOptions?: ProviderRequestOptions,
+): Promise<ModelResponse>;
+export async function callOpenAICompatible(
+  target: TargetConfig,
+  prompt: string,
+  imagePathOrOptions?: string | ProviderRequestOptions,
   outputMode: "prompted-json" | "schema-constrained-json" = "prompted-json",
   signal?: AbortSignal,
   schema?: object,
   generation?: Record<string, unknown>,
+  requestOptions?: ProviderRequestOptions,
 ): Promise<ModelResponse> {
+  const options = providerRequestOptions(
+    imagePathOrOptions,
+    outputMode,
+    signal,
+    schema,
+    generation,
+    requestOptions,
+  );
+  const requestImagePath = options.imagePath;
+  const requestOutputMode = options.outputMode ?? "prompted-json";
   const userContent: any[] = [{ type: "text", text: prompt }];
-  if (imagePath)
+  if (requestImagePath)
     userContent.push({
       type: "image_url",
       image_url: {
-        url: `data:${imageMime(imagePath)};base64,${(await readFile(imagePath)).toString("base64")}`,
+        url: `data:${imageMime(requestImagePath)};base64,${(await readFile(requestImagePath)).toString("base64")}`,
       },
     });
   const allowedGeneration = [
@@ -172,7 +300,7 @@ export async function callOpenAICompatible(
     "stop",
     "n",
   ];
-  const normalizedGeneration = { ...(generation ?? {}) };
+  const normalizedGeneration = { ...(options.generation ?? {}) };
   if (
     normalizedGeneration.maxTokens != null &&
     normalizedGeneration.max_tokens == null &&
@@ -191,23 +319,37 @@ export async function callOpenAICompatible(
     messages: [{ role: "user", content: userContent }],
     ...safeGeneration,
   };
-  if (outputMode === "schema-constrained-json") {
+  const usesTools =
+    options.tools !== undefined || options.toolChoice !== undefined;
+  if (usesTools && target.supportsTools === false)
+    throw new ProviderError(
+      `Target ${target.name} does not advertise tool-calling support.`,
+    );
+  if (options.tools?.length) body.tools = options.tools;
+  if (options.toolChoice !== undefined) body.tool_choice = options.toolChoice;
+  if (options.tools?.length && target.provider === "openrouter")
+    body.provider = { ...(body.provider ?? {}), require_parameters: true };
+  if (requestOutputMode === "schema-constrained-json" && !usesTools) {
     if (!target.supportsStructuredOutput)
       throw new ProviderError(
         `Target ${target.name} does not advertise schema-constrained JSON support.`,
       );
-    if (!schema)
+    if (!options.schema)
       throw new ProviderError(
         "Schema-constrained mode requires an extraction schema.",
       );
     body.response_format = {
       type: "json_schema",
-      json_schema: { name: "evalforge_extraction", strict: true, schema },
+      json_schema: {
+        name: "evalforge_extraction",
+        strict: true,
+        schema: options.schema,
+      },
     };
     if (target.provider === "openrouter")
       body.provider = { ...(body.provider ?? {}), require_parameters: true };
   }
-  return postChat(target, body, signal);
+  return postChat(target, body, options.signal);
 }
 
 /** Performs a real, minimal multimodal request so an advertised vision target
@@ -222,7 +364,13 @@ export async function testTarget(
     throw new ProviderError(
       `Target ${target.name} does not support image input.`,
     );
-  if (options.schema && !target.supportsStructuredOutput)
+  const usesTools =
+    options.tools !== undefined || options.toolChoice !== undefined;
+  if (usesTools && target.supportsTools === false)
+    throw new ProviderError(
+      `Target ${target.name} does not advertise tool-calling support.`,
+    );
+  if (options.schema && !usesTools && !target.supportsStructuredOutput)
     throw new ProviderError(
       `Target ${target.name} does not advertise schema-constrained JSON support.`,
     );
@@ -231,7 +379,9 @@ export async function testTarget(
       type: "text",
       text: options.schema
         ? "Reply with a JSON object matching the supplied schema."
-        : "Reply with OK.",
+        : usesTools
+          ? `Call the ${options.tools?.[0]?.function.name ?? "supplied"} function exactly once with an empty JSON object. Do not answer with text.`
+          : "Reply with OK.",
     },
   ];
   if (vision)
@@ -241,10 +391,14 @@ export async function testTarget(
     });
   const body: any = {
     model: target.model,
-    max_tokens: 8,
+    max_tokens: options.maxTokens ?? (options.tools?.length ? 64 : 8),
     messages: [{ role: "user", content }],
   };
-  if (options.schema) {
+  if (options.tools?.length) body.tools = options.tools;
+  if (options.toolChoice !== undefined) body.tool_choice = options.toolChoice;
+  if (options.tools?.length && target.provider === "openrouter")
+    body.provider = { ...(body.provider ?? {}), require_parameters: true };
+  if (options.schema && !usesTools) {
     body.response_format = {
       type: "json_schema",
       json_schema: {
@@ -257,10 +411,63 @@ export async function testTarget(
       body.provider = { require_parameters: true };
   }
   const response = await postChat(target, body, signal);
-  if (options.schema) {
+  if (options.schema && !usesTools) {
     validateStructuredResponse(target, options.schema, response.text);
   }
   return { ok: true, response };
+}
+
+/**
+ * Perform a safe tool-capability probe using a no-argument local function.
+ * The function is never executed; only the provider's returned call envelope
+ * is checked. Runtime evaluation tools are intentionally not sent here.
+ */
+export async function testToolCallingTarget(
+  target: TargetConfig,
+  signal?: AbortSignal,
+): Promise<ProviderTestResult> {
+  const result = await testTarget(
+    target,
+    {
+      tools: [TOOL_PREFLIGHT_PROBE],
+      toolChoice: "required",
+      maxTokens: 512,
+    },
+    signal,
+  );
+  const calls = result.response.toolCalls ?? [];
+  if (calls.length !== 1) {
+    throw new ProviderError(
+      `Target ${target.name} did not return the required tool preflight call.`,
+    );
+  }
+  const call = calls[0] as any;
+  const fn = call && typeof call.function === "object" ? call.function : call;
+  if (!fn || fn.name !== TOOL_PREFLIGHT_PROBE.function.name)
+    throw new ProviderError(
+      `Target ${target.name} returned the wrong tool during preflight.`,
+    );
+  let args: unknown;
+  try {
+    args =
+      typeof fn.arguments === "string"
+        ? JSON.parse(fn.arguments)
+        : fn.arguments;
+  } catch {
+    throw new ProviderError(
+      `Target ${target.name} returned malformed tool arguments during preflight.`,
+    );
+  }
+  if (
+    !args ||
+    typeof args !== "object" ||
+    Array.isArray(args) ||
+    Object.keys(args).length !== 0
+  )
+    throw new ProviderError(
+      `Target ${target.name} returned invalid tool arguments during preflight.`,
+    );
+  return result;
 }
 
 export async function withRetries<T>(

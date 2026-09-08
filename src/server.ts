@@ -4,7 +4,11 @@ import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseStore } from "./storage/db.js";
-import { importManifest } from "./core/manifest.js";
+import {
+  datasetJsonl,
+  generatedManifest,
+  importManifest,
+} from "./core/manifest.js";
 import { compareRuns, markdownReport } from "./core/reports.js";
 import { runEvaluation } from "./core/runner.js";
 import {
@@ -12,9 +16,70 @@ import {
   projectFile,
   saveJson,
   shellQuote,
+  validateRunConfig,
 } from "./core/project.js";
+import {
+  createModelCatalog,
+  fetchTargetModelCatalog,
+} from "./core/model-catalog.js";
 import { registerSecrets, sanitize } from "./core/security.js";
 import * as providers from "./core/providers.js";
+import type { TaskKind } from "./core/types.js";
+
+const generatedDatasetSchema = (taskKind: "text-json" | "tool-calling") => ({
+  type: "object",
+  properties: {
+    cases: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          caseId: { type: "string" },
+          inputText: { type: "string" },
+          expected:
+            taskKind === "tool-calling"
+              ? {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      arguments: { type: "object" },
+                    },
+                    required: ["name", "arguments"],
+                    additionalProperties: false,
+                  },
+                }
+              : { type: "object" },
+          referenceTranscription: { type: "string" },
+          metadata: { type: "object" },
+        },
+        required: ["caseId", "inputText", "expected"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["cases"],
+  additionalProperties: false,
+});
+
+function parseGeneratedJson(text: string): unknown {
+  const cleaned = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start)
+      return JSON.parse(cleaned.slice(start, end + 1));
+    throw new Error("The provider did not return a JSON dataset.");
+  }
+}
 
 export async function startServer(
   dbPath: string,
@@ -42,7 +107,9 @@ export async function startServer(
     ? path.resolve(sourceDir, "../dashboard")
     : path.resolve(sourceDir, "../dist/dashboard");
   const configPath = path.join(storageRoot, "dashboard-config.json");
+  const modelCatalog = createModelCatalog();
   const configSummary = (config: any) => ({
+    taskKind: config.taskKind ?? "document-json",
     baseConfigPath: config.baseConfigPath,
     datasetVersion: config.datasetVersion,
     ocrTarget: config.ocrTarget?.name,
@@ -53,6 +120,12 @@ export async function startServer(
     outputMode: config.outputMode,
     judgeRubric: config.judgeRubric ?? "",
     generation: config.generation,
+    schema: config.schema,
+    fieldRules: config.fieldRules,
+    stagePrompts: config.stagePrompts,
+    tools: config.tools ?? [],
+    toolChoice: config.toolChoice ?? "auto",
+    toolCallOrder: config.toolCallOrder ?? "ordered",
   });
   const command = (version?: string) => {
     const dataset = version ? db.getDataset(version) : db.listDatasets()[0];
@@ -109,6 +182,49 @@ export async function startServer(
         }
         return JSON.parse(text || "{}");
       };
+      if (req.method === "GET" && url.pathname === "/api/models/openrouter") {
+        json(await modelCatalog());
+        return;
+      }
+      if (
+        req.method === "GET" &&
+        parts[0] === "api" &&
+        parts[1] === "models" &&
+        parts[2] === "target" &&
+        parts[3]
+      ) {
+        const target = db.getTarget(parts[3], true);
+        if (!target) {
+          json({ error: "Provider target not found." }, 404);
+          return;
+        }
+        if (target.provider === "openrouter") {
+          json(await modelCatalog());
+          return;
+        }
+        json(await fetchTargetModelCatalog(target));
+        return;
+      }
+      if (
+        req.method === "GET" &&
+        parts[0] === "api" &&
+        parts[1] === "examples" &&
+        parts.length === 3
+      ) {
+        const examples: Record<string, string> = {
+          "document-json": "sample-data/config.json",
+          "text-json": "sample-data/text-json/config.json",
+          "tool-calling": "sample-data/tool-calling/config.json",
+        };
+        const file = examples[parts[2]];
+        if (!file) {
+          json({ error: "Example not found" }, 404);
+          return;
+        }
+        const config = await loadConfig(await projectFile(projectRoot, file));
+        json(configSummary({ ...config, baseConfigPath: file }));
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/api/setup") {
         let configured: any;
         try {
@@ -132,9 +248,14 @@ export async function startServer(
         const extractionTarget = pick(input.extractionTarget),
           ocrTarget = pick(input.ocrTarget),
           judgeTarget = input.judgeTarget ? pick(input.judgeTarget) : undefined;
+        const taskKind = input.taskKind ?? "document-json";
+        if (!["document-json", "text-json", "tool-calling"].includes(taskKind))
+          throw new Error("Choose a valid evaluation type.");
         if (
           !extractionTarget ||
-          (input.extractionSource !== "reference" && !ocrTarget)
+          (taskKind === "document-json" &&
+            input.extractionSource !== "reference" &&
+            !ocrTarget)
         )
           throw new Error("Select configured OCR and extraction targets.");
         if (
@@ -155,7 +276,9 @@ export async function startServer(
           typeof input.baseConfigPath === "string"
             ? input.baseConfigPath.trim()
             : "";
-        const baseConfigPath = requestedBasePath || existing?.baseConfigPath;
+        const baseConfigPath = Object.hasOwn(input, "baseConfigPath")
+          ? requestedBasePath || undefined
+          : existing?.baseConfigPath;
         if (baseConfigPath) {
           if (
             existing &&
@@ -188,17 +311,25 @@ export async function startServer(
             );
           }
         }
-        if (input.datasetVersion && !db.getDataset(input.datasetVersion))
-          throw new Error("Selected dataset not found.");
+        const datasetVersion = input.datasetVersion ?? base.datasetVersion;
+        const dataset = datasetVersion
+          ? db.getDataset(datasetVersion)
+          : undefined;
+        if (!dataset) throw new Error("Selected dataset not found.");
+        if (dataset && (dataset.taskKind ?? "document-json") !== taskKind)
+          throw new Error(
+            "The dataset does not match this evaluation type. Choose a matching dataset.",
+          );
         if (input.judgeTarget && (!judgeTarget || !input.judgeRubric?.trim()))
           throw new Error("A configured judge and rubric are required.");
         const config = {
           ...base,
+          taskKind,
           baseConfigPath,
           ocrTarget,
           extractionTarget,
           judgeTarget,
-          datasetVersion: input.datasetVersion ?? base.datasetVersion,
+          datasetVersion,
           inferenceOnly:
             typeof input.inferenceOnly === "boolean"
               ? input.inferenceOnly
@@ -207,7 +338,33 @@ export async function startServer(
           outputMode: input.outputMode,
           generation: input.generation ?? base.generation,
           judgeRubric: input.judgeRubric ?? base.judgeRubric,
+          schema: baseConfigPath ? base.schema : (input.schema ?? base.schema),
+          fieldRules: baseConfigPath
+            ? (base.fieldRules ?? [])
+            : (input.fieldRules ?? base.fieldRules ?? []),
+          crossFieldRules:
+            (base.taskKind ?? "document-json") === taskKind
+              ? base.crossFieldRules
+              : [],
+          stagePrompts: baseConfigPath
+            ? base.stagePrompts
+            : (input.stagePrompts ?? base.stagePrompts),
+          tools:
+            taskKind === "tool-calling"
+              ? baseConfigPath
+                ? base.tools
+                : (input.tools ?? base.tools)
+              : undefined,
+          toolChoice:
+            taskKind === "tool-calling"
+              ? (input.toolChoice ?? base.toolChoice ?? "auto")
+              : undefined,
+          toolCallOrder:
+            taskKind === "tool-calling"
+              ? (input.toolCallOrder ?? base.toolCallOrder ?? "ordered")
+              : undefined,
         };
+        validateRunConfig(config);
         await saveJson(configPath, config);
         json({
           runCommand: command(config.datasetVersion),
@@ -252,13 +409,86 @@ export async function startServer(
         json(db.listDatasets());
         return;
       }
+      if (
+        req.method === "GET" &&
+        parts[0] === "api" &&
+        parts[1] === "datasets" &&
+        parts[2] &&
+        parts.length === 4 &&
+        parts[3] === "jsonl"
+      ) {
+        const dataset = db.getDataset(parts[2]);
+        if (!dataset) {
+          json({ error: "Dataset not found" }, 404);
+          return;
+        }
+        res.setHeader("content-type", "application/jsonl; charset=utf-8");
+        res.setHeader(
+          "content-disposition",
+          `attachment; filename="${(dataset.name || "dataset").replace(/[^a-z0-9._-]+/gi, "-")}.jsonl"`,
+        );
+        res.end(datasetJsonl(dataset));
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/datasets/import") {
         const input = await body();
         const file = await projectFile(projectRoot, input.path);
         const dataset = await importManifest(
           file,
           path.join(storageRoot, "assets"),
+          { allowMissingExpected: true },
         );
+        db.saveDataset(dataset);
+        json(dataset);
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/datasets/generate") {
+        const input = await body();
+        const taskKind = input.taskKind as TaskKind;
+        if (taskKind !== "text-json" && taskKind !== "tool-calling")
+          throw new Error(
+            "Provider-generated datasets currently support Text → JSON and Tool calling. Import image documents as JSONL.",
+          );
+        const targetName =
+          typeof input.targetName === "string" ? input.targetName.trim() : "";
+        const target = targetName ? db.getTarget(targetName, true) : undefined;
+        if (!target)
+          throw new Error("Choose a configured provider and model first.");
+        const name =
+          typeof input.name === "string" && input.name.trim()
+            ? input.name.trim().slice(0, 120)
+            : `Generated ${taskKind === "tool-calling" ? "tool-calling" : "text-to-JSON"} dataset`;
+        const count = Number(input.caseCount ?? 5);
+        if (!Number.isInteger(count) || count < 1 || count > 50)
+          throw new Error("Case count must be a whole number from 1 to 50.");
+        const brief =
+          typeof input.brief === "string" && input.brief.trim()
+            ? input.brief.trim().slice(0, 4000)
+            : "Create varied, realistic examples with a mix of normal and edge cases.";
+        const schema = generatedDatasetSchema(taskKind);
+        const prompt = [
+          "You create synthetic evaluation datasets for a local-first model evaluation tool.",
+          `Generate exactly ${count} independent cases for the ${taskKind === "tool-calling" ? "tool-calling" : "text-to-JSON"} workflow.`,
+          "Return only one JSON object matching the supplied schema. Do not use Markdown fences.",
+          "Every case must have a unique caseId, useful inputText, and the deterministic ideal expected output.",
+          taskKind === "tool-calling"
+            ? "For expected, return an array of function calls with name and JSON object arguments. These are expectations only; no tools will be executed."
+            : "For expected, return the JSON object the model should produce from inputText.",
+          "Use synthetic data only; never include real personal, financial, or secret information.",
+          `Dataset brief: ${brief}`,
+        ].join("\n\n");
+        const response = await providers.callOpenAICompatible(target, prompt, {
+          outputMode: target.supportsStructuredOutput
+            ? "schema-constrained-json"
+            : "prompted-json",
+          schema,
+          generation: { max_tokens: Math.min(12000, 1200 * count) },
+          signal: AbortSignal.timeout(120000),
+        });
+        const dataset = generatedManifest(parseGeneratedJson(response.text), {
+          taskKind,
+          name,
+        });
         db.saveDataset(dataset);
         json(dataset);
         return;
@@ -498,8 +728,11 @@ export async function startServer(
         const collection =
           parts[1] === "runs" ? db.getRun(parts[2]) : db.getDataset(parts[2]);
         const item = collection?.cases.find((c: any) => c.caseId === parts[4]);
-        if (!item) {
-          json({ error: "Case not found" }, 404);
+        if (!item || !item.imagePath) {
+          json(
+            { error: item ? "This case has no image" : "Case not found" },
+            404,
+          );
           return;
         }
         const file = await realpath(item.imagePath),

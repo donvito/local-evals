@@ -1,0 +1,69 @@
+{
+  "name": "Synthetic text-to-JSON edge cases",
+  "taskKind": "text-json",
+  "cases": [
+    {
+      "caseId": "text-json-001",
+      "inputText": "CASE_ID=text-json-001\nSubject: New workspace subscription\nHello fictional billing desk,\nJuniper Works opened its workspace on January 15, 2025. Please record twelve seats at a monthly rate of $49.95; the subscription is active.\nThanks,\nThe synthetic operations team",
+      "expected": {
+        "customer": "Juniper Works",
+        "opened": "2025-01-15",
+        "seats": 12,
+        "monthlyRate": 49.95,
+        "active": true
+      }
+    },
+    {
+      "caseId": "text-json-002",
+      "inputText": "CASE_ID=text-json-002\nParse this fictional record. customer=Kite Lab; nickname=null; dueDate=2025-03-31; balance=0. The memo field is missing.",
+      "expected": {
+        "customer": "Kite Lab",
+        "nickname": null,
+        "dueDate": "2025-03-31",
+        "balance": 0
+      }
+    },
+    {
+      "caseId": "text-json-003",
+      "inputText": "CASE_ID=text-json-003\nParse this fictional record. customer=Lantern Guild; dueDate=2024-02-29; offset=-17.25; attempts=0; note=null.",
+      "expected": {
+        "customer": "Lantern Guild",
+        "dueDate": "2024-02-29",
+        "offset": -17.25,
+        "attempts": 0,
+        "note": null
+      }
+    },
+    {
+      "caseId": "text-json-004",
+      "inputText": "CASE_ID=text-json-004\nParse this fictional record. customer=Moonbase Supply; active=false. The seats and dueDate fields are intentionally omitted.",
+      "expected": {
+        "customer": "Moonbase Supply",
+        "active": false
+      }
+    },
+    {
+      "caseId": "text-json-005",
+      "inputText": "CASE_ID=text-json-005\nFrom: ops@northstar.example\nSubject: Fictional annual allowance\nNorthstar Fabrication has an annual limit of 1,000,000.25 and a utilization ratio of 0.125. The allowance is due on December 31, 2026, and the account is active.\nThis is a synthetic note for parser testing only.",
+      "expected": {
+        "customer": "Northstar Fabrication",
+        "dueDate": "2026-12-31",
+        "annualLimit": 1000000.25,
+        "ratio": 0.125,
+        "active": true
+      }
+    },
+    {
+      "caseId": "text-json-006",
+      "inputText": "CASE_ID=text-json-006\nParse this fictional record. customer=Orchid Transit; dueDate=2025-07-04; count=3; unitPrice=19.99; total=59.97; comment=null.",
+      "expected": {
+        "customer": "Orchid Transit",
+        "dueDate": "2025-07-04",
+        "count": 3,
+        "unitPrice": 19.99,
+        "total": 59.97,
+        "comment": null
+      }
+    }
+  ]
+}
