@@ -2624,15 +2624,6 @@ function Datasets({
           className="dataset-management-toolbar"
           aria-label="Dataset management"
         >
-          <button
-            type="button"
-            className="button secondary dataset-create-toggle"
-            onClick={() => setCreateOpen((value) => !value)}
-            aria-expanded={createOpen}
-            aria-controls="dataset-create-panel"
-          >
-            {createOpen ? "Close creator" : "Create with a provider"}
-          </button>
           <form
             className="inline-form dataset-import-form"
             onSubmit={importDataset}
@@ -2662,6 +2653,15 @@ function Datasets({
               <code>datasets/receipts.jsonl</code>.
             </small>
           </form>
+          <button
+            type="button"
+            className="button primary dataset-create-toggle"
+            onClick={() => setCreateOpen((value) => !value)}
+            aria-expanded={createOpen}
+            aria-controls="dataset-create-panel"
+          >
+            {createOpen ? "Close creator" : "Create new dataset"}
+          </button>
           <div className="sample-imports">
             <span className="dataset-toolbar-label">Quick samples</span>
             <div className="sample-import-actions">
@@ -3237,6 +3237,31 @@ function DatasetViewerSurface({
   expanded?: boolean;
 }) {
   const searchId = `${idPrefix}-search`;
+  const previewDialog = useRef<HTMLDialogElement>(null);
+  const previewBody = useRef<HTMLDivElement>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const selectedIndex = visibleCases.findIndex((item) => item.caseId === selectedCase?.caseId);
+  const selectCase = (caseId: string) => {
+    onSelectCase(caseId);
+    if (window.matchMedia("(max-width: 960px)").matches) setPreviewOpen(true);
+  };
+  useEffect(() => {
+    const node = previewDialog.current;
+    if (previewOpen && node && !node.open) node.showModal();
+    if (!previewOpen && node?.open) node.close();
+  }, [previewOpen]);
+  useEffect(() => {
+    if (previewBody.current) previewBody.current.scrollTop = 0;
+  }, [selectedCase?.caseId]);
+  useEffect(() => {
+    setPreviewOpen(false);
+  }, [dataset.version]);
+  useEffect(() => {
+    if (!previewOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [previewOpen]);
   const casesHeadingId = `${idPrefix}-cases-heading`;
   const isDocumentWorkflow = taskKind === "document-json";
   const isToolWorkflow = taskKind === "tool-calling";
@@ -3325,7 +3350,7 @@ function DatasetViewerSurface({
                       taskKind={taskKind}
                       item={item}
                       selected={item.caseId === selectedCase?.caseId}
-                      onSelect={() => onSelectCase(item.caseId)}
+                      onSelect={() => selectCase(item.caseId)}
                     />
                   ))}
                 </tbody>
@@ -3353,6 +3378,29 @@ function DatasetViewerSurface({
           idPrefix={idPrefix}
         />
       </div>
+      <dialog
+        ref={previewDialog}
+        className="dataset-case-dialog"
+        aria-label="Case preview"
+        onClose={() => setPreviewOpen(false)}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) setPreviewOpen(false);
+        }}
+      >
+        <div className="dataset-case-dialog-shell">
+          <div className="dataset-case-dialog-toolbar">
+            <span aria-live="polite">{selectedIndex + 1} / {visibleCases.length}</span>
+            <div className="dataset-case-dialog-navigation">
+            <button type="button" className="button secondary" disabled={selectedIndex <= 0} onClick={() => onSelectCase(visibleCases[selectedIndex - 1].caseId)}>← Prev</button>
+            <button type="button" className="button secondary" disabled={selectedIndex < 0 || selectedIndex >= visibleCases.length - 1} onClick={() => onSelectCase(visibleCases[selectedIndex + 1].caseId)}>Next →</button>
+            </div>
+            <button type="button" className="button secondary" onClick={() => setPreviewOpen(false)}>Close</button>
+          </div>
+          <div className="dataset-case-dialog-body" ref={previewBody}>
+            {previewOpen && <DatasetDetail dataset={dataset} taskKind={taskKind} item={selectedCase} idPrefix={`${idPrefix}-preview`} />}
+          </div>
+        </div>
+      </dialog>
     </div>
   );
 }
@@ -3484,7 +3532,7 @@ function DatasetDetail({
     ? `/api/datasets/${encodeURIComponent(dataset.version)}/cases/${encodeURIComponent(item.caseId)}/image`
     : "";
   return (
-    <aside className="dataset-detail" aria-labelledby={detailId}>
+    <aside className="dataset-detail" aria-labelledby={detailId} tabIndex={-1}>
       <div className="dataset-detail-heading">
         <div>
           <span className="eyebrow">SELECTED CASE</span>

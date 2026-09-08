@@ -4198,3 +4198,61 @@ summary:hover {
   display: flex;
   align-items: flex-start;
 }
+
+.dataset-case-dialog {
+  width: calc(100vw - 16px);
+  max-width: 760px;
+  height: calc(100dvh - 24px);
+  max-height: calc(100dvh - 24px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink);
+}
+.dataset-case-dialog::backdrop { background: #13251ecc; }
+.dataset-case-dialog-shell {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.dataset-case-dialog-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.dataset-case-dialog-navigation { display: flex; gap: 8px; }
+.dataset-case-dialog-toolbar > button { justify-self: end; }
+.dataset-case-dialog-toolbar button { min-height: 44px; }
+.dataset-case-dialog-body { overflow: auto; overscroll-behavior: contain; }
+.dataset-case-dialog-body .dataset-detail { border: 0; }
+@media (max-width: 960px) {
+  .dataset-workspace > .dataset-detail { display: none; }
+}
+
+@media (max-width: 960px) {
+  .dataset-management-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .dataset-management-toolbar .dataset-import-form,
+  .dataset-management-toolbar .sample-imports {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    width: 100%;
+  }
+  .dataset-import-form .import-controls {
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+  }
+  .dataset-import-form .import-controls input { min-width: 0; flex: 1; }
+  .dataset-import-form .import-controls button { width: auto; flex: 0 0 auto; }
+  .dataset-management-toolbar .sample-import-actions { flex-wrap: wrap; }
+  .dataset-management-toolbar .dataset-create-toggle { min-height: 44px; width: 100%; }
+}
