@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type RefObject,
   type ReactNode,
 } from "react";
@@ -199,6 +200,13 @@ type ActiveExecution = {
   runId?: string;
 };
 type Tab = "overview" | "runs" | "datasets" | "targets" | "compare" | "setup";
+type CaseTab =
+  | "transcription"
+  | "input-output"
+  | "json"
+  | "execution"
+  | "timing"
+  | "metadata";
 const TAB_VALUES: Tab[] = [
   "overview",
   "runs",
@@ -409,8 +417,11 @@ const runTaskKind = (run: RunDetail): TaskKind =>
 const date = (value?: string) =>
   value
     ? new Date(value).toLocaleString([], {
-        dateStyle: "medium",
-        timeStyle: "short",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
       })
     : "—";
 const isTerminalRun = (status?: string) =>
@@ -620,9 +631,10 @@ function App() {
   const [tab, setTab] = useState<Tab>(() => tabFromLocation());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
-      return window.localStorage.getItem("local-evals-sidebar") === "collapsed";
+      const preference = window.localStorage.getItem("local-evals-sidebar");
+      return preference === null || preference === "collapsed";
     } catch {
-      return false;
+      return true;
     }
   });
   const [moreOpen, setMoreOpen] = useState(false);
@@ -912,7 +924,9 @@ function App() {
     setMoreOpen(false);
     window.scrollTo({ top: 0, behavior: "instant" });
     requestAnimationFrame(() =>
-      document.querySelector<HTMLElement>(".page-title h2")?.focus(),
+      document
+        .querySelector<HTMLElement>(".content h2, .content [data-view-heading]")
+        ?.focus(),
     );
   };
   const openRun = async (runId: string) => {
@@ -1405,33 +1419,27 @@ function Runs({
   onTab: (t: Tab) => void;
 }) {
   return (
-    <>
-      <PageTitle
-        eyebrow="RUN HISTORY"
-        title="Runs & case inspector"
-        sub="Select a run to trace every response back to its source."
-        action={
-          <button className="button secondary" onClick={() => onTab("setup")}>
-            Run setup →
-          </button>
-        }
-      />
-      <div className="runs-layout">
-        <section className="panel run-list">
-          <div className="panel-head">
-            <div>
-              <h3>All runs</h3>
-              <p>
-                {runs.length} evaluation snapshot{runs.length === 1 ? "" : "s"}
-              </p>
-            </div>
+    <div className="runs-layout" tabIndex={-1} data-view-heading="runs">
+      <section className="panel run-list" aria-label="Runs">
+        <header className="run-list-header">
+          <div>
+            <span className="eyebrow">RUNS</span>
+            <h2 tabIndex={-1}>{runs.length}</h2>
+            <span className="run-list-count">
+              evaluation snapshot{runs.length === 1 ? "" : "s"}
+            </span>
           </div>
+          <button className="button secondary" onClick={() => onTab("setup")}>
+            Setup <span aria-hidden="true">→</span>
+          </button>
+        </header>
+        <div className="run-list-body">
           {loading ? (
             <Loading />
           ) : runs.length ? (
             <>
               <label className="mobile-run-picker">
-                Choose a run
+                Select run
                 <select
                   value={selected?.runId || ""}
                   onChange={(e) => {
@@ -1450,6 +1458,7 @@ function Runs({
               <div className="run-history-items">
                 {runs.map((r) => (
                   <button
+                    type="button"
                     className={
                       selected?.runId === r.runId
                         ? "run-row selected"
@@ -1457,15 +1466,44 @@ function Runs({
                     }
                     key={r.runId}
                     onClick={() => onOpen(r.runId)}
+                    aria-pressed={selected?.runId === r.runId}
                   >
-                    <span className="run-name">
-                      {r.runId.slice(0, 12)}
-                      <small>{date(r.createdAt)}</small>
+                    <span className="run-row-main">
+                      <code className="run-name" title={r.runId}>
+                        {r.runId.slice(0, 12)}
+                      </code>
+                      <time dateTime={r.createdAt}>{date(r.createdAt)}</time>
                     </span>
-                    <span className="run-count">
+                    <span
+                      className={`run-row-status ${
+                        r.status === "failed" || r.status === "cancelled"
+                          ? "fail"
+                          : r.status === "running"
+                            ? "running"
+                            : r.inferenceOnly
+                              ? "neutral"
+                              : r.passedCount ===
+                                    (r.totalCases || r.caseCount || 0) &&
+                                  (r.totalCases || r.caseCount || 0)
+                                ? "pass"
+                                : "neutral"
+                      }`}
+                    >
+                      {r.status === "failed" || r.status === "cancelled"
+                        ? r.status
+                        : r.status === "running"
+                          ? "RUNNING"
+                          : r.inferenceOnly
+                            ? "INFERENCE"
+                            : r.status || "COMPLETE"}
+                    </span>
+                    <span className="run-count" title="Passed cases">
                       {r.inferenceOnly
                         ? "inference only"
                         : `${r.passedCount}/${r.caseCount}`}
+                    </span>
+                    <span className="row-arrow" aria-hidden="true">
+                      →
                     </span>
                   </button>
                 ))}
@@ -1478,29 +1516,31 @@ function Runs({
               text="Open Run setup to start your first evaluation."
             />
           )}
+        </div>
+      </section>
+      {selected ? (
+        <Inspector
+          run={selected}
+          item={selectedCase}
+          events={events}
+          eventsLoading={eventsLoading}
+          eventsHint={eventsHint}
+          onCase={onCase}
+          onTab={onTab}
+        />
+      ) : (
+        <section
+          className="panel inspector-placeholder"
+          aria-label="Run inspector"
+        >
+          <span className="placeholder-icon" aria-hidden="true">
+            ⌁
+          </span>
+          <h3>Select a run</h3>
+          <p>Open a run to inspect its cases, output, timing, and activity.</p>
         </section>
-        {selected ? (
-          <Inspector
-            run={selected}
-            item={selectedCase}
-            events={events}
-            eventsLoading={eventsLoading}
-            eventsHint={eventsHint}
-            onCase={onCase}
-            onTab={onTab}
-          />
-        ) : (
-          <section className="panel inspector-placeholder">
-            <span className="placeholder-icon">⌁</span>
-            <h3>Select a run</h3>
-            <p>
-              Open a run to inspect images, transcriptions, JSON, timing, and
-              judge evidence side by side.
-            </p>
-          </section>
-        )}
-      </div>
-    </>
+      )}
+    </div>
   );
 }
 
@@ -1553,198 +1593,260 @@ function Inspector({
     if (!item || !visibleCases.some((c) => c.caseId === item.caseId))
       onCase(visibleCases[0]);
   }, [failedOnly, item, onCase, visibleCases]);
+  const selectedStatus = item ? caseStatus(item) : null;
+  const previousCase = caseIndex > 0 ? visibleCases[caseIndex - 1] : null;
+  const nextCase =
+    caseIndex >= 0 && caseIndex < visibleCases.length - 1
+      ? visibleCases[caseIndex + 1]
+      : null;
   return (
     <section className="inspector">
-      {run.error && <RunErrorNotice error={run.error} context="Run" />}
-      <div className="inspector-head">
-        <div>
-          <span className="eyebrow">RUN {run.runId.slice(0, 12)}</span>
-          <h3>
-            {run.status || "Complete"} <small>{date(run.createdAt)}</small>
-          </h3>
-        </div>
-        <div className="export-actions">
-          <button className="text-button" onClick={() => onTab("setup")}>
-            Open setup →
-          </button>
-          <button className="text-button" onClick={() => onTab("compare")}>
-            Compare this run →
-          </button>
-          <a
-            href={`/api/runs/${encodeURIComponent(run.runId)}/export?format=json`}
-            download
-          >
-            JSON ↓
-          </a>
-          <a
-            href={`/api/runs/${encodeURIComponent(run.runId)}/export?format=markdown`}
-            download
-          >
-            Markdown ↓
-          </a>
-        </div>
-      </div>
-      <details className="run-details">
-        <summary>Snapshot & attempts</summary>
-        <pre tabIndex={0} aria-label="Run snapshot and attempts">
-          {pretty({ snapshot: run.snapshot, attempts: run.attempts })}
-        </pre>
-      </details>
-      <section className="case-picker" aria-label="Browse cases">
-        <div className="case-picker-head">
-          <div>
-            <span className="eyebrow">CASE BROWSER</span>
-            <h4>Choose a case to inspect</h4>
+      <div className="inspector-workspace">
+        <aside className="case-picker" aria-label="Browse cases">
+          <div className="case-picker-head">
+            <div>
+              <span className="eyebrow">CASES</span>
+              <h3>{visibleCases.length}</h3>
+            </div>
+            <span
+              className="case-result-count"
+              role="status"
+              aria-live="polite"
+            >
+              of {run.cases.length}
+            </span>
           </div>
-          <span className="case-result-count" role="status" aria-live="polite">
-            {visibleCases.length} of {run.cases.length} shown
-          </span>
-        </div>
-        <div className="case-filter-row">
-          <label>
-            Find a case
-            <input
-              type="search"
-              value={caseQuery}
-              onChange={(e) => setCaseQuery(e.target.value)}
-              placeholder="Search by case ID"
-            />
-          </label>
-          <label className="case-failed-filter">
-            <input
-              type="checkbox"
-              checked={failedOnly}
-              onChange={(e) => setFailedOnly(e.target.checked)}
-            />{" "}
-            Failed only (
-            {
-              run.cases.filter((c) => c.error || c.grade?.passed === false)
-                .length
-            }
-            )
-          </label>
-        </div>
-        {visibleCases.length ? (
-          <div className="case-browser">
-            <div className="case-table-shell">
-              <div
-                className="case-list"
-                role="list"
-                aria-label="Cases in this run"
-              >
-                {visibleCases.map((candidate, index) => {
-                  const status = caseStatus(candidate);
-                  const selected = candidate.caseId === item?.caseId;
-                  return (
-                    <button
-                      type="button"
-                      id={`run-case-${candidate.caseId}`}
-                      className={`case-list-item${selected ? " selected" : ""}`}
-                      aria-pressed={selected}
-                      onClick={() => onCase(candidate)}
-                      key={candidate.caseId}
+          <div className="case-filter-row">
+            <label>
+              <span className="sr-only">Find a case</span>
+              <input
+                type="search"
+                value={caseQuery}
+                onChange={(e) => setCaseQuery(e.target.value)}
+                placeholder="Filter case IDs"
+              />
+            </label>
+            <label className="case-failed-filter">
+              <input
+                type="checkbox"
+                checked={failedOnly}
+                onChange={(e) => setFailedOnly(e.target.checked)}
+              />{" "}
+              Failed (
+              {
+                run.cases.filter((c) => c.error || c.grade?.passed === false)
+                  .length
+              }
+              )
+            </label>
+          </div>
+          {visibleCases.length ? (
+            <div className="case-browser">
+              <div className="case-table-shell">
+                <div
+                  className="case-list"
+                  role="list"
+                  aria-label="Cases in this run"
+                >
+                  {visibleCases.map((candidate, index) => {
+                    const status = caseStatus(candidate);
+                    const selected = candidate.caseId === item?.caseId;
+                    return (
+                      <button
+                        type="button"
+                        id={`run-case-${candidate.caseId}`}
+                        className={`case-list-item${selected ? " selected" : ""}`}
+                        aria-pressed={selected}
+                        onClick={() => onCase(candidate)}
+                        key={candidate.caseId}
+                      >
+                        <span className="case-list-index">{index + 1}</span>
+                        <span className="case-list-copy">
+                          <strong title={candidate.caseId}>
+                            {candidate.caseId}
+                          </strong>
+                          {candidate.error && (
+                            <small title={candidate.error}>
+                              {candidate.error}
+                            </small>
+                          )}
+                        </span>
+                        <span className={`case-status ${status.tone}`}>
+                          {status.label}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="case-selection-controls">
+                  <label className="case-select-fallback">
+                    <span className="sr-only">Selected case</span>
+                    <select
+                      value={caseIndex >= 0 ? item!.caseId : ""}
+                      disabled={!visibleCases.length}
+                      onChange={(e) =>
+                        onCase(
+                          visibleCases.find(
+                            (c) => c.caseId === e.target.value,
+                          ) || null,
+                        )
+                      }
                     >
-                      <span className="case-list-index">{index + 1}</span>
-                      <span className="case-list-copy">
-                        <strong title={candidate.caseId}>
-                          {candidate.caseId}
-                        </strong>
-                        {candidate.error && (
-                          <small title={candidate.error}>
-                            {candidate.error}
-                          </small>
-                        )}
-                      </span>
-                      <span className={`case-status ${status.tone}`}>
-                        {status.label}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="case-selection-controls">
-                <label className="case-select-fallback">
-                  Selected case
-                  <select
-                    value={caseIndex >= 0 ? item!.caseId : ""}
-                    disabled={!visibleCases.length}
-                    onChange={(e) =>
-                      onCase(
-                        visibleCases.find((c) => c.caseId === e.target.value) ||
-                          null,
-                      )
-                    }
-                  >
-                    {visibleCases.map((c, i) => (
-                      <option value={c.caseId} key={c.caseId}>
-                        {i + 1}. {c.caseId}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="case-pagination">
-                  <button
-                    className="button secondary"
-                    disabled={caseIndex <= 0}
-                    onClick={() => onCase(visibleCases[caseIndex - 1])}
-                  >
-                    ← Previous
-                  </button>
-                  <span role="status">
+                      {visibleCases.map((c, i) => (
+                        <option value={c.caseId} key={c.caseId}>
+                          {i + 1}. {c.caseId}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <span className="case-pagination" role="status">
                     {caseIndex >= 0 ? caseIndex + 1 : 0} of{" "}
                     {visibleCases.length}
                   </span>
-                  <button
-                    className="button secondary"
-                    disabled={
-                      caseIndex < 0 || caseIndex >= visibleCases.length - 1
-                    }
-                    onClick={() => onCase(visibleCases[caseIndex + 1])}
-                  >
-                    Next →
-                  </button>
                 </div>
               </div>
             </div>
-          </div>
-        ) : (
-          <div className="case-filter-empty" role="status">
-            {run.cases.length
-              ? "No cases match the current filters."
-              : "This run has not produced any case results yet."}
-          </div>
-        )}
-      </section>
-      {item ? (
-        <CaseView
-          run={run}
-          item={item}
-          afterPhoto={
-            <RunActivity
+          ) : (
+            <div className="case-filter-empty" role="status">
+              {run.cases.length
+                ? "No cases match the current filters."
+                : "This run has not produced any case results yet."}
+            </div>
+          )}
+        </aside>
+        <div className="case-detail-pane">
+          <header className="inspector-head case-detail-toolbar">
+            <div>
+              <span className="eyebrow">RUN {run.runId.slice(0, 12)}</span>
+              <div className="case-detail-title">
+                <h2 tabIndex={-1} title={item?.caseId}>
+                  {item?.caseId || "Select a case"}
+                </h2>
+                {item?.error ? (
+                  <FailureChip
+                    key={`${run.runId}:${item.caseId}`}
+                    error={item.error}
+                    context="Case"
+                    label="Error"
+                  />
+                ) : selectedStatus ? (
+                  <span
+                    className={`status-pill ${selectedStatus.tone === "error" ? "fail" : selectedStatus.tone}`}
+                  >
+                    {selectedStatus.label}
+                  </span>
+                ) : !run.error ? (
+                  <span className="status-pill neutral">
+                    {run.status || "Complete"}
+                  </span>
+                ) : null}
+                {run.error && (
+                  <FailureChip
+                    key={run.runId}
+                    error={run.error}
+                    context="Run"
+                    label={item ? "Run failed" : "Failed"}
+                  />
+                )}
+              </div>
+              <span className="case-detail-run-meta">
+                {run.status || "Complete"} · {date(run.createdAt)}
+              </span>
+            </div>
+            <div className="case-toolbar-actions">
+              <div
+                className="case-toolbar-navigation"
+                aria-label="Case navigation"
+              >
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={!previousCase}
+                  onClick={() => previousCase && onCase(previousCase)}
+                >
+                  ← Prev
+                </button>
+                <span
+                  className="case-toolbar-position"
+                  role="status"
+                  aria-live="polite"
+                >
+                  {caseIndex >= 0 ? caseIndex + 1 : 0}/{visibleCases.length}
+                </span>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={!nextCase}
+                  onClick={() => nextCase && onCase(nextCase)}
+                >
+                  Next →
+                </button>
+              </div>
+              <button className="text-button" onClick={() => onTab("setup")}>
+                Setup
+              </button>
+              <a
+                href={`/api/runs/${encodeURIComponent(run.runId)}/export?format=json`}
+                download
+                className="export-link"
+              >
+                JSON ↓
+              </a>
+              <a
+                href={`/api/runs/${encodeURIComponent(run.runId)}/export?format=markdown`}
+                download
+                className="export-link"
+              >
+                Markdown ↓
+              </a>
+              <button
+                className="button primary"
+                onClick={() => onTab("compare")}
+              >
+                Compare
+              </button>
+            </div>
+          </header>
+          {item ? (
+            <CaseView
+              run={run}
+              item={item}
               events={events}
-              loading={eventsLoading}
-              hint={eventsHint}
+              eventsLoading={eventsLoading}
+              eventsHint={eventsHint}
             />
-          }
-        />
-      ) : (
-        <>
-          <Empty
-            icon="□"
-            title={run.cases.length ? "No matching cases" : "No case results"}
-            text={
-              run.cases.length
-                ? "Clear the search or turn off Failed only to see more cases."
-                : "This run has not produced any case results yet."
-            }
-          />
-          <RunActivity
-            events={events}
-            loading={eventsLoading}
-            hint={eventsHint}
-          />
-        </>
-      )}
+          ) : (
+            <div className="case-detail-empty">
+              <Empty
+                icon="□"
+                title={
+                  run.cases.length ? "No matching cases" : "No case results"
+                }
+                text={
+                  run.cases.length
+                    ? "Clear the search or turn off Failed only to see more cases."
+                    : "This run has not produced any case results yet."
+                }
+              />
+              <RunActivity
+                events={events}
+                loading={eventsLoading}
+                hint={eventsHint}
+              />
+              <details className="run-details empty-run-metadata">
+                <summary>Metadata · snapshot & attempts</summary>
+                <pre tabIndex={0} aria-label="Run snapshot and attempts">
+                  {pretty({
+                    snapshot: run.snapshot,
+                    attempts: run.attempts,
+                    config: run.config,
+                  })}
+                </pre>
+              </details>
+            </div>
+          )}
+        </div>
+      </div>
     </section>
   );
 }
@@ -1816,28 +1918,62 @@ function RunActivity({
     </section>
   );
 }
-function RunErrorNotice({
+function FailureChip({
   error,
   context,
+  label,
 }: {
   error: string;
   context: string;
+  label: string;
 }) {
+  const dialog = useRef<HTMLDialogElement>(null);
   const friendly = describeRunError(error);
   return (
-    <div className="alert error run-error-notice" role="alert">
-      <strong>
-        {context}: {friendly.title}
-      </strong>
-      <p>{friendly.message}</p>
-      <p>{friendly.action}</p>
-      <details>
-        <summary>Technical details</summary>
-        <pre tabIndex={0} aria-label={`${context} error details`}>
-          {error}
-        </pre>
-      </details>
-    </div>
+    <>
+      <button
+        type="button"
+        className="status-pill fail failure-chip"
+        aria-haspopup="dialog"
+        aria-label={`Show ${context.toLowerCase()} failure details`}
+        title={`Show ${context.toLowerCase()} failure details`}
+        onClick={() => dialog.current?.showModal()}
+      >
+        {label}
+      </button>
+      <dialog
+        ref={dialog}
+        className="failure-dialog"
+        aria-label={`${context} failure details`}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) dialog.current?.close();
+        }}
+      >
+        <header className="failure-dialog-head">
+          <strong>
+            {context}: {friendly.title}
+          </strong>
+          <button
+            type="button"
+            className="button secondary"
+            autoFocus
+            onClick={() => dialog.current?.close()}
+          >
+            Close
+          </button>
+        </header>
+        <div className="run-error-notice">
+          <p>{friendly.message}</p>
+          <p>{friendly.action}</p>
+          <details>
+            <summary>Technical details</summary>
+            <pre tabIndex={0} aria-label={`${context} error details`}>
+              {error}
+            </pre>
+          </details>
+        </div>
+      </dialog>
+    </>
   );
 }
 
@@ -1971,11 +2107,15 @@ function ZoomableImage({
 function CaseView({
   run,
   item,
-  afterPhoto,
+  events,
+  eventsLoading,
+  eventsHint,
 }: {
   run: RunDetail;
   item: CaseResult;
-  afterPhoto: ReactNode;
+  events: RunEvent[];
+  eventsLoading: boolean;
+  eventsHint: string;
 }) {
   const image = `/api/runs/${encodeURIComponent(run.runId)}/cases/${encodeURIComponent(item.caseId)}/image`;
   const failures = item.grade?.failures || [];
@@ -1984,155 +2124,314 @@ function CaseView({
   const isToolWorkflow = taskKind === "tool-calling";
   const hasImage = isDocumentWorkflow && Boolean(item.imagePath);
   const proposedToolCalls = displayToolCalls(item);
+  const actualOutput = isToolWorkflow
+    ? proposedToolCalls
+    : (item.parsedJson ?? item.rawExtraction);
+  const firstTab: CaseTab = isDocumentWorkflow
+    ? "transcription"
+    : "input-output";
+  const [activeTab, setActiveTab] = useState<CaseTab>(firstTab);
+  useEffect(() => {
+    setActiveTab(firstTab);
+  }, [firstTab, run.runId]);
+  const tabOptions: { id: CaseTab; label: string }[] = [
+    {
+      id: firstTab,
+      label: isDocumentWorkflow ? "Transcription" : "Output",
+    },
+    { id: "json", label: "JSON" },
+    { id: "execution", label: `Execution (${events.length})` },
+    { id: "timing", label: "Timing & judge" },
+    { id: "metadata", label: "Metadata" },
+  ];
+  const caseKey = item.caseId.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const panelId = `case-panel-${caseKey}`;
+  const tabId = (id: CaseTab) => `case-tab-${caseKey}-${id}`;
+  const handleTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+    if (!keys.includes(event.key)) return;
+    event.preventDefault();
+    const buttons = Array.from(
+      event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+        '[role="tab"]',
+      ) || [],
+    );
+    const currentIndex = buttons.indexOf(event.currentTarget);
+    if (currentIndex < 0) return;
+    const nextIndex =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? buttons.length - 1
+          : (currentIndex +
+              (event.key === "ArrowRight" ? 1 : -1) +
+              buttons.length) %
+            buttons.length;
+    buttons[nextIndex]?.focus();
+    const nextTab = tabOptions[nextIndex];
+    if (nextTab) setActiveTab(nextTab.id);
+  };
+  const timingEntries = Object.entries(item.timings || {});
+  const totalTiming = timingEntries.find(([key]) =>
+    /total|duration/i.test(key),
+  )?.[1];
+  const timingSum = timingEntries.reduce(
+    (total, [, value]) => total + value,
+    0,
+  );
+  const duration =
+    typeof totalTiming === "number"
+      ? `${Math.round(totalTiming)} ms`
+      : timingEntries.length
+        ? `${Math.round(timingSum)} ms`
+        : "—";
+  const storedAttempts = (run.attempts || []).filter(
+    (attempt) =>
+      attempt &&
+      typeof attempt === "object" &&
+      !Array.isArray(attempt) &&
+      (attempt as Record<string, unknown>).caseId === item.caseId,
+  );
+  const eventAttempts = new Set(
+    events
+      .filter(
+        (event) =>
+          event.caseId === item.caseId && typeof event.attempt === "number",
+      )
+      .map((event) => `${event.stage || "request"}:${event.attempt}`),
+  );
+  const attemptCount = storedAttempts.length || eventAttempts.size;
+  const judgeSummary = isToolWorkflow
+    ? "N/A"
+    : item.judge?.verdict || "Not configured";
+  const expectedLabel = isToolWorkflow
+    ? "Expected tool calls"
+    : "Expected JSON";
+  const actualLabel = isToolWorkflow ? "Proposed tool calls" : "Actual JSON";
+  const renderCaseContent = () => {
+    if (activeTab === firstTab) {
+      return isDocumentWorkflow ? (
+        <div className="case-tab-content">
+          <div className="transcription">
+            {item.referenceTranscription ? (
+              <CompareText
+                title="Reference transcription"
+                value={item.referenceTranscription}
+                muted=""
+              />
+            ) : (
+              <p className="missing-data-line">REFERENCE · not supplied</p>
+            )}
+            <CompareText
+              title="Model transcription"
+              value={item.ocrText}
+              muted="OCR did not return text"
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="case-tab-content">
+          <CodeCard
+            title={actualLabel}
+            value={actualOutput}
+            details={isToolWorkflow ? rawToolResponse(item) : undefined}
+          />
+        </div>
+      );
+    }
+    if (activeTab === "json") {
+      return (
+        <div className="case-json-panel case-tab-content">
+          <div
+            className={`json-grid${item.expected === undefined ? " unlabeled-output" : ""}`}
+          >
+            {item.expected !== undefined ? (
+              <CodeCard title={expectedLabel} value={item.expected} />
+            ) : (
+              <p className="missing-data-line">
+                {expectedLabel.toUpperCase()} · not labeled for this case
+              </p>
+            )}
+            <CodeCard
+              title={actualLabel}
+              value={actualOutput}
+              details={isToolWorkflow ? rawToolResponse(item) : undefined}
+            />
+          </div>
+        </div>
+      );
+    }
+    if (activeTab === "execution") {
+      return (
+        <div className="case-execution-panel case-tab-content">
+          <RunActivity
+            events={events}
+            loading={eventsLoading}
+            hint={eventsHint}
+          />
+        </div>
+      );
+    }
+    if (activeTab === "metadata") {
+      return (
+        <div className="metadata-grid case-tab-content">
+          <CodeCard title="Run snapshot" value={run.snapshot} />
+          <CodeCard title="Attempts" value={run.attempts} />
+          <CodeCard title="Run config" value={run.config} />
+        </div>
+      );
+    }
+    return (
+      <div className="case-timing-panel case-tab-content">
+        <div className="detail-grid">
+          <div className="panel-inner">
+            <h4>{item.grade ? "Grade breakdown" : "Inference output"}</h4>
+            {item.grade ? (
+              <div className="grade-list">
+                <Grade label="Parse success" value={item.grade.parseSuccess} />
+                <Grade label="Schema valid" value={item.grade.schemaValid} />
+                <Grade
+                  label={
+                    isToolWorkflow ? "Tool checks passed" : "Field accuracy"
+                  }
+                  value={
+                    item.grade.fieldAccuracy === undefined
+                      ? undefined
+                      : metric(item.grade.fieldAccuracy)
+                  }
+                />
+                {isDocumentWorkflow && (
+                  <Grade label="OCR score" value={ocrSummary(item.ocrGrade)} />
+                )}
+              </div>
+            ) : (
+              <p className="muted">
+                No expected JSON supplied; this case is not scored.
+              </p>
+            )}
+            {failures.length ? (
+              <div className="failures">
+                <h4>
+                  {isToolWorkflow ? "Tool check failures" : "Field failures"}
+                </h4>
+                {failures.map((failure, index) => (
+                  <div
+                    className="failure"
+                    key={`${failure.path || "failure"}-${index}`}
+                  >
+                    <strong>{failure.path || "Unknown field"}</strong>
+                    <span>{failure.message || failure.kind || "Mismatch"}</span>
+                    {failure.expected !== undefined && (
+                      <code>
+                        expected {pretty(failure.expected)} · actual{" "}
+                        {pretty(failure.actual)}
+                      </code>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <div className="panel-inner">
+            <h4>{isToolWorkflow ? "Timing" : "Timing & judge"}</h4>
+            <div className="timing">
+              {timingEntries.length ? (
+                timingEntries.map(([key, value]) => (
+                  <span key={key}>
+                    <b>{key.replace(/Ms$/, "")}</b>
+                    {Math.round(value)} ms
+                  </span>
+                ))
+              ) : (
+                <span className="muted">No timing recorded.</span>
+              )}
+            </div>
+            {!isToolWorkflow &&
+              (item.judge ? (
+                <div className="judge">
+                  <span className="eyebrow">SEMANTIC JUDGE</span>
+                  <strong>{item.judge.verdict || "Recorded"}</strong>
+                  <p>{item.judge.evidence || "No evidence supplied."}</p>
+                </div>
+              ) : (
+                <p className="muted">No semantic judge configured.</p>
+              ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
   return (
     <div className="case-view">
-      {item.error && <RunErrorNotice error={item.error} context="Case" />}
-      <div className="case-heading">
-        <div>
-          <span className="eyebrow">CASE</span>
-          <h3>{item.caseId}</h3>
-        </div>
-        <span
-          className={
-            item.grade?.passed
-              ? "status-pill pass"
-              : item.grade
-                ? "status-pill fail"
-                : "status-pill neutral"
-          }
-        >
-          {item.grade?.passed ? "PASS" : item.grade ? "FAIL" : "INFERENCE"}
-        </span>
+      <div className="case-tabs" role="tablist" aria-label="Case details">
+        {tabOptions.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            id={tabId(tab.id)}
+            className={`case-tab${activeTab === tab.id ? " active" : ""}`}
+            role="tab"
+            aria-selected={activeTab === tab.id}
+            aria-controls={panelId}
+            tabIndex={activeTab === tab.id ? 0 : -1}
+            onClick={() => setActiveTab(tab.id)}
+            onKeyDown={handleTabKeyDown}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
-      <div className="case-grid">
-        {hasImage ? (
-          <div className="image-card">
-            <ZoomableImage src={image} alt={`Document ${item.caseId}`} />
-            <span>Tap image to zoom</span>
-          </div>
-        ) : (
-          <div className="input-text-card">
+      <div className="case-inspection-body">
+        <aside
+          className="case-reference-pane"
+          aria-label="Case input reference"
+          tabIndex={0}
+        >
+          {hasImage ? (
+            <div className="image-card">
+              <ZoomableImage src={image} alt={`Document ${item.caseId}`} />
+            </div>
+          ) : (
             <CompareText
               title="Input text"
               value={item.inputText}
               muted="No input text supplied"
             />
-          </div>
+          )}
+        </aside>
+        <section
+          id={panelId}
+          className="case-tab-panel"
+          role="tabpanel"
+          aria-labelledby={tabId(activeTab)}
+          tabIndex={0}
+        >
+          {renderCaseContent()}
+        </section>
+      </div>
+      <footer className="case-status-strip" aria-label="Case status summary">
+        {timingEntries.length ? (
+          timingEntries.map(([key, value]) => (
+            <span key={key}>
+              <b>{key.replace(/Ms$/, "")}</b>
+              <code>{Math.round(value)} ms</code>
+            </span>
+          ))
+        ) : (
+          <span>
+            <b>Duration</b>
+            <code>{duration}</code>
+          </span>
         )}
-        <div className="transcription">
-          {isDocumentWorkflow ? (
-            <>
-              <CompareText
-                title="Reference transcription"
-                value={item.referenceTranscription}
-                muted="No reference transcription"
-              />
-              <CompareText
-                title="Model transcription"
-                value={item.ocrText}
-                muted="OCR did not return text"
-              />
-            </>
-          ) : (
-            <div className="mode-note">
-              <span className="eyebrow">{TASK_KIND_LABELS[taskKind]}</span>
-              <p>
-                This workflow proposes tool calls without executing them; no OCR
-                fields are expected.
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
-      {afterPhoto}
-      <div className="json-grid">
-        <CodeCard
-          title={
-            isToolWorkflow
-              ? item.expected === undefined
-                ? "Expected tool calls (not labeled)"
-                : "Expected tool calls"
-              : item.expected === undefined
-                ? "Expected JSON (not labeled)"
-                : "Expected JSON"
-          }
-          value={item.expected}
-        />
-        <CodeCard
-          title={isToolWorkflow ? "Proposed tool calls" : "Actual JSON"}
-          value={
-            isToolWorkflow
-              ? proposedToolCalls
-              : (item.parsedJson ?? item.rawExtraction)
-          }
-          details={isToolWorkflow ? rawToolResponse(item) : undefined}
-        />
-      </div>
-      <div className="detail-grid">
-        <div className="panel-inner">
-          <h4>{item.grade ? "Grade breakdown" : "Inference output"}</h4>
-          {item.grade ? (
-            <div className="grade-list">
-              <Grade label="Parse success" value={item.grade.parseSuccess} />
-              <Grade label="Schema valid" value={item.grade.schemaValid} />
-              <Grade
-                label={isToolWorkflow ? "Tool checks passed" : "Field accuracy"}
-                value={
-                  item.grade.fieldAccuracy === undefined
-                    ? undefined
-                    : metric(item.grade.fieldAccuracy)
-                }
-              />
-              {isDocumentWorkflow && (
-                <Grade label="OCR score" value={ocrSummary(item.ocrGrade)} />
-              )}
-            </div>
-          ) : (
-            <p className="muted">
-              No expected JSON supplied; this case is not scored.
-            </p>
-          )}
-          {failures.length ? (
-            <div className="failures">
-              <h4>
-                {isToolWorkflow ? "Tool check failures" : "Field failures"}
-              </h4>
-              {failures.map((f, i) => (
-                <div className="failure" key={`${f.path}-${i}`}>
-                  <strong>{f.path || "Unknown field"}</strong>
-                  <span>{f.message || f.kind || "Mismatch"}</span>
-                  {f.expected !== undefined && (
-                    <code>
-                      expected {pretty(f.expected)} · actual {pretty(f.actual)}
-                    </code>
-                  )}
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </div>
-        <div className="panel-inner">
-          <h4>{isToolWorkflow ? "Timing" : "Timing & judge"}</h4>
-          <div className="timing">
-            {Object.entries(item.timings || {}).map(([key, value]) => (
-              <span key={key}>
-                <b>{key.replace(/Ms$/, "")}</b>
-                {value} ms
-              </span>
-            ))}
-          </div>
-          {!isToolWorkflow &&
-            (item.judge ? (
-              <div className="judge">
-                <span className="eyebrow">SEMANTIC JUDGE</span>
-                <strong>{item.judge.verdict || "Recorded"}</strong>
-                <p>{item.judge.evidence || "No evidence supplied."}</p>
-              </div>
-            ) : (
-              <p className="muted">No semantic judge configured.</p>
-            ))}
-        </div>
-      </div>
+        <span>
+          <b>Attempts</b>
+          <code>{attemptCount || "—"}</code>
+        </span>
+        <span>
+          <b>Judge</b>
+          <strong>{judgeSummary}</strong>
+        </span>
+      </footer>
     </div>
   );
 }
@@ -2319,30 +2618,32 @@ function Datasets({
   ];
   return (
     <>
-      <PageTitle
-        eyebrow="DATASETS"
-        title="Dataset library"
-        sub="Inspect versioned cases and their expected outputs."
-      />
-      <section className="panel">
-        <div className="panel-head">
-          <div>
-            <h3>Imported datasets</h3>
-            <p>Browse your documents, reference text, and expected outputs.</p>
-            <button
-              type="button"
-              className="button secondary dataset-create-toggle"
-              onClick={() => setCreateOpen((value) => !value)}
-            >
-              {createOpen ? "Close creator" : "Create with a provider"}
-            </button>
-          </div>
+      <PageTitle eyebrow="DATASETS" title="Datasets" />
+      <section className="panel dataset-panel">
+        <div
+          className="dataset-management-toolbar"
+          aria-label="Dataset management"
+        >
+          <button
+            type="button"
+            className="button secondary dataset-create-toggle"
+            onClick={() => setCreateOpen((value) => !value)}
+            aria-expanded={createOpen}
+            aria-controls="dataset-create-panel"
+          >
+            {createOpen ? "Close creator" : "Create with a provider"}
+          </button>
           <form
-            className="inline-form"
+            className="inline-form dataset-import-form"
             onSubmit={importDataset}
             aria-busy={busy}
           >
-            <label htmlFor="dataset-import-path">Import a dataset</label>
+            <label
+              className="dataset-toolbar-label"
+              htmlFor="dataset-import-path"
+            >
+              Import JSONL
+            </label>
             <div className="import-controls">
               <input
                 id="dataset-import-path"
@@ -2353,18 +2654,17 @@ function Datasets({
                 aria-describedby="dataset-path-help"
               />
               <button className="button secondary" disabled={busy}>
-                {busy ? "Importing…" : "Import JSONL"}
+                {busy ? "Importing…" : "Import"}
               </button>
             </div>
-            <small id="dataset-path-help">
+            <small id="dataset-path-help" className="sr-only">
               Use a path relative to the project root, for example{" "}
               <code>datasets/receipts.jsonl</code>.
             </small>
           </form>
           <div className="sample-imports">
-            <strong>Quick samples</strong>
-            <small>Import a fixture dataset for each workflow type.</small>
-            <div>
+            <span className="dataset-toolbar-label">Quick samples</span>
+            <div className="sample-import-actions">
               {sampleDatasets.map((sample) => (
                 <button
                   key={sample.taskKind}
@@ -2386,6 +2686,7 @@ function Datasets({
         </div>
         {createOpen && (
           <form
+            id="dataset-create-panel"
             className="dataset-create-panel"
             onSubmit={generateDataset}
             aria-busy={busy}
@@ -2496,25 +2797,10 @@ function Datasets({
         )}
         {datasets.length ? (
           <div className="dataset-library">
-            <div className="dataset-library-intro">
-              <div>
-                <span className="eyebrow">DATASET WORKSPACE</span>
-                <h3>Choose a dataset to inspect</h3>
-                <p>
-                  Start with a dataset, then browse its cases in the table. Your
-                  imported data stays unchanged.
-                </p>
-              </div>
-              <span className="dataset-library-count">
-                {datasets.length}{" "}
-                {datasets.length === 1 ? "dataset" : "datasets"}
-              </span>
-            </div>
             <div className="dataset-library-layout">
               <aside className="dataset-picker" aria-label="Dataset selection">
                 <div className="dataset-picker-heading">
                   <strong>Datasets</strong>
-                  <small>Select one to open its records.</small>
                 </div>
                 <div className="dataset-choice-list">
                   {datasets.map((d) => {
@@ -2963,8 +3249,7 @@ function DatasetViewerSurface({
     >
       <div className="dataset-viewer-toolbar">
         <label className="dataset-search" htmlFor={searchId}>
-          Search cases
-          <small>Filter by case ID or text</small>
+          <span className="sr-only">Search cases by ID or text</span>
           <input
             id={searchId}
             type="search"
