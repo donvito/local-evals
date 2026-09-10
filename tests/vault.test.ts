@@ -28,7 +28,8 @@ describe("CredentialVault", () => {
 
     expect(vault.decrypt(ciphertext)).toBe("provider-secret");
     expect(readFileSync(keyPath)).toHaveLength(32);
-    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32")
+      expect(statSync(keyPath).mode & 0o777).toBe(0o600);
     expect(ciphertext).not.toContain("provider-secret");
     expect(new CredentialVault(keyPath).decrypt(ciphertext)).toBe(
       "provider-secret",

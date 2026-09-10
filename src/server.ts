@@ -3,6 +3,8 @@ import { networkInterfaces } from "node:os";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { DatabaseStore } from "./storage/db.js";
 import {
   datasetJsonl,
@@ -102,6 +104,7 @@ export async function startServer(
   }
   const db = new DatabaseStore(dbPath),
     storageRoot = path.dirname(path.resolve(dbPath));
+  db.recoverDatasetJobs();
   const sourceDir = path.dirname(fileURLToPath(import.meta.url));
   const dashboardRoot = sourceDir.includes(path.sep + "dist" + path.sep)
     ? path.resolve(sourceDir, "../dashboard")
@@ -146,6 +149,96 @@ export async function startServer(
     finish: () => void;
   };
   let activeRun: ActiveRun | undefined;
+  type ActiveGeneration = {
+    controller: AbortController;
+    jobId: string;
+    done: Promise<void>;
+    stopRequested: boolean;
+  };
+  let activeGeneration: ActiveGeneration | undefined;
+  let generationClosing = false;
+  let generationPoll: NodeJS.Timeout | undefined;
+  const pumpGeneration = async (): Promise<void> => {
+    if (generationClosing || activeGeneration) return;
+    try {
+      db.recoverDatasetJobs();
+    } catch {
+      return;
+    }
+    let job;
+    try {
+      job = db.claimNextDatasetJob();
+    } catch {
+      return;
+    }
+    if (!job) return;
+    let input;
+    try {
+      input = db.getDatasetJobInput(job.jobId);
+    } catch {
+      db.failDatasetJob(job.jobId, "Dataset generation job metadata is unavailable.");
+      void pumpGeneration().catch(() => undefined);
+      return;
+    }
+    if (!input) {
+      db.failDatasetJob(job.jobId, "Dataset generation job metadata is unavailable.");
+      void pumpGeneration().catch(() => undefined);
+      return;
+    }
+    let target;
+    try {
+      target = db.getTarget(input.targetName, true);
+    } catch {
+      db.failDatasetJob(job.jobId, "Configured provider target is unavailable.");
+      void pumpGeneration().catch(() => undefined);
+      return;
+    }
+    if (!target) {
+      db.failDatasetJob(job.jobId, "Configured provider target is unavailable.");
+      void pumpGeneration().catch(() => undefined);
+      return;
+    }
+    const schema = generatedDatasetSchema(input.taskKind as "text-json" | "tool-calling");
+    const prompt = [
+      "You create synthetic evaluation datasets for a local-first model evaluation tool.",
+      `Generate exactly ${input.caseCount} independent cases for the ${input.taskKind === "tool-calling" ? "tool-calling" : "text-to-JSON"} workflow.`,
+      "Return only one JSON object matching the supplied schema. Do not use Markdown fences.",
+      "Every case must have a unique caseId, useful inputText, and the deterministic ideal expected output.",
+      input.taskKind === "tool-calling"
+        ? "For expected, return an array of function calls with name and JSON object arguments. These are expectations only; no tools will be executed."
+        : "For expected, return the JSON object the model should produce from inputText.",
+      "Use synthetic data only; never include real personal, financial, or secret information.",
+      `The required JSON schema is: ${JSON.stringify(schema)}`,
+      `Dataset brief: ${input.brief}`,
+    ].join("\n\n");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), input.timeoutSeconds * 1000);
+    const done = (async () => {
+      try {
+        const response = await providers.callOpenAICompatible(target, prompt, {
+          outputMode: target.supportsStructuredOutput ? "schema-constrained-json" : "prompted-json",
+          schema,
+          generation: { max_tokens: Math.min(12000, 1200 * input.caseCount) },
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || (activeGeneration as ActiveGeneration | undefined)?.stopRequested)
+          throw new Error("Stopped by user.");
+        db.completeDatasetJob(input.jobId, generatedManifest(parseGeneratedJson(response.text), {
+          taskKind: input.taskKind,
+          name: input.name,
+        }));
+      } catch {
+        const stopped = (activeGeneration as ActiveGeneration | undefined)?.stopRequested === true;
+        db.failDatasetJob(input.jobId, stopped ? "Stopped by user." : controller.signal.aborted ? `Dataset generation exceeded its ${input.timeoutSeconds}-second timeout.` : "Provider request failed.", stopped ? "interrupted" : "failed");
+      } finally {
+        clearTimeout(timeout);
+        const runningGeneration = activeGeneration as ActiveGeneration | undefined;
+        if (runningGeneration?.jobId === input.jobId) activeGeneration = undefined;
+        void pumpGeneration().catch(() => undefined);
+      }
+    })();
+    activeGeneration = { controller, jobId: input.jobId, done, stopRequested: false };
+  };
   const server = http.createServer(async (req, res) => {
     const json = (value: unknown, status = 200) => {
       res.statusCode = status;
@@ -409,6 +502,120 @@ export async function startServer(
         json(db.listDatasets());
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/dataset-jobs") {
+        json(db.listDatasetJobs());
+        return;
+      }
+      if (req.method === "PATCH" && parts[0] === "api" && parts[1] === "datasets" && parts.length === 3) {
+        const input = await body();
+        if (typeof input.name !== "string" || !input.name.trim() || input.name.trim().length > 120) {
+          json({ error: "Dataset name must contain 1 to 120 characters." }, 400);
+          return;
+        }
+        const dataset = db.renameDataset(parts[2], input.name);
+        if (!dataset) json({ error: "Dataset not found." }, 404);
+        else json(dataset);
+        return;
+      }
+      if (req.method === "POST" && parts[0] === "api" && parts[1] === "datasets" && parts[3] === "duplicate" && parts.length === 4) {
+        const source = db.getDataset(parts[2]);
+        if (!source) {
+          json({ error: "Dataset not found." }, 404);
+          return;
+        }
+        const newVersion = createHash("sha256").update(randomUUID()).digest("hex");
+        json(db.duplicateDataset(parts[2], newVersion), 201);
+        return;
+      }
+      if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "datasets" && parts.length === 3) {
+        if (!db.deleteDataset(parts[2])) {
+          json({ error: "Dataset not found." }, 404);
+          return;
+        }
+        json({ deleted: true });
+        return;
+      }
+      if (
+        req.method === "POST" &&
+        parts[0] === "api" &&
+        parts[1] === "dataset-jobs" &&
+        parts[2] &&
+        parts[3] === "stop" &&
+        parts.length === 4
+      ) {
+        const control = db.getDatasetJobControl(parts[2]);
+        if (!control) {
+          json({ error: "Dataset job not found." }, 404);
+          return;
+        }
+        if (["completed", "failed", "interrupted"].includes(control.status)) {
+          json({ error: "Dataset job is already finished." }, 409);
+          return;
+        }
+        if (control.status === "queued") {
+          const stopped = db.stopDatasetJob(parts[2]);
+          if (!stopped) {
+            json({ error: "Dataset job changed state. Refresh and try stopping it again." }, 409);
+            return;
+          }
+          json(stopped, 200);
+          void pumpGeneration().catch(() => undefined);
+          return;
+        }
+        if (activeGeneration?.jobId !== parts[2]) {
+          json({ error: "Dataset job is running in another server process." }, 409);
+          return;
+        }
+        activeGeneration.stopRequested = true;
+        activeGeneration.controller.abort();
+        await activeGeneration.done;
+        json(db.getDatasetJob(parts[2]), 200);
+        return;
+      }
+      if (req.method === "DELETE" && parts[0] === "api" && parts[1] === "dataset-jobs" && parts.length === 3) {
+        if (!db.getDatasetJob(parts[2])) {
+          json({ error: "Dataset job not found." }, 404);
+        } else if (!db.deleteFailedDatasetJob(parts[2])) {
+          json({ error: "Only failed or interrupted generation jobs can be deleted." }, 409);
+        } else {
+          json({ deleted: true });
+        }
+        return;
+      }
+      if (req.method === "POST" && parts[0] === "api" && parts[1] === "dataset-jobs" && parts.length === 4 && parts[3] === "retry") {
+        const previous = db.getDatasetJob(parts[2]);
+        if (!previous) {
+          json({ error: "Dataset job not found." }, 404);
+          return;
+        }
+        if (previous.status !== "failed" && previous.status !== "interrupted") {
+          json({ error: "Only failed or interrupted generation jobs can be retried." }, 409);
+          return;
+        }
+        const input = db.getDatasetJobInput(previous.jobId);
+        if (!input) {
+          json({ error: "Original generation settings are unavailable." }, 409);
+          return;
+        }
+        const job = db.createDatasetJob({ ...input, jobId: randomUUID() });
+        json(job, 202);
+        void pumpGeneration().catch(() => undefined);
+        return;
+      }
+      if (
+        req.method === "GET" &&
+        parts[0] === "api" &&
+        parts[1] === "dataset-jobs" &&
+        parts.length === 3
+      ) {
+        const job = db.getDatasetJob(parts[2]);
+        if (!job) {
+          json({ error: "Dataset job not found." }, 404);
+          return;
+        }
+        json(job);
+        return;
+      }
       if (
         req.method === "GET" &&
         parts[0] === "api" &&
@@ -451,8 +658,7 @@ export async function startServer(
           );
         const targetName =
           typeof input.targetName === "string" ? input.targetName.trim() : "";
-        const target = targetName ? db.getTarget(targetName, true) : undefined;
-        if (!target)
+        if (!targetName || !db.getTarget(targetName))
           throw new Error("Choose a configured provider and model first.");
         const name =
           typeof input.name === "string" && input.name.trim()
@@ -465,32 +671,21 @@ export async function startServer(
           typeof input.brief === "string" && input.brief.trim()
             ? input.brief.trim().slice(0, 4000)
             : "Create varied, realistic examples with a mix of normal and edge cases.";
-        const schema = generatedDatasetSchema(taskKind);
-        const prompt = [
-          "You create synthetic evaluation datasets for a local-first model evaluation tool.",
-          `Generate exactly ${count} independent cases for the ${taskKind === "tool-calling" ? "tool-calling" : "text-to-JSON"} workflow.`,
-          "Return only one JSON object matching the supplied schema. Do not use Markdown fences.",
-          "Every case must have a unique caseId, useful inputText, and the deterministic ideal expected output.",
-          taskKind === "tool-calling"
-            ? "For expected, return an array of function calls with name and JSON object arguments. These are expectations only; no tools will be executed."
-            : "For expected, return the JSON object the model should produce from inputText.",
-          "Use synthetic data only; never include real personal, financial, or secret information.",
-          `Dataset brief: ${brief}`,
-        ].join("\n\n");
-        const response = await providers.callOpenAICompatible(target, prompt, {
-          outputMode: target.supportsStructuredOutput
-            ? "schema-constrained-json"
-            : "prompted-json",
-          schema,
-          generation: { max_tokens: Math.min(12000, 1200 * count) },
-          signal: AbortSignal.timeout(120000),
-        });
-        const dataset = generatedManifest(parseGeneratedJson(response.text), {
-          taskKind,
+        const timeoutSeconds = input.timeoutSeconds === undefined ? 600 : Number(input.timeoutSeconds);
+        if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 3600)
+          throw new Error("Timeout must be a whole number from 30 to 3600 seconds.");
+        const jobId = randomUUID();
+        const job = db.createDatasetJob({
+          jobId,
           name,
+          taskKind,
+          targetName,
+          caseCount: count,
+          brief,
+          timeoutSeconds,
         });
-        db.saveDataset(dataset);
-        json(dataset);
+        json(job, 202);
+        void pumpGeneration().catch(() => undefined);
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/runs/start") {
@@ -791,9 +986,21 @@ export async function startServer(
     }
   });
   server.once("close", () => {
+    generationClosing = true;
+    if (generationPoll) clearInterval(generationPoll);
     const run = activeRun;
+    const generation = activeGeneration;
     run?.controller.abort();
-    if (run) void run.done.finally(() => db.close());
+    if (generation) {
+      db.failDatasetJob(
+        generation.jobId,
+        "Generation process stopped before completion.",
+        "interrupted",
+      );
+      generation.controller.abort();
+    }
+    const waits = [run?.done, generation?.done].filter(Boolean) as Promise<void>[];
+    if (waits.length) void Promise.allSettled(waits).finally(() => db.close());
     else db.close();
   });
   try {
@@ -810,6 +1017,8 @@ export async function startServer(
     );
   }
   const address = server.address() as { port: number };
+  generationPoll = setInterval(() => void pumpGeneration().catch(() => undefined), 1000);
+  void pumpGeneration().catch(() => undefined);
   console.log("Local Evals dashboard: http://127.0.0.1:" + address.port);
   if (host === "0.0.0.0")
     for (const hostname of allowedHosts)

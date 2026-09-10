@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { CaseResult, RunConfig } from "../core/types.js";
@@ -169,6 +169,37 @@ const MIGRATIONS: Array<[number, string]> = [
       CREATE INDEX IF NOT EXISTS run_events_event_id_idx ON run_events(event_id);
     `,
   ],
+  [
+    4,
+    `
+      CREATE TABLE IF NOT EXISTS dataset_jobs (
+        job_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        name TEXT NOT NULL,
+        task_kind TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        case_count INTEGER NOT NULL,
+        dataset_version TEXT,
+        error TEXT,
+        owner_pid INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS dataset_jobs_updated_at_idx ON dataset_jobs(updated_at DESC);
+    `,
+  ],
+  [
+    5,
+    `
+      ALTER TABLE dataset_jobs ADD COLUMN brief TEXT NOT NULL DEFAULT '';
+    `,
+  ],
+  [
+    6,
+    `
+      ALTER TABLE dataset_jobs ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 600;
+    `,
+  ],
 ];
 
 export class DatabaseStore {
@@ -177,15 +208,48 @@ export class DatabaseStore {
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+    if (path !== ":memory:" && existsSync(path)) {
+      const probe = new Database(path, { readonly: true, fileMustExist: true });
+      try {
+        const hasMigrationTable = Boolean(
+          probe
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            )
+            .get(),
+        );
+        if (hasMigrationTable) {
+          const versions = probe
+            .prepare("SELECT version FROM schema_migrations")
+            .all() as Array<{ version: number }>;
+          const latestApplied = Math.max(
+            0,
+            ...versions.map(({ version }) => version),
+          );
+          const latestKnown = Math.max(...MIGRATIONS.map(([version]) => version));
+          if (latestApplied > latestKnown)
+            throw new Error(
+              `Database schema version ${latestApplied} is newer than supported version ${latestKnown}.`,
+            );
+        }
+      } finally {
+        probe.close();
+      }
+    }
     this.vault = new CredentialVault(
       path === ":memory:"
         ? join(tmpdir(), `evalforge-${randomUUID()}.credentials.key`)
         : `${path}.credentials.key`,
     );
     this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.initializeMigrations();
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      this.initializeMigrations();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -455,6 +519,185 @@ export class DatabaseStore {
       .get(version) as any;
     return row ? JSON.parse(row.manifest_json) : undefined;
   }
+  renameDataset(version: string, name: string): any {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed.length > 120)
+      throw new Error("Dataset name must contain 1 to 120 characters.");
+    const changed = this.db.prepare(
+      "UPDATE datasets SET manifest_json=json_set(manifest_json, '$.name', ?) WHERE version=?",
+    ).run(trimmed, version).changes;
+    return changed ? this.getDataset(version) : undefined;
+  }
+  duplicateDataset(version: string, newVersion: string): any {
+    const source = this.getDataset(version);
+    if (!source) return undefined;
+    const name = `${typeof source.name === "string" ? source.name : "Dataset"} (copy)`.slice(0, 120);
+    const duplicate = { ...source, version: newVersion, name, duplicatedFrom: version };
+    this.db.transaction(() => {
+      this.db
+        .prepare("INSERT INTO datasets(version,manifest_json) VALUES(?,?)")
+        .run(newVersion, JSON.stringify(duplicate));
+    })();
+    return duplicate;
+  }
+  deleteDataset(version: string): boolean {
+    return this.db.transaction(() => {
+      const changed = this.db
+        .prepare("DELETE FROM datasets WHERE version=?")
+        .run(version).changes;
+      if (!changed) return false;
+      this.db
+        .prepare("DELETE FROM dataset_jobs WHERE dataset_version=? AND status='completed'")
+        .run(version);
+      return true;
+    })();
+  }
+  createDatasetJob(job: {
+    jobId: string;
+    name: string;
+    taskKind: string;
+    targetName: string;
+    caseCount: number;
+    brief: string;
+    timeoutSeconds?: number;
+  }) {
+    const now = new Date().toISOString();
+    const row = {
+      jobId: job.jobId,
+      status: "queued" as const,
+      name: job.name,
+      taskKind: job.taskKind,
+      targetName: job.targetName,
+      caseCount: job.caseCount,
+      brief: job.brief,
+      timeoutSeconds: job.timeoutSeconds ?? 600,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const result = this.db.transaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO dataset_jobs(job_id,status,name,task_kind,target_name,case_count,brief,timeout_seconds,owner_pid,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?, ?,?)",
+        )
+        .run(
+          row.jobId,
+          row.status,
+          row.name,
+          row.taskKind,
+          row.targetName,
+          row.caseCount,
+          row.brief,
+          row.timeoutSeconds,
+          null,
+          row.createdAt,
+          row.updatedAt,
+        );
+      return row;
+    })();
+    return result;
+  }
+  claimNextDatasetJob(): ReturnType<DatabaseStore["getDatasetJob"]> {
+    return this.db.transaction(() => {
+      const running = this.db
+        .prepare("SELECT job_id FROM dataset_jobs WHERE status='running' LIMIT 1")
+        .get();
+      if (running) return undefined;
+      const next = this.db
+        .prepare("SELECT job_id FROM dataset_jobs WHERE status='queued' ORDER BY created_at ASC, rowid ASC LIMIT 1")
+        .get() as { job_id?: string } | undefined;
+      if (!next?.job_id) return undefined;
+      const changed = this.db
+        .prepare("UPDATE dataset_jobs SET status='running',owner_pid=?,updated_at=? WHERE job_id=? AND status='queued'")
+        .run(process.pid, new Date().toISOString(), next.job_id).changes;
+      return changed ? this.getDatasetJob(next.job_id) : undefined;
+    }).immediate();
+  }
+  getDatasetJobInput(jobId: string) {
+    const row = this.db
+      .prepare("SELECT job_id,name,task_kind,target_name,case_count,brief,timeout_seconds FROM dataset_jobs WHERE job_id=?")
+      .get(jobId) as any;
+    return row
+      ? { jobId: row.job_id, name: row.name, taskKind: row.task_kind, targetName: row.target_name, caseCount: row.case_count, brief: row.brief, timeoutSeconds: row.timeout_seconds }
+      : undefined;
+  }
+  getDatasetJobControl(jobId: string) {
+    return this.db
+      .prepare("SELECT job_id,status,owner_pid FROM dataset_jobs WHERE job_id=?")
+      .get(jobId) as
+      | { job_id: string; status: string; owner_pid: number | null }
+      | undefined;
+  }
+  stopDatasetJob(jobId: string) {
+    const changed = this.db
+      .prepare("UPDATE dataset_jobs SET status='interrupted',error='Stopped by user.',updated_at=? WHERE job_id=? AND status='queued'")
+      .run(new Date().toISOString(), jobId).changes;
+    return changed ? this.getDatasetJob(jobId) : undefined;
+  }
+  getDatasetJob(jobId: string) {
+    const row = this.db
+      .prepare("SELECT * FROM dataset_jobs WHERE job_id=?")
+      .get(jobId) as any;
+    return row ? this.datasetJob(row) : undefined;
+  }
+  listDatasetJobs() {
+    return (this.db
+      .prepare("SELECT * FROM dataset_jobs ORDER BY created_at DESC LIMIT 50")
+      .all() as any[]).map((row) => this.datasetJob(row));
+  }
+  completeDatasetJob(jobId: string, manifest: any) {
+    const now = new Date().toISOString();
+    return this.db.transaction(() => {
+      const changed = this.db
+        .prepare("UPDATE dataset_jobs SET status='completed',dataset_version=?,error=NULL,updated_at=? WHERE job_id=? AND status='running'")
+        .run(manifest.version, now, jobId).changes;
+      if (!changed) return false;
+      this.db
+        .prepare("INSERT OR IGNORE INTO datasets(version,manifest_json) VALUES(?,?)")
+        .run(manifest.version, JSON.stringify(manifest));
+      return true;
+    })();
+  }
+  failDatasetJob(jobId: string, error: string, status: "failed" | "interrupted" = "failed") {
+    this.db
+      .prepare("UPDATE dataset_jobs SET status=?,error=?,updated_at=? WHERE job_id=? AND status='running'")
+      .run(status, safeJobError(error), new Date().toISOString(), jobId);
+  }
+  deleteFailedDatasetJob(jobId: string): boolean {
+    return this.db.prepare(
+      "DELETE FROM dataset_jobs WHERE job_id=? AND status IN ('failed','interrupted')",
+    ).run(jobId).changes > 0;
+  }
+  recoverDatasetJobs() {
+    const rows = this.db
+      .prepare("SELECT job_id,owner_pid FROM dataset_jobs WHERE status='running'")
+      .all() as Array<{ job_id: string; owner_pid: number | null }>;
+    for (const row of rows) {
+      if (row.owner_pid) {
+        try {
+          process.kill(row.owner_pid, 0);
+          continue;
+        } catch (error: any) {
+          if (error.code !== "ESRCH") continue;
+        }
+      }
+      this.failDatasetJob(row.job_id, "Generation process exited before completion.", "interrupted");
+    }
+  }
+  private datasetJob(row: any) {
+    return {
+      jobId: row.job_id,
+      status: row.status,
+      name: row.name,
+      taskKind: row.task_kind,
+      targetName: row.target_name,
+      caseCount: row.case_count,
+      timeoutSeconds: row.timeout_seconds,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      ...(row.dataset_version ? { datasetVersion: row.dataset_version } : {}),
+      ...(row.error ? { error: row.error } : {}),
+    };
+  }
   saveTarget(target: any, apiKey?: string) {
     const candidate = { ...target };
     const suppliedKey = apiKey ?? candidate.apiKey;
@@ -543,6 +786,29 @@ export class DatabaseStore {
   }
 
   private initializeMigrations(): void {
+    const hasMigrationTable = Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+        )
+        .get(),
+    );
+    if (hasMigrationTable) {
+      const versions = this.db
+        .prepare("SELECT version FROM schema_migrations")
+        .all() as Array<{ version: number }>;
+      const latestApplied = Math.max(0, ...versions.map(({ version }) => version));
+      const latestKnown = Math.max(...MIGRATIONS.map(([version]) => version));
+      if (latestApplied > latestKnown)
+        throw new Error(
+          `Database schema version ${latestApplied} is newer than supported version ${latestKnown}.`,
+        );
+      const pending = MIGRATIONS.some(
+        ([version]) => !versions.some((applied) => applied.version === version),
+      );
+      if (pending && this.db.name !== ":memory:") this.backupBeforeMigrations();
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -569,6 +835,25 @@ export class DatabaseStore {
     });
     applyMigrations();
   }
+
+  private backupBeforeMigrations(): void {
+    const backupPath = join(
+      dirname(this.db.name),
+      `${basename(this.db.name)}.pre-migration-${Date.now()}-${randomUUID()}.db`,
+    );
+    this.db.prepare("VACUUM INTO ?").run(backupPath);
+  }
+}
+
+function safeJobError(error: unknown): string {
+  const message = String(sanitize(error ?? "Dataset generation failed."));
+  if (/(?:prompt|image|messages|content|authorization|api[_-]?key|token)\s*[":=]/i.test(message))
+    return "Diagnostic payload redacted.";
+  const returned = message.match(/^(.+?) returned (\d+):/);
+  const transport = message.match(/^Transport error calling ([^:]+):/);
+  if (returned) return `${returned[1]} returned ${returned[2]}.`;
+  if (transport) return `Transport error calling ${transport[1]}.`;
+  return message.slice(0, 500);
 }
 
 type RunRow = {

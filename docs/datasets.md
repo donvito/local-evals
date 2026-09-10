@@ -4,6 +4,8 @@
 
 Open **Datasets** to import a manifest, browse cases, and inspect their inputs and expected outputs. Keep private data under the ignored `datasets/` directory.
 
+Right-click a dataset to rename, duplicate, or delete it. Rename edits the title in place: Enter saves and Escape cancels. Duplicate creates a separate library entry with the same cases and shared imported assets. Deleting a dataset also removes its completed creation records, but keeps evaluation history and imported files. Deletion requires confirmation. Generation-job menus offer Stop or retry/delete actions according to their status.
+
 ## Start with sample data
 
 Use the quick-sample import buttons in Datasets, or import one of these paths:
@@ -92,6 +94,14 @@ Use `[]` when no call should be proposed. The run configuration must define the 
 ## Generate a dataset with a provider
 
 In Datasets, choose **Create with a provider**, select a configured provider/model, choose Text → JSON or Tool calling, and enter a brief. Review the generated inputs and expected outputs before using them as a benchmark. Document images must be imported from files.
+
+Generation runs as a background job saved in the app's database. You can refresh or leave the page and return to Datasets to see its status, open the completed dataset, or read a failure message. New requests join a persistent queue and run one at a time in submission order, without stopping the current generation. The creation form is saved in this browser so a refresh also preserves your draft.
+
+Set **Generation timeout (minutes)** when creating a dataset. It defaults to 10 minutes and accepts 0.5 to 60 minutes. Each job retains its timeout in the queue; the clock starts when generation begins, not while waiting. Restarting the server interrupts the running job; its status remains visible, but partial model output is not saved or resumed. Waiting jobs retain their briefs and resume from the queue after restart. Start a new generation to retry an interrupted job.
+
+Select a generation job in the dataset list to view its status and any error in the main pane. Failed or interrupted jobs offer **Retry generation**, which queues a new attempt with the original settings, and **Delete failed job**, which removes only that job record. Saved datasets and active jobs are not deleted.
+
+Use **Stop generation** for a running job or **Remove from queue** for a waiting job. Stopped jobs remain in history as interrupted and can be retried or deleted. Partial output is not saved, and the next waiting job proceeds once the running request has stopped. Deletion asks for confirmation before removing the attempt and its error history.
 
 ## Import from the command line
 

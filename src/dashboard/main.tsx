@@ -157,6 +157,70 @@ type Dataset = {
     originalImagePath?: string;
   }[];
 };
+type DatasetJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted";
+type DatasetJob = {
+  jobId: string;
+  status: DatasetJobStatus;
+  name: string;
+  taskKind: TaskKind;
+  targetName: string;
+  caseCount: number;
+  createdAt: string;
+  updatedAt: string;
+  datasetVersion?: string;
+  timeoutSeconds?: number;
+  error?: string;
+};
+type GenerationDraft = {
+  target: string;
+  taskKind: "text-json" | "tool-calling";
+  name: string;
+  count: string;
+  brief: string;
+  timeoutMinutes: string;
+};
+const DATASET_GENERATION_DRAFT_KEY = "local-evals-dataset-generation-draft";
+const validGenerationTimeoutMinutes = (value: string, fallback = "10") => {
+  const minutes = Number(value);
+  return Number.isFinite(minutes) && minutes >= 0.5 && minutes <= 60
+    ? value
+    : fallback;
+};
+const readGenerationDraft = (): GenerationDraft => {
+  const fallback: GenerationDraft = {
+    target: "",
+    taskKind: "text-json",
+    name: "",
+    count: "5",
+    brief: "",
+    timeoutMinutes: "10",
+  };
+  try {
+    const value = JSON.parse(
+      window.localStorage.getItem(DATASET_GENERATION_DRAFT_KEY) || "null",
+    ) as Partial<GenerationDraft> | null;
+    if (!value || typeof value !== "object") return fallback;
+    return {
+      target: typeof value.target === "string" ? value.target : fallback.target,
+      taskKind:
+        value.taskKind === "tool-calling" ? "tool-calling" : "text-json",
+      name: typeof value.name === "string" ? value.name : fallback.name,
+      count: typeof value.count === "string" ? value.count : fallback.count,
+      brief: typeof value.brief === "string" ? value.brief : fallback.brief,
+      timeoutMinutes:
+        typeof value.timeoutMinutes === "string"
+          ? validGenerationTimeoutMinutes(value.timeoutMinutes)
+          : fallback.timeoutMinutes,
+    };
+  } catch {
+    return fallback;
+  }
+};
 type SetupConfig = {
   baseConfigPath?: string;
   datasetVersion?: string;
@@ -3047,17 +3111,298 @@ function Datasets({
   onRefresh: () => Promise<void>;
 }) {
   const [path, setPath] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const [generationSubmitting, setGenerationSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const [messageKind, setMessageKind] = useState<Notice["kind"]>("success");
   const [createOpen, setCreateOpen] = useState(false);
-  const [generateTarget, setGenerateTarget] = useState(targets[0]?.name || "");
+  const [jobs, setJobs] = useState<DatasetJob[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(true);
+  const [jobsError, setJobsError] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [jobAction, setJobAction] = useState<"retry" | "delete" | "stop" | "">("");
+  const [jobActionError, setJobActionError] = useState("");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameName, setRenameName] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [renameError, setRenameError] = useState("");
+  const [datasetMutation, setDatasetMutation] = useState<"duplicate" | "delete" | "">("");
+  const [contextMenu, setContextMenu] = useState<{
+    kind: "dataset" | "job";
+    id: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const draft = useRef<GenerationDraft | null>(null);
+  if (!draft.current) draft.current = readGenerationDraft();
+  const [generateTarget, setGenerateTarget] = useState(
+    draft.current.target || targets[0]?.name || "",
+  );
   const [generateTaskKind, setGenerateTaskKind] = useState<
     "text-json" | "tool-calling"
-  >("text-json");
-  const [generateName, setGenerateName] = useState("");
-  const [generateCount, setGenerateCount] = useState("5");
-  const [generateBrief, setGenerateBrief] = useState("");
+  >(draft.current.taskKind);
+  const [generateName, setGenerateName] = useState(draft.current.name);
+  const [generateCount, setGenerateCount] = useState(draft.current.count);
+  const [generateBrief, setGenerateBrief] = useState(draft.current.brief);
+  const [generateTimeoutMinutes, setGenerateTimeoutMinutes] = useState(
+    draft.current.timeoutMinutes,
+  );
+  const onRefreshRef = useRef(onRefresh);
+  const jobsRef = useRef<DatasetJob[]>([]);
+  const selectedJobIdRef = useRef("");
+  const suppressDatasetAutoSelectRef = useRef(false);
+  const renameTitleRef = useRef<HTMLHeadingElement>(null);
+  const renameRequestRef = useRef(false);
+  const datasetMutationRef = useRef(false);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const jobsRequestRef = useRef<Promise<DatasetJob[]> | null>(null);
+  const handledCompletedJobsRef = useRef(new Set<string>());
+  const knownJobStatusesRef = useRef(new Map<string, DatasetJobStatus>());
+  const submittedJobIdsRef = useRef(new Set<string>());
+  const initialJobsLoadedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const pollingStoppedRef = useRef(false);
+  const pollTimerRef = useRef<number | undefined>(undefined);
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
+  useEffect(() => {
+    onRefreshRef.current = onRefresh;
+  }, [onRefresh]);
+  useEffect(() => {
+    jobsRef.current = jobs;
+  }, [jobs]);
+  useEffect(() => {
+    selectedJobIdRef.current = selectedJobId;
+  }, [selectedJobId]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        DATASET_GENERATION_DRAFT_KEY,
+        JSON.stringify({
+          target: generateTarget,
+          taskKind: generateTaskKind,
+          name: generateName,
+          count: generateCount,
+          brief: generateBrief,
+          timeoutMinutes: generateTimeoutMinutes,
+        }),
+      );
+    } catch {
+      /* Creation draft persistence is best-effort. */
+    }
+  }, [
+    generateBrief,
+    generateCount,
+    generateName,
+    generateTarget,
+    generateTaskKind,
+    generateTimeoutMinutes,
+  ]);
+  const selectCompletedJob = async (job: DatasetJob) => {
+    if (!job.datasetVersion) return;
+    try {
+      await onRefreshRef.current();
+      if (!mountedRef.current) return;
+      if (
+        selectedJobIdRef.current &&
+        selectedJobIdRef.current !== job.jobId
+      )
+        return;
+      setSelectedJobId("");
+      setSelectedVersion(job.datasetVersion);
+      setMessageKind("success");
+      setMessage(`${job.name || "Dataset"} is ready.`);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setMessageKind("error");
+      setMessage(
+        err instanceof Error ? err.message : "Could not refresh datasets",
+      );
+    }
+  };
+  const retryDatasetJob = async (job: DatasetJob) => {
+    if (jobAction) return;
+    setJobAction("retry");
+    setJobActionError("");
+    try {
+      const retried = await api<DatasetJob>(
+        `/api/dataset-jobs/${encodeURIComponent(job.jobId)}/retry`,
+        { method: "POST" },
+      );
+      setJobs((current) => {
+        const next = [...current, retried];
+        jobsRef.current = next;
+        return next;
+      });
+      submittedJobIdsRef.current.add(retried.jobId);
+      setSelectedJobId(retried.jobId);
+      setJobActionError("");
+      void pollJobs();
+    } catch (err) {
+      setJobActionError(
+        err instanceof Error ? err.message : "Could not retry generation",
+      );
+    } finally {
+      setJobAction("");
+    }
+  };
+  const stopDatasetJob = async (job: DatasetJob) => {
+    if (jobAction) return;
+    setJobAction("stop");
+    setJobActionError("");
+    try {
+      const stopped = await api<DatasetJob>(
+        `/api/dataset-jobs/${encodeURIComponent(job.jobId)}/stop`,
+        { method: "POST" },
+      );
+      await jobsRequestRef.current;
+      if (!mountedRef.current) return;
+      setJobs((current) => {
+        const next = current.map((item) => item.jobId === stopped.jobId ? stopped : item);
+        jobsRef.current = next;
+        return next;
+      });
+      void pollJobs();
+    } catch (error) {
+      if (mountedRef.current)
+        setJobActionError(error instanceof Error ? error.message : "Could not stop generation.");
+    } finally {
+      if (mountedRef.current) setJobAction("");
+    }
+  };
+  const deleteDatasetJob = async (job: DatasetJob) => {
+    if (jobAction) return;
+    if (!window.confirm(`Delete the generation attempt "${job.name || "Untitled dataset"}"?\n\nThis permanently removes its history and error details. Saved datasets will not be deleted.`)) return;
+    setJobAction("delete");
+    setJobActionError("");
+    if (selectedJobIdRef.current === job.jobId) {
+      setSelectedJobId("");
+      setSelectedVersion("");
+      suppressDatasetAutoSelectRef.current = true;
+    }
+    try {
+      await api<void>(
+        `/api/dataset-jobs/${encodeURIComponent(job.jobId)}`,
+        { method: "DELETE" },
+      );
+      setJobs((current) => {
+        const next = current.filter((item) => item.jobId !== job.jobId);
+        jobsRef.current = next;
+        return next;
+      });
+    } catch (err) {
+      setJobActionError(
+        err instanceof Error ? err.message : "Could not delete job",
+      );
+      setMessageKind("error");
+      setMessage(
+        err instanceof Error ? err.message : "Could not delete generation job.",
+      );
+    } finally {
+      setJobAction("");
+    }
+  };
+  const loadJobs = useCallback(async (): Promise<DatasetJob[]> => {
+    if (jobsRequestRef.current) return jobsRequestRef.current;
+    const request = api<DatasetJob[]>("/api/dataset-jobs")
+      .then(async (nextJobs) => {
+        if (!mountedRef.current) return nextJobs;
+        const isInitialLoad = !initialJobsLoadedRef.current;
+        const completedToRefresh = isInitialLoad
+          ? nextJobs.some((job) => job.status === "completed" && job.datasetVersion)
+          : false;
+        const completedToSelect = nextJobs.find(
+          (job) =>
+            job.status === "completed" &&
+            job.datasetVersion &&
+            (submittedJobIdsRef.current.has(job.jobId) ||
+              knownJobStatusesRef.current.get(job.jobId) === "queued" ||
+              knownJobStatusesRef.current.get(job.jobId) === "running"),
+        );
+        initialJobsLoadedRef.current = true;
+        for (const job of nextJobs) {
+          knownJobStatusesRef.current.set(job.jobId, job.status);
+          if (job.status === "completed") {
+            handledCompletedJobsRef.current.add(job.jobId);
+          }
+        }
+        setJobs(nextJobs);
+        setJobsError("");
+        setJobsLoading(false);
+        if (completedToRefresh) {
+          try {
+            await onRefreshRef.current();
+          } catch (err) {
+            if (mountedRef.current) {
+              setMessageKind("error");
+              setMessage(
+                err instanceof Error
+                  ? err.message
+                  : "Could not refresh datasets",
+              );
+            }
+          }
+        }
+        if (completedToSelect) {
+          submittedJobIdsRef.current.delete(completedToSelect.jobId);
+          await selectCompletedJob(completedToSelect);
+        }
+        return nextJobs;
+      })
+      .catch((err) => {
+        if (!mountedRef.current) return jobsRef.current;
+        setJobsLoading(false);
+        setJobsError(err instanceof Error ? err.message : "Could not load dataset jobs");
+        return jobsRef.current;
+      })
+      .finally(() => {
+        jobsRequestRef.current = null;
+      });
+    jobsRequestRef.current = request;
+    return request;
+  }, []);
+  const pollJobs = useCallback(async () => {
+    const nextJobs = await loadJobs();
+    if (
+      !pollingStoppedRef.current &&
+      (nextJobs.some(
+        (job) => job.status === "queued" || job.status === "running",
+      ) ||
+        jobsRef.current.some(
+          (job) => job.status === "queued" || job.status === "running",
+        )) &&
+      pollTimerRef.current === undefined
+    ) {
+      pollTimerRef.current = window.setTimeout(() => {
+        pollTimerRef.current = undefined;
+        void pollJobs();
+      }, 1500);
+    }
+  }, [loadJobs]);
+  useEffect(() => {
+    pollingStoppedRef.current = false;
+    void pollJobs();
+    return () => {
+      pollingStoppedRef.current = true;
+      if (pollTimerRef.current !== undefined) {
+        window.clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = undefined;
+      }
+    };
+  }, [pollJobs]);
+  const activeGenerationJob = jobs.find((job) => job.status === "running");
+  const queuedGenerationCount = jobs.filter(
+    (job) => job.status === "queued",
+  ).length;
+  const selectedJob = jobs.find((job) => job.jobId === selectedJobId);
+  const datasetVersions = new Set(datasets.map((dataset) => dataset.version));
+  const pickerJobs = jobs.filter(
+    (job) =>
+      job.status !== "completed" ||
+      !job.datasetVersion ||
+      !datasetVersions.has(job.datasetVersion),
+  );
   const [selectedVersion, setSelectedVersion] = useState(() => {
     try {
       return (
@@ -3069,7 +3414,183 @@ function Datasets({
       return datasets[0]?.version || "";
     }
   });
+  const selectedDataset = datasets.find(
+    (dataset) => dataset.version === selectedVersion,
+  );
+  const contextDataset =
+    contextMenu?.kind === "dataset"
+      ? datasets.find((dataset) => dataset.version === contextMenu.id)
+      : undefined;
+  const contextJob =
+    contextMenu?.kind === "job"
+      ? jobs.find((job) => job.jobId === contextMenu.id)
+      : undefined;
   useEffect(() => {
+    setRenameName(selectedDataset?.name || "");
+    setRenameOpen(false);
+    setRenameError("");
+  }, [selectedDataset?.name, selectedDataset?.version]);
+  const renameDataset = async () => {
+    if (!selectedDataset || renameBusy || renameRequestRef.current) return;
+    const name = renameName.trim();
+    if (!name) {
+      setRenameError("Dataset name cannot be empty.");
+      return;
+    }
+    renameRequestRef.current = true;
+    setRenameBusy(true);
+    setRenameError("");
+    const version = selectedDataset.version;
+    try {
+      await api<Dataset>(
+        `/api/datasets/${encodeURIComponent(version)}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name }),
+        },
+      );
+      await onRefreshRef.current();
+      if (!mountedRef.current) return;
+      setSelectedVersion(version);
+      setRenameOpen(false);
+    } catch (err) {
+      setRenameError(
+        err instanceof Error ? err.message : "Could not rename dataset",
+      );
+    } finally {
+      renameRequestRef.current = false;
+      if (mountedRef.current) setRenameBusy(false);
+    }
+  };
+  const beginRename = (dataset = selectedDataset) => {
+    if (!dataset || datasetMutationRef.current) return;
+    closeContextMenu();
+    suppressDatasetAutoSelectRef.current = false;
+    setSelectedJobId("");
+    setSelectedVersion(dataset.version);
+    setRenameName(dataset.name || "");
+    setRenameError("");
+    setRenameOpen(true);
+  };
+  useEffect(() => {
+    if (!renameOpen) return;
+    window.requestAnimationFrame(() => {
+      const node = renameTitleRef.current;
+      if (!node) return;
+      node.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+  }, [renameOpen]);
+  const openContextMenu = (
+    kind: "dataset" | "job",
+    id: string,
+    x: number,
+    y: number,
+  ) => {
+    setContextMenu({
+      kind,
+      id,
+      x: Math.max(8, Math.min(x, window.innerWidth - 220)),
+      y: Math.max(8, Math.min(y, window.innerHeight - 180)),
+    });
+  };
+  const closeContextMenu = () => setContextMenu(null);
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!contextMenuRef.current?.contains(event.target as Node))
+        closeContextMenu();
+    };
+    const dismissOnViewportChange = () => closeContextMenu();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeContextMenu();
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        const items = Array.from(
+          contextMenuRef.current?.querySelectorAll<HTMLButtonElement>(
+            '[role="menuitem"]:not([disabled])',
+          ) || [],
+        );
+        if (!items.length) return;
+        event.preventDefault();
+        const index = items.indexOf(document.activeElement as HTMLButtonElement);
+        items[(index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", onKeyDown);
+    window.addEventListener("scroll", dismissOnViewportChange, true);
+    window.addEventListener("resize", dismissOnViewportChange);
+    window.requestAnimationFrame(() =>
+      contextMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not([disabled])')?.focus(),
+    );
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("scroll", dismissOnViewportChange, true);
+      window.removeEventListener("resize", dismissOnViewportChange);
+    };
+  }, [contextMenu]);
+  const duplicateDataset = async (dataset: Dataset) => {
+    if (datasetMutationRef.current) return;
+    datasetMutationRef.current = true;
+    setDatasetMutation("duplicate");
+    setRenameError("");
+    closeContextMenu();
+    try {
+      const copy = await api<Dataset>(
+        `/api/datasets/${encodeURIComponent(dataset.version)}/duplicate`,
+        { method: "POST" },
+      );
+      await onRefreshRef.current();
+      if (!mountedRef.current) return;
+      suppressDatasetAutoSelectRef.current = false;
+      setSelectedJobId("");
+      setSelectedVersion(copy.version);
+    } catch (err) {
+      setMessageKind("error");
+      setMessage(err instanceof Error ? err.message : "Could not duplicate dataset");
+    } finally {
+      datasetMutationRef.current = false;
+      if (mountedRef.current) setDatasetMutation("");
+    }
+  };
+  const deleteDataset = async (dataset: Dataset) => {
+    if (datasetMutationRef.current) return;
+    if (!window.confirm(
+      `Delete dataset "${dataset.name || "Untitled dataset"}"?\n\nThis removes the dataset and its completed creation history. Evaluation runs and imported files are retained.`,
+    )) return;
+    datasetMutationRef.current = true;
+    setDatasetMutation("delete");
+    closeContextMenu();
+    setSelectedJobId("");
+    setSelectedVersion("");
+    suppressDatasetAutoSelectRef.current = true;
+    try {
+      await api<{ deleted: boolean }>(
+        `/api/datasets/${encodeURIComponent(dataset.version)}`,
+        { method: "DELETE" },
+      );
+      await onRefreshRef.current();
+      await pollJobs();
+    } catch (err) {
+      setMessageKind("error");
+      setMessage(err instanceof Error ? err.message : "Could not delete dataset");
+    } finally {
+      datasetMutationRef.current = false;
+      if (mountedRef.current) setDatasetMutation("");
+    }
+  };
+  useEffect(() => {
+    if (!selectedVersion) {
+      if (datasets.length && !suppressDatasetAutoSelectRef.current)
+        setSelectedVersion(datasets[0]?.version || "");
+      return;
+    }
     if (
       datasets.length &&
       !datasets.some((dataset) => dataset.version === selectedVersion)
@@ -3092,7 +3613,7 @@ function Datasets({
     if (!generateTarget && targets[0]?.name) setGenerateTarget(targets[0].name);
   }, [generateTarget, targets]);
   const importPath = async (datasetPath: string, label: string) => {
-    setBusy(true);
+    setImportBusy(true);
     setMessage("");
     try {
       const imported = await api<Dataset>("/api/datasets/import", {
@@ -3109,7 +3630,7 @@ function Datasets({
       setMessageKind("error");
       setMessage(err instanceof Error ? err.message : "Import failed");
     } finally {
-      setBusy(false);
+      setImportBusy(false);
     }
   };
   const importDataset = async (e: FormEvent) => {
@@ -3118,10 +3639,21 @@ function Datasets({
   };
   const generateDataset = async (e: FormEvent) => {
     e.preventDefault();
-    setBusy(true);
+    if (generationSubmitting || !targets.length) return;
+    const timeoutMinutes = Number(generateTimeoutMinutes);
+    if (
+      !Number.isFinite(timeoutMinutes) ||
+      timeoutMinutes < 0.5 ||
+      timeoutMinutes > 60
+    ) {
+      setMessageKind("error");
+      setMessage("Generation timeout must be between 0.5 and 60 minutes.");
+      return;
+    }
+    setGenerationSubmitting(true);
     setMessage("");
     try {
-      const generated = await api<Dataset>("/api/datasets/generate", {
+      const job = await api<DatasetJob>("/api/datasets/generate", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -3130,14 +3662,30 @@ function Datasets({
           name: generateName,
           caseCount: Number(generateCount),
           brief: generateBrief,
+          timeoutSeconds: Math.round(timeoutMinutes * 60),
         }),
       });
-      await onRefresh();
-      setSelectedVersion(generated.version);
+      setJobs((current) => {
+        const next = [job, ...current.filter((item) => item.jobId !== job.jobId)];
+        jobsRef.current = next;
+        return next;
+      });
+      submittedJobIdsRef.current.add(job.jobId);
+      if (job.status === "completed" && job.datasetVersion) {
+        handledCompletedJobsRef.current.add(job.jobId);
+        submittedJobIdsRef.current.delete(job.jobId);
+        void selectCompletedJob(job);
+      }
+      void pollJobs();
+      setJobsError("");
       setCreateOpen(false);
       setMessageKind("success");
       setMessage(
-        `${generated.name} created with ${generated.cases.length} cases.`,
+        job.status === "completed"
+          ? `${job.name || "Dataset"} created.`
+          : job.status === "queued"
+            ? `${job.name || "Dataset"} added to the queue.`
+            : `${job.name || "Dataset"} generation started.`,
       );
     } catch (err) {
       setMessageKind("error");
@@ -3145,7 +3693,7 @@ function Datasets({
         err instanceof Error ? err.message : "Dataset generation failed",
       );
     } finally {
-      setBusy(false);
+      setGenerationSubmitting(false);
     }
   };
   const sampleDatasets: { taskKind: TaskKind; path: string }[] = [
@@ -3167,7 +3715,7 @@ function Datasets({
           <form
             className="inline-form dataset-import-form"
             onSubmit={importDataset}
-            aria-busy={busy}
+            aria-busy={importBusy}
           >
             <label
               className="dataset-toolbar-label"
@@ -3184,8 +3732,8 @@ function Datasets({
                 placeholder="manifests/invoices.jsonl"
                 aria-describedby="dataset-path-help"
               />
-              <button className="button secondary" disabled={busy}>
-                {busy ? "Importing…" : "Import"}
+              <button className="button secondary" disabled={importBusy}>
+                {importBusy ? "Importing…" : "Import"}
               </button>
             </div>
             <small id="dataset-path-help" className="sr-only">
@@ -3210,7 +3758,7 @@ function Datasets({
                   key={sample.taskKind}
                   type="button"
                   className="button mini"
-                  disabled={busy}
+                  disabled={importBusy}
                   onClick={() =>
                     void importPath(
                       sample.path,
@@ -3229,7 +3777,7 @@ function Datasets({
             id="dataset-create-panel"
             className="dataset-create-panel"
             onSubmit={generateDataset}
-            aria-busy={busy}
+            aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
           >
             <div className="dataset-create-copy">
               <span className="eyebrow">PROVIDER-POWERED</span>
@@ -3300,6 +3848,21 @@ function Datasets({
                   onChange={(event) => setGenerateCount(event.target.value)}
                 />
               </label>
+              <label>
+                Generation timeout (minutes)
+                <input
+                  type="number"
+                  min="0.5"
+                  max="60"
+                  step="0.5"
+                  required
+                  value={generateTimeoutMinutes}
+                  onChange={(event) =>
+                    setGenerateTimeoutMinutes(event.target.value)
+                  }
+                />
+                <small>Starts when generation begins, not while queued waiting.</small>
+              </label>
               <label className="dataset-create-brief">
                 What should the cases cover?
                 <textarea
@@ -3312,9 +3875,15 @@ function Datasets({
               <button
                 className="button primary"
                 type="submit"
-                disabled={busy || !targets.length}
+                disabled={
+                  generationSubmitting || !targets.length
+                }
               >
-                {busy ? "Generating…" : "Generate dataset"}
+                {generationSubmitting
+                  ? "Starting…"
+                  : activeGenerationJob || queuedGenerationCount
+                    ? "Add to queue"
+                    : "Generate dataset"}
               </button>
             </div>
           </form>
@@ -3335,23 +3904,50 @@ function Datasets({
             </button>
           </div>
         )}
-        {datasets.length ? (
+        {datasets.length || jobsLoading || jobsError || jobs.length ? (
           <div className="dataset-library">
             <div className="dataset-library-layout">
               <aside className="dataset-picker" aria-label="Dataset selection">
                 <div className="dataset-picker-heading">
-                  <strong>Datasets</strong>
+                  {(activeGenerationJob || queuedGenerationCount > 0) && (
+                    <small aria-live="polite">
+                      {activeGenerationJob
+                        ? `Running ${activeGenerationJob.name || "dataset"}`
+                        : `${queuedGenerationCount} queued`}
+                    </small>
+                  )}
                 </div>
                 <div className="dataset-choice-list">
                   {datasets.map((d) => {
-                    const selected = d.version === selectedVersion;
+                    const selected = !selectedJobId && d.version === selectedVersion;
                     return (
                       <button
                         key={d.version}
                         type="button"
                         className={`dataset-choice${selected ? " selected" : ""}`}
                         aria-pressed={selected}
-                        onClick={() => setSelectedVersion(d.version)}
+                        onClick={() => {
+                          suppressDatasetAutoSelectRef.current = false;
+                          setSelectedJobId("");
+                          setSelectedVersion(d.version);
+                        }}
+                        onContextMenu={(event) => {
+                          event.preventDefault();
+                          suppressDatasetAutoSelectRef.current = false;
+                          setSelectedJobId("");
+                          setSelectedVersion(d.version);
+                          openContextMenu("dataset", d.version, event.clientX, event.clientY);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
+                            event.preventDefault();
+                            suppressDatasetAutoSelectRef.current = false;
+                            setSelectedJobId("");
+                            setSelectedVersion(d.version);
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            openContextMenu("dataset", d.version, rect.left, rect.bottom);
+                          }
+                        }}
                       >
                         <span
                           className="dataset-choice-icon"
@@ -3360,7 +3956,7 @@ function Datasets({
                           ▦
                         </span>
                         <span className="dataset-choice-copy">
-                          <strong>{d.name || "Untitled dataset"}</strong>
+                          <strong title={d.name || "Untitled dataset"}>{d.name || "Untitled dataset"}</strong>
                           <span>
                             {TASK_KIND_LABELS[datasetTaskKind(d)]} ·{" "}
                             {d.cases.length}{" "}
@@ -3376,31 +3972,244 @@ function Datasets({
                       </button>
                     );
                   })}
+                  {(jobsLoading || jobsError || pickerJobs.length > 0) && (
+                    <div className="dataset-job-list" aria-live="polite">
+                      {jobsError && (
+                        <div className="dataset-picker-message error" role="alert">
+                          <span>Could not load jobs: {jobsError}</span>
+                          <button type="button" className="text-button" onClick={() => void pollJobs()}>
+                            Retry
+                          </button>
+                        </div>
+                      )}
+                      {jobsLoading && <p className="dataset-picker-loading" role="status">Loading jobs…</p>}
+                      {!jobsLoading && !jobsError && pickerJobs.map((job) => {
+                        const statusLabel = job.status[0].toUpperCase() + job.status.slice(1);
+                        const statusClass =
+                          job.status === "running"
+                            ? "running"
+                            : job.status === "failed" || job.status === "interrupted"
+                              ? "fail"
+                              : job.status === "completed"
+                                ? "pass"
+                                : "neutral";
+                        return (
+                          <div className="dataset-job" key={job.jobId}>
+                            <button
+                              type="button"
+                              className={`dataset-choice${selectedJobId === job.jobId ? " selected" : ""}`}
+                              aria-pressed={selectedJobId === job.jobId}
+                              aria-label={`${job.name || "Untitled dataset"}: ${statusLabel}. Show details`}
+                              onClick={() => {
+                                setJobActionError("");
+                                setSelectedJobId(job.jobId);
+                              }}
+                              onContextMenu={(event) => {
+                                event.preventDefault();
+                                setJobActionError("");
+                                setSelectedJobId(job.jobId);
+                                openContextMenu("job", job.jobId, event.clientX, event.clientY);
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
+                                  event.preventDefault();
+                                  setJobActionError("");
+                                  setSelectedJobId(job.jobId);
+                                  const rect = event.currentTarget.getBoundingClientRect();
+                                  openContextMenu("job", job.jobId, rect.left, rect.bottom);
+                                }
+                              }}
+                            >
+                            <span className="dataset-choice-icon" aria-hidden="true">&#9638;</span>
+                            <span className="dataset-job-copy dataset-choice-copy">
+                              <strong title={job.name || "Untitled dataset"}>{job.name || "Untitled dataset"}</strong>
+                              <span>
+                                {TASK_KIND_LABELS[asTaskKind(job.taskKind)]} · {job.caseCount} {job.caseCount === 1 ? "case" : "cases"}
+                                {(job.status === "queued" || job.status === "running") &&
+                                  typeof job.timeoutSeconds === "number" &&
+                                  Number.isFinite(job.timeoutSeconds) &&
+                                  ` · ${Math.round((job.timeoutSeconds / 60) * 10) / 10} min timeout`}
+                              </span>
+                            </span>
+                            <span className={`dataset-job-indicator ${statusClass}`} title={statusLabel} aria-hidden="true">
+                              {job.status === "failed" || job.status === "interrupted" ? "!" : job.status === "completed" ? "+" : "\u00b7"}
+                            </span>
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </aside>
-              {datasets.find(
-                (dataset) => dataset.version === selectedVersion,
-              ) && (
-                <section
-                  className="dataset-selection"
-                  aria-label="Selected dataset"
+              {contextMenu && (contextDataset || contextJob) && (
+                <div
+                  ref={contextMenuRef}
+                  className="dataset-context-menu"
+                  role="menu"
+                  aria-label="Dataset actions"
+                  style={{ left: contextMenu.x, top: contextMenu.y }}
                 >
-                  <div className="dataset-selection-note">
-                    <div>
-                      <span className="eyebrow">SELECTED DATASET</span>
-                      <p>Browse the cases and inspect one record at a time.</p>
-                    </div>
-                    <span className="dataset-selection-hint">
-                      Use Open viewer for a larger workspace
-                    </span>
-                  </div>
-                  <DatasetViewer
-                    dataset={datasets.find(
-                      (dataset) => dataset.version === selectedVersion,
-                    )!}
-                  />
-                </section>
+                  {contextDataset && (
+                    <>
+                      <button type="button" role="menuitem" onClick={() => beginRename(contextDataset)}>
+                        Rename
+                      </button>
+                      <button type="button" role="menuitem" disabled={Boolean(datasetMutation)} onClick={() => void duplicateDataset(contextDataset)}>
+                        {datasetMutation === "duplicate" ? "Duplicating..." : "Duplicate"}
+                      </button>
+                      <button type="button" role="menuitem" disabled={Boolean(datasetMutation)} onClick={() => void deleteDataset(contextDataset)}>
+                        {datasetMutation === "delete" ? "Deleting..." : "Delete"}
+                      </button>
+                    </>
+                  )}
+                  {contextJob && (contextJob.status === "queued" || contextJob.status === "running") && (
+                    <button type="button" role="menuitem" disabled={Boolean(jobAction)} onClick={() => { closeContextMenu(); void stopDatasetJob(contextJob); }}>
+                      {contextJob.status === "queued" ? "Remove from queue" : "Stop generation"}
+                    </button>
+                  )}
+                  {contextJob && (contextJob.status === "failed" || contextJob.status === "interrupted") && (
+                    <>
+                      <button type="button" role="menuitem" disabled={Boolean(jobAction)} onClick={() => { closeContextMenu(); void retryDatasetJob(contextJob); }}>
+                        {jobAction === "retry" ? "Retrying..." : "Retry generation"}
+                      </button>
+                      <button type="button" role="menuitem" disabled={Boolean(jobAction)} onClick={() => { closeContextMenu(); void deleteDatasetJob(contextJob); }}>
+                        {jobAction === "delete" ? "Deleting..." : "Delete failed job"}
+                      </button>
+                    </>
+                  )}
+                </div>
               )}
+              <section className="dataset-selection" aria-label="Selected dataset">
+                {selectedJob ? (
+                  <div className="dataset-detail dataset-job-detail">
+                    <div className="dataset-detail-heading">
+                      <div>
+                        <span className="eyebrow">DATASET GENERATION JOB</span>
+                        <h4>{selectedJob.name || "Untitled dataset"}</h4>
+                      </div>
+                      <span
+                        className={`status-pill ${
+                          selectedJob.status === "running"
+                            ? "running"
+                            : selectedJob.status === "failed" || selectedJob.status === "interrupted"
+                              ? "fail"
+                              : selectedJob.status === "completed"
+                                ? "pass"
+                                : "neutral"
+                        }`}
+                      >
+                        {selectedJob.status[0].toUpperCase() + selectedJob.status.slice(1)}
+                      </span>
+                    </div>
+                    <p className="dataset-job-description" role="status">
+                      {selectedJob.status === "running"
+                        ? "Generating your dataset. You can leave this page and return when it is ready."
+                        : selectedJob.status === "queued"
+                          ? "Waiting in the queue. Generation will start when the current job finishes."
+                          : selectedJob.status === "completed"
+                            ? "Your dataset is ready to open."
+                            : "Generation did not complete. Review the error below, then retry or delete this attempt."}
+                    </p>
+                    <dl className="dataset-job-facts">
+                      <div><dt>Type</dt><dd>{TASK_KIND_LABELS[asTaskKind(selectedJob.taskKind)]}</dd></div>
+                      <div><dt>Cases requested</dt><dd>{selectedJob.caseCount}</dd></div>
+                      <div><dt>Provider target</dt><dd>{selectedJob.targetName}</dd></div>
+                      {typeof selectedJob.timeoutSeconds === "number" && (
+                        <div><dt>Generation timeout</dt><dd>{Math.round((selectedJob.timeoutSeconds / 60) * 10) / 10} minutes</dd></div>
+                      )}
+                    </dl>
+                    {(selectedJob.status === "running" || selectedJob.status === "queued") && (
+                      <button
+                        type="button"
+                        className="button secondary"
+                        disabled={Boolean(jobAction)}
+                        onClick={() => void stopDatasetJob(selectedJob)}
+                      >
+                        {jobAction === "stop" ? "Stopping..." : selectedJob.status === "queued" ? "Remove from queue" : "Stop generation"}
+                      </button>
+                    )}
+                    {selectedJob.status === "completed" && selectedJob.datasetVersion && (
+                      <button type="button" className="button primary" onClick={() => void selectCompletedJob(selectedJob)}>Open dataset</button>
+                    )}
+                    {selectedJob.error && (
+                      <div className="run-error-notice" role="alert">
+                        <strong>Generation error</strong>
+                        <p>{selectedJob.error}</p>
+                      </div>
+                    )}
+                    {(selectedJob.status === "failed" || selectedJob.status === "interrupted") && (
+                      <div className="dataset-header-actions">
+                        <button
+                          type="button"
+                          className="button primary"
+                          disabled={Boolean(jobAction)}
+                          onClick={() => void retryDatasetJob(selectedJob)}
+                        >
+                          {jobAction === "retry" ? "Retrying..." : "Retry generation"}
+                        </button>
+                        <button
+                          type="button"
+                          className="button secondary"
+                          disabled={Boolean(jobAction)}
+                          onClick={() => void deleteDatasetJob(selectedJob)}
+                        >
+                          {jobAction === "delete" ? "Deleting..." : "Delete failed job"}
+                        </button>
+                      </div>
+                    )}
+                    {jobActionError && (
+                      <div className="import-message error" role="alert">
+                        {jobActionError}
+                      </div>
+                    )}
+                  </div>
+                ) : selectedDataset ? (
+                  <DatasetViewer
+                    dataset={selectedDataset}
+                    onTitleDoubleClick={beginRename}
+                    titleEditor={renameOpen ? (
+                      <h3
+                        className="dataset-title-editor"
+                        ref={renameTitleRef}
+                        contentEditable={!renameBusy}
+                        suppressContentEditableWarning
+                        role="textbox"
+                        aria-label="Dataset name"
+                        aria-multiline="false"
+                        onInput={(event) => setRenameName(event.currentTarget.textContent || "")}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void renameDataset();
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            setRenameName(selectedDataset.name || "");
+                            setRenameError("");
+                            setRenameOpen(false);
+                          }
+                        }}
+                        onBlur={() => {
+                          if (renameOpen) void renameDataset();
+                        }}
+                      >
+                        {renameName}
+                      </h3>
+                      {renameError && (
+                        <span className="error dataset-title-edit-error" role="alert">
+                          {renameError}
+                        </span>
+                      )}
+                    ) : undefined}
+                  />
+                ) : (
+                  <Empty
+                    icon="▦"
+                    title="No completed dataset yet"
+                    text="Generated datasets will appear here when they finish, or import a JSONL manifest to get started."
+                  />
+                )}
+              </section>
             </div>
           </div>
         ) : (
@@ -3457,7 +4266,7 @@ const providerLabel = (target: Target) =>
         ? "OpenAI"
         : "OpenAI-compatible";
 
-function DatasetViewer({ dataset }: { dataset: Dataset }) {
+function DatasetViewer({ dataset, onTitleDoubleClick, titleEditor }: { dataset: Dataset; onTitleDoubleClick?: () => void; titleEditor?: ReactNode }) {
   const taskKind = datasetTaskKind(dataset);
   const [query, setQuery] = useState("");
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(
@@ -3552,6 +4361,8 @@ function DatasetViewer({ dataset }: { dataset: Dataset }) {
       <div className="dataset-viewer">
         <DatasetHeader
           dataset={dataset}
+          onTitleDoubleClick={onTitleDoubleClick}
+          titleEditor={titleEditor}
           taskKind={taskKind}
           isOpen={maximized}
           onMaximize={() => setMaximized(true)}
@@ -3667,6 +4478,8 @@ function DatasetViewer({ dataset }: { dataset: Dataset }) {
 
 function DatasetHeader({
   dataset,
+  onTitleDoubleClick,
+  titleEditor,
   taskKind,
   titleId,
   isOpen,
@@ -3676,6 +4489,8 @@ function DatasetHeader({
   maximizeButtonRef,
 }: {
   dataset: Dataset;
+  onTitleDoubleClick?: () => void;
+  titleEditor?: ReactNode;
   taskKind: TaskKind;
   titleId?: string;
   isOpen?: boolean;
@@ -3695,7 +4510,11 @@ function DatasetHeader({
         </span>
         <div className="dataset-title-content">
           <div className="dataset-title-line">
-            <h3 id={titleId}>{dataset.name || "Untitled dataset"}</h3>
+            {titleEditor ?? (
+              <h3 id={titleId} onDoubleClick={onTitleDoubleClick}>
+                {dataset.name || "Untitled dataset"}
+              </h3>
+            )}
             <span className="tag dataset-kind">
               {TASK_KIND_LABELS[taskKind]}
             </span>
@@ -5801,7 +6620,9 @@ function SetupPanel({
                     </option>
                   </select>
                   <small>
-                    Outputs are stored for review but are not scored.
+                    {form.inferenceOnly
+                      ? "Outputs are stored for review but are not scored."
+                      : "Outputs are stored for review and scored against the expected results."}
                   </small>
                 </label>
                 {currentTaskKind === "document-json" && (

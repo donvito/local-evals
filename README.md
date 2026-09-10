@@ -33,6 +33,7 @@ The CLI command is now `npm run localevals --` (formerly `npm run evalforge --`)
 
 ## Guides
 
+- [Back up and move app data](docs/backups.md): portable backup, restore, and migration recovery.
 - [Prepare datasets](docs/datasets.md) — images, text, tool-call expectations, and sample data.
 - [Configure providers and models](docs/providers.md) — local endpoints, OpenRouter, and model capabilities.
 - [Set up and run evaluations](docs/runs.md) — prompts, schemas, grading, and CLI usage.

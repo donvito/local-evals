@@ -8,6 +8,7 @@ import { sanitize, registerSecrets } from "./core/security.js";
 import { compareRuns, markdownReport } from "./core/reports.js";
 import { startServer } from "./server.js";
 import * as providers from "./core/providers.js";
+import { backupAppData, restoreAppData } from "./storage/backup.js";
 
 function parse(args: string[]) {
   const positionals: string[] = [],
@@ -30,6 +31,9 @@ export async function main(args = process.argv.slice(2)) {
   const [command, ...rest] = args;
   if (!command || command === "help" || command === "--help") {
     usage();
+    console.log(
+      "App data:\n  backup --out <new-backup-directory> [--db <path>]\n  restore <backup-directory> --to <new-data-directory>",
+    );
     return;
   }
   const { positionals: p, flags: f } = parse(rest);
@@ -42,6 +46,20 @@ export async function main(args = process.argv.slice(2)) {
       process.cwd(),
       f.host ?? "127.0.0.1",
     );
+    return;
+  }
+  if (command === "backup") {
+    if (!f.out) throw new Error("Usage: backup --out <new-backup-directory> [--db <path>]");
+    const result = await backupAppData(dbPath, path.resolve(f.out));
+    console.log("Backup created: " + result.directory);
+    console.log("This backup includes the credential key. Keep it private.");
+    return;
+  }
+  if (command === "restore") {
+    if (!p[0] || !f.to) throw new Error("Usage: restore <backup-directory> --to <new-data-directory>");
+    const result = await restoreAppData(path.resolve(p[0]), path.resolve(f.to));
+    console.log("Restored database: " + result.dbPath);
+    console.log("Start the app with --db " + result.dbPath);
     return;
   }
   const db = new DatabaseStore(dbPath);
