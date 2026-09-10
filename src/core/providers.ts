@@ -22,6 +22,11 @@ export class ProviderError extends Error {
 }
 
 export type ProviderTestResult = { ok: true; response: ModelResponse };
+export class PreflightError extends ProviderError {
+  constructor(message: string, public code: "truncated" | "incompatible") {
+    super(message);
+  }
+}
 export type ProviderRequestOptions = {
   imagePath?: string;
   outputMode?: "prompted-json" | "schema-constrained-json";
@@ -56,8 +61,9 @@ function validateStructuredResponse(
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new ProviderError(
+    throw new PreflightError(
       `Target ${target.name} returned invalid JSON during structured-output preflight.`,
+      "incompatible",
     );
   }
   try {
@@ -67,8 +73,9 @@ function validateStructuredResponse(
       ? Ajv2020Ctor
       : AjvCtor)({ allErrors: true, strict: false }).compile(schema);
     if (!validator(parsed))
-      throw new ProviderError(
+      throw new PreflightError(
         `Target ${target.name} did not honor the structured-output preflight schema: ${(validator.errors ?? []).map((error: any) => error.message).join("; ")}`,
+        "incompatible",
       );
   } catch (error) {
     if (error instanceof ProviderError) throw error;
@@ -155,6 +162,7 @@ async function postChat(
   target: TargetConfig,
   body: unknown,
   signal?: AbortSignal,
+  preflightMaxTokens?: number,
 ): Promise<ModelResponse> {
   registerSecrets([target]);
   if (target.apiKeyEnv && !target.apiKey && !process.env[target.apiKeyEnv])
@@ -203,6 +211,12 @@ async function postChat(
   const providerError = providerErrorMessage(target, raw);
   if (providerError)
     throw new ProviderError(providerError, false, sanitize(raw));
+  if (preflightMaxTokens !== undefined && raw?.choices?.[0]?.finish_reason === "length") {
+    throw new PreflightError(
+      `Preflight exhausted its ${preflightMaxTokens}-token output budget before completion. Reasoning may consume this budget; this does not establish provider incompatibility.`,
+      "truncated",
+    );
+  }
   const text = responseText(raw);
   const message = raw?.choices?.[0]?.message;
   const toolCalls = Array.isArray(message?.tool_calls)
@@ -378,7 +392,7 @@ export async function testTarget(
     {
       type: "text",
       text: options.schema
-        ? "Reply with a JSON object matching the supplied schema."
+        ? `Reply only with a JSON value matching this schema:\n${JSON.stringify(options.schema)}`
         : usesTools
           ? `Call the ${options.tools?.[0]?.function.name ?? "supplied"} function exactly once with an empty JSON object. Do not answer with text.`
           : "Reply with OK.",
@@ -391,7 +405,7 @@ export async function testTarget(
     });
   const body: any = {
     model: target.model,
-    max_tokens: options.maxTokens ?? (options.tools?.length ? 64 : 8),
+    max_tokens: options.maxTokens ?? 512,
     messages: [{ role: "user", content }],
   };
   if (options.tools?.length) body.tools = options.tools;
@@ -410,7 +424,7 @@ export async function testTarget(
     if (target.provider === "openrouter")
       body.provider = { require_parameters: true };
   }
-  const response = await postChat(target, body, signal);
+  const response = await postChat(target, body, signal, body.max_tokens);
   if (options.schema && !usesTools) {
     validateStructuredResponse(target, options.schema, response.text);
   }

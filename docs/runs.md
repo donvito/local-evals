@@ -43,7 +43,7 @@ Enable **inference-only** for unlabeled datasets: outputs are stored without exp
 ## Output and grading settings
 
 - `prompted-json` includes the schema in the extraction prompt.
-- `schema-constrained-json` sends strict `response_format.json_schema` and needs a target that supports it. The app does not repair JSON or silently fall back.
+- `schema-constrained-json` sends strict `response_format.json_schema` and needs a target that supports it. Preflight includes the schema in its prompt and allows up to 512 output tokens, including reasoning. A completed response that violates the schema triggers `prompted-json` fallback and a `preflight_warning` event. A token-limit finish stops the run with a truncation diagnostic instead of declaring incompatibility. This preflight budget is separate from run generation settings; a successful probe does not prove strict enforcement for every request.
 - Tool calling uses its own protocol. Set `toolChoice` to `auto`, `required`, or `none`, and `toolCallOrder` to `ordered` or `unordered`. Calls are recorded and graded without execution.
 - Generation options live in `generation` and can be overridden per target. Request timeout defaults to 60 seconds; concurrency defaults to 1.
 

@@ -12,6 +12,7 @@ import {
   callOpenAICompatible,
   discoverTargetMetadata,
   ProviderError,
+  PreflightError,
   testTarget,
   testToolCallingTarget,
   PREFLIGHT_SCHEMA,
@@ -84,8 +85,13 @@ function diagnosticError(error: unknown): string {
   );
   if (missing)
     return `Target ${missing[1]} is missing credential configuration.`;
+  if (error instanceof PreflightError && error.code === "truncated")
+    return redacted(message).slice(0, 500);
   if (error instanceof ProviderError) return "Provider request failed.";
   return redacted(message).slice(0, error instanceof ProviderError ? 240 : 500);
+}
+function isStructuredOutputPreflightFailure(error: unknown): boolean {
+  return error instanceof PreflightError && error.code === "incompatible";
 }
 function event(db: ExtendedDb, runId: string, type: string, payload?: unknown) {
   try {
@@ -376,6 +382,7 @@ async function runCase(
   config: RunConfig,
   options: RunnerOptions,
   db: ExtendedDb,
+  extractionOutputMode: "prompted-json" | "schema-constrained-json",
 ): Promise<CaseResult> {
   const caseStarted = Date.now();
   event(db, runId, "case_started", { caseId: item.caseId });
@@ -443,7 +450,7 @@ async function runCase(
     const schema = options.schema ?? config.schema;
     const schemaPrompt =
       taskKind !== "tool-calling" &&
-      (config.outputMode ?? "prompted-json") === "prompted-json" &&
+      extractionOutputMode === "prompted-json" &&
       schema
         ? `\n\nSchema:\n${JSON.stringify(schema)}`
         : "";
@@ -471,9 +478,13 @@ async function runCase(
             undefined,
             taskKind === "tool-calling"
               ? "prompted-json"
-              : (config.outputMode ?? "prompted-json"),
+              : extractionOutputMode,
             signal,
-            taskKind === "tool-calling" ? undefined : schema,
+            taskKind === "tool-calling"
+              ? undefined
+              : extractionOutputMode === "schema-constrained-json"
+                ? schema
+                : undefined,
             generationFor(config, extractionTarget),
             toolRequest,
           ),
@@ -613,6 +624,8 @@ export async function runEvaluation(
     throw new Error("requestTimeoutMs must be positive.");
   const schema = config.schema;
   if (schema && typeof schema === "object") validateSchemaDefinition(schema);
+  let extractionOutputMode: "prompted-json" | "schema-constrained-json" =
+    config.outputMode ?? "prompted-json";
   const runtimeTargets = {
     ocr:
       taskKind !== "document-json" || extractionOnly
@@ -632,6 +645,7 @@ export async function runEvaluation(
   };
   const effectiveConfig: RunConfig = {
     ...config,
+    outputMode: extractionOutputMode,
     ...(config.ocrTarget
       ? {
           ocrTarget: credentialFreeTarget(
@@ -695,6 +709,7 @@ export async function runEvaluation(
     },
     assetHashes,
     config: sanitize(effectiveConfig),
+    requestedOutputMode: config.outputMode ?? "prompted-json",
     schema,
     schemaHash: hash(schema),
     configHash: hash(effectiveConfig),
@@ -777,20 +792,34 @@ export async function runEvaluation(
         taskKind !== "tool-calling" &&
         config.outputMode === "schema-constrained-json"
       )
-        await requestStage(
-          db,
-          runId,
-          "__preflight__",
-          "extraction-preflight",
-          (signal) =>
-            testTarget(
-              runtimeTargets.extraction,
-              { schema: PREFLIGHT_SCHEMA },
-              signal,
-            ).then((r) => r.response),
-          executionOptions,
-          config,
-        );
+        try {
+          await requestStage(
+            db,
+            runId,
+            "__preflight__",
+            "extraction-preflight",
+            (signal) =>
+              testTarget(
+                runtimeTargets.extraction,
+                { schema: PREFLIGHT_SCHEMA },
+                signal,
+              ).then((r) => r.response),
+            executionOptions,
+            config,
+          );
+        } catch (error) {
+          if (!isStructuredOutputPreflightFailure(error)) throw error;
+          extractionOutputMode = "prompted-json";
+          effectiveConfig.outputMode = extractionOutputMode;
+          snapshot.config = sanitize(effectiveConfig);
+          snapshot.configHash = hash(effectiveConfig);
+          db.updateRunSnapshot?.(runId, snapshot);
+          event(db, runId, "preflight_warning", {
+            stage: "extraction-preflight",
+            requestedOutputMode: snapshot.requestedOutputMode,
+            outputMode: extractionOutputMode,
+          });
+        }
       if (taskKind === "tool-calling")
         await requestStage(
           db,
@@ -828,6 +857,7 @@ export async function runEvaluation(
           config,
           executionOptions,
           db,
+          extractionOutputMode,
         );
         results[index] = result;
         db.saveCaseResult(

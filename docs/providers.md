@@ -37,7 +37,7 @@ For llama.cpp, the provider type can be `llama.cpp`. Document OCR also requires 
 
 Choose OpenRouter and use `https://openrouter.ai/api/v1`. Search the model catalog or enter a model ID manually. Catalog filters include Vision, Structured JSON, Tools, Free, and minimum context size.
 
-Selecting a catalog result fills the model ID and advertised capabilities. Actual behavior still depends on the serving endpoint; schema-constrained JSON requires structured-output support.
+Selecting a catalog result fills the model ID and advertised capabilities. Actual behavior still depends on the serving endpoint; schema-constrained JSON requires structured-output support. If runtime preflight indicates incompatibility, the run falls back to `prompted-json` and continues while logging a preflight warning.
 
 For file-based configurations, reference an environment variable:
 

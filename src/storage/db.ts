@@ -25,6 +25,7 @@ export type StoredCaseResult = {
 };
 
 export type RunEventType =
+  | "preflight_warning"
   | "run_started"
   | "stage_started"
   | "stage_finished"
@@ -44,6 +45,7 @@ export type RunEvent = {
 };
 
 const RUN_EVENT_TYPES = new Set<RunEventType>([
+  "preflight_warning",
   "run_started",
   "stage_started",
   "stage_finished",
@@ -55,6 +57,8 @@ const RUN_EVENT_TYPES = new Set<RunEventType>([
   "run_finished",
 ]);
 const RUN_EVENT_KEYS = new Set([
+  "requestedOutputMode",
+  "outputMode",
   "phase",
   "stage",
   "caseId",
@@ -97,7 +101,9 @@ function eventPayload(value: unknown): Record<string, unknown> {
       key === "caseId" ||
       key === "stage" ||
       key === "status" ||
-      key === "phase"
+      key === "phase" ||
+      key === "requestedOutputMode" ||
+      key === "outputMode"
     ) {
       output[key] = String(child).slice(0, 120);
     } else if (typeof child === "boolean" || typeof child === "number") {
@@ -346,14 +352,22 @@ export class DatabaseStore {
     const row = this.db
       .prepare("SELECT snapshot_json FROM runs WHERE run_id=?")
       .get(runId) as any;
-    this.db
-      .prepare("UPDATE runs SET snapshot_json=? WHERE run_id=?")
-      .run(
-        JSON.stringify(
-          sanitize({ ...JSON.parse(row?.snapshot_json ?? "{}"), ...snapshot }),
-        ),
-        runId,
-      );
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE runs SET snapshot_json=? WHERE run_id=?")
+        .run(
+          JSON.stringify(
+            sanitize({ ...JSON.parse(row?.snapshot_json ?? "{}"), ...snapshot }),
+          ),
+          runId,
+        );
+      const config = (snapshot as { config?: RunConfig }).config;
+      if (config) {
+        this.db
+          .prepare("UPDATE config_snapshots SET config_json=? WHERE run_id=?")
+          .run(serializeConfig(config), runId);
+      }
+    })();
   }
   finishRun(runId: string, status: string, error?: string) {
     this.db

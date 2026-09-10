@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { runEvaluation } from "../src/core/runner.js";
 import { ProviderError } from "../src/core/providers.js";
+import { DatabaseStore } from "../src/storage/db.js";
 import type {
   CaseResult,
   DatasetManifest,
@@ -40,11 +44,17 @@ function fakeDb() {
   const saved: CaseResult[] = [];
   const attempts: unknown[] = [];
   const events: unknown[] = [];
+  const createdSnapshots: unknown[] = [];
+  const updatedSnapshots: unknown[] = [];
   return {
     saved,
     attempts,
     events,
-    createRun: vi.fn(),
+    createdSnapshots,
+    updatedSnapshots,
+    createRun: vi.fn((_id: string, _config: unknown, _dataset: string, snapshot: unknown) =>
+      createdSnapshots.push(structuredClone(snapshot)),
+    ),
     saveCaseResult: vi.fn((_id: string, result: CaseResult) =>
       saved.push(result),
     ),
@@ -53,7 +63,9 @@ function fakeDb() {
         attempts.push({ ...(attempt as object), stage }),
     ),
     finishRun: vi.fn(),
-    updateRunSnapshot: vi.fn(),
+    updateRunSnapshot: vi.fn((_id: string, snapshot: unknown) =>
+      updatedSnapshots.push(structuredClone(snapshot)),
+    ),
     appendRunEvent: vi.fn((_id: string, type: string, payload: unknown) =>
       events.push({ type, ...(payload as object) }),
     ),
@@ -149,6 +161,174 @@ describe("evaluation runner", () => {
     expect(
       db.attempts.every((attempt: any) => attempt.stage === "extraction"),
     ).toBe(true);
+  });
+
+  it("falls back to prompted-json when schema-constrained preflight returns invalid content", async () => {
+    const db = fakeDb();
+    const target = {
+      name: "extract",
+      baseUrl: "http://extract",
+      model: "m",
+      supportsStructuredOutput: true,
+    };
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+        const body = JSON.parse(String(init.body));
+        if (body.response_format?.json_schema?.name === "evalforge_preflight") {
+          return new Response(
+            JSON.stringify({ choices: [{ message: { content: "not-json" } }] }),
+            { status: 200 },
+          );
+        }
+        expect(body.response_format).toBeUndefined();
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '{"total":1}' } }],
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const config = {
+      ...baseConfig,
+      taskKind: "text-json" as const,
+      outputMode: "schema-constrained-json" as const,
+      extractionTarget: target,
+      stagePrompts: { ocr: "", extraction: "extract" },
+      schema: {
+        type: "object",
+        properties: { total: { type: "number" } },
+        required: ["total"],
+        additionalProperties: false,
+      },
+    };
+    const result = await runEvaluation(
+      { cases: [{ caseId: "a", inputText: "total=1", expected: { total: 1 } }] },
+      config as any,
+      { db },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.every(([url]) =>
+        String(url).endsWith("/chat/completions"),
+      ),
+    ).toBe(true);
+    expect(result.results[0].parsedJson).toMatchObject({ total: 1 });
+    expect(db.updatedSnapshots).toHaveLength(2);
+    expect(db.updatedSnapshots[0].config.outputMode).toBe("schema-constrained-json");
+    expect(db.updatedSnapshots[1]).toMatchObject({
+      config: { outputMode: "prompted-json" },
+      requestedOutputMode: "schema-constrained-json",
+    });
+    expect(db.updatedSnapshots[1].configHash).not.toBe(
+      db.createdSnapshots[0].configHash,
+    );
+    expect(db.events.some((event: any) => event.type === "preflight_warning")).toBe(
+      true,
+    );
+  });
+
+  it("aborts on truncated schema preflight without fallback or extraction", async () => {
+    const db = fakeDb();
+    const target = {
+      name: "extract",
+      baseUrl: "http://extract",
+      model: "m",
+      supportsStructuredOutput: true,
+    };
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ finish_reason: "length", message: { content: null } }],
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const config = {
+      ...baseConfig,
+      taskKind: "text-json" as const,
+      outputMode: "schema-constrained-json" as const,
+      extractionTarget: target,
+      stagePrompts: { ocr: "", extraction: "extract" },
+      schema: {
+        type: "object",
+        properties: { total: { type: "number" } },
+        required: ["total"],
+        additionalProperties: false,
+      },
+    };
+
+    await expect(
+      runEvaluation(
+        { cases: [{ caseId: "a", inputText: "total=1", expected: { total: 1 } }] },
+        config as any,
+        { db },
+      ),
+    ).rejects.toThrow(/Preflight exhausted its 512-token output budget/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(db.saved).toHaveLength(0);
+    expect(db.attempts).toHaveLength(1);
+    expect(db.attempts[0].stage).toBe("extraction-preflight");
+    expect(db.events.some((event: any) => event.type === "preflight_warning")).toBe(false);
+  });
+
+  it("persists prompted-json in the SQLite run config after fallback", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "evalforge-runner-fallback-"));
+    const db = new DatabaseStore(path.join(dir, "runs.db"));
+    const target = {
+      name: "extract",
+      baseUrl: "http://extract",
+      model: "m",
+      supportsStructuredOutput: true,
+    };
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      return body.response_format?.json_schema?.name === "evalforge_preflight"
+        ? new Response(
+            JSON.stringify({ choices: [{ message: { content: "not-json" } }] }),
+            { status: 200 },
+          )
+        : new Response(
+            JSON.stringify({ choices: [{ message: { content: '{"total":1}' } }] }),
+            { status: 200 },
+          );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let runId = "";
+    try {
+      await runEvaluation(
+        { cases: [{ caseId: "a", inputText: "total=1", expected: { total: 1 } }] },
+        {
+          ...baseConfig,
+          taskKind: "text-json",
+          outputMode: "schema-constrained-json",
+          extractionTarget: target,
+          stagePrompts: { ocr: "", extraction: "extract" },
+          schema: {
+            type: "object",
+            properties: { total: { type: "number" } },
+            required: ["total"],
+            additionalProperties: false,
+          },
+        },
+        { db, onStarted: (id) => (runId = id) },
+      );
+      expect(db.getRun(runId)?.config.outputMode).toBe("prompted-json");
+      expect(db.listRunEvents(runId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "preflight_warning",
+          payload: {
+            stage: "extraction-preflight",
+            requestedOutputMode: "schema-constrained-json",
+            outputMode: "prompted-json",
+          },
+        }),
+      ]));
+    } finally {
+      db.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("persists all HTTP 429 attempts before succeeding", async () => {

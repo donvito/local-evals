@@ -1,7 +1,12 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { writeFile } from "node:fs/promises";
+import { writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   callOpenAICompatible,
+  PreflightError,
+  PREFLIGHT_SCHEMA,
   ProviderError,
   testToolCallingTarget,
   TOOL_PREFLIGHT_PROBE,
@@ -17,6 +22,8 @@ const target = {
 };
 
 afterEach(() => vi.unstubAllGlobals());
+const imagePath = join(tmpdir(), `evalforge-provider-${randomUUID()}.png`);
+afterEach(() => rm(imagePath, { force: true }));
 
 describe("OpenAI-compatible provider", () => {
   it("sends image bytes, generation settings, and schema constraints", async () => {
@@ -38,7 +45,7 @@ describe("OpenAI-compatible provider", () => {
       );
     });
     vi.stubGlobal("fetch", fetchMock);
-    const path = "/private/tmp/evalforge-provider-test.png";
+    const path = imagePath;
     await writeFile(path, Buffer.from([137, 80, 78, 71]));
     const response = await callOpenAICompatible(
       target,
@@ -93,6 +100,76 @@ describe("OpenAI-compatible provider", () => {
     });
   });
 
+  it("uses the default testTarget token budget and includes the schema in its prompt", async () => {
+    let request: any;
+    const schema = {
+      type: "object",
+      properties: { ok: { type: "boolean" } },
+      required: ["ok"],
+      additionalProperties: false,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        request = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '{"ok":true}' } }],
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await expect(testTarget(target, { schema })).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(request.max_tokens).toBe(512);
+    expect(request.messages[0].content[0].text).toContain(
+      JSON.stringify(schema),
+    );
+  });
+
+  it("honors an explicit testTarget maxTokens option", async () => {
+    let request: any;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        request = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "OK" } }] }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await expect(testTarget(target, { maxTokens: 37 })).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(request.max_tokens).toBe(37);
+  });
+
+  it.each([null, undefined])(
+    "throws truncated PreflightError before parsing %s content",
+    async (content) => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              choices: [{ finish_reason: "length", message: { content } }],
+            }),
+            { status: 200 },
+          ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const error = await testTarget(target).catch((value) => value);
+      expect(error).toBeInstanceOf(PreflightError);
+      expect(error.code).toBe("truncated");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("rejects structured preflight output with wrong types or extra properties", async () => {
     vi.stubGlobal(
       "fetch",
@@ -112,9 +189,28 @@ describe("OpenAI-compatible provider", () => {
       required: ["ok"],
       additionalProperties: false,
     };
-    await expect(testTarget(target, { schema })).rejects.toThrow(
-      /did not honor/,
+    const error = await testTarget(target, { schema }).catch((value) => value);
+    expect(error).toBeInstanceOf(PreflightError);
+    expect(error.code).toBe("incompatible");
+  });
+
+  it("reports completed invalid JSON preflight output as incompatible", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              choices: [{ finish_reason: "stop", message: { content: "not-json" } }],
+            }),
+            { status: 200 },
+          ),
+      ),
     );
+
+    const error = await testTarget(target, { schema: PREFLIGHT_SCHEMA }).catch((value) => value);
+    expect(error).toBeInstanceOf(PreflightError);
+    expect(error.code).toBe("incompatible");
   });
 
   it("reports provider error envelopes returned with HTTP 2xx and hints at /v1", async () => {
