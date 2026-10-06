@@ -2,7 +2,7 @@
 
 A local-first app for evaluating document → JSON, text → JSON, and tool-call proposals with OpenAI-compatible providers or OpenRouter. Inspect inputs, outputs, scores, and execution logs side by side.
 
-![Local Evals showing a receipt alongside its extracted JSON](docs/images/runs-screenshot.png)
+![Local Evals Runs view: an invoice image beside its expected and extracted JSON, with every case passing](docs/images/runs-screenshot.png)
 
 ## Run the app
 
