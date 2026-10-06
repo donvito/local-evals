@@ -4169,6 +4169,7 @@ function Datasets({
                     dataset={selectedDataset}
                     onTitleDoubleClick={beginRename}
                     titleEditor={renameOpen ? (
+                      <>
                       <h3
                         className="dataset-title-editor"
                         ref={renameTitleRef}
@@ -4200,6 +4201,7 @@ function Datasets({
                           {renameError}
                         </span>
                       )}
+                      </>
                     ) : undefined}
                   />
                 ) : (
