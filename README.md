@@ -13,7 +13,7 @@ npm install
 npm run dev
 ```
 
-Open [localhost:4173](http://127.0.0.1:4173). Configure a provider, import a dataset, then launch an evaluation from **Setup**. Data is stored locally in `.localevals/`.
+Open [localhost:4173](http://127.0.0.1:4173). Configure a provider, import a dataset, then launch an evaluation from **Setup**. Create an experiment to group related runs under a name. Data is stored locally in `.localevals/`.
 
 For an offline demo with synthetic data and mock model responses, run `npm run demo` and open [localhost:4180](http://127.0.0.1:4180).
 
@@ -37,6 +37,7 @@ The CLI command is now `npm run localevals --` (formerly `npm run evalforge --`)
 - [Prepare datasets](docs/datasets.md) — images, text, tool-call expectations, and sample data.
 - [Configure providers and models](docs/providers.md) — local endpoints, OpenRouter, and model capabilities.
 - [Set up and run evaluations](docs/runs.md) — prompts, schemas, grading, and CLI usage.
+- [Organize experiments](docs/experiments.md) — name a group of related runs and find them together.
 - [Compare evaluation results](docs/comparison.md) — compare runs on the same dataset, inspect regressions, and export results.
 
 ## License

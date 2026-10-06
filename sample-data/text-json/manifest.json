@@ -1,68 +1,93 @@
 {
-  "name": "Synthetic text-to-JSON edge cases",
+  "name": "Customer support inquiries",
   "taskKind": "text-json",
   "cases": [
     {
-      "caseId": "text-json-001",
-      "inputText": "CASE_ID=text-json-001\nSubject: New workspace subscription\nHello fictional billing desk,\nJuniper Works opened its workspace on January 15, 2025. Please record twelve seats at a monthly rate of $49.95; the subscription is active.\nThanks,\nThe synthetic operations team",
+      "caseId": "inquiry-001",
+      "inputText": "Hi, I was charged twice for order ORD-10482 this morning. I only placed one order. Please refund the duplicate charge as soon as possible.\n- Dana",
       "expected": {
-        "customer": "Juniper Works",
-        "opened": "2025-01-15",
-        "seats": 12,
-        "monthlyRate": 49.95,
-        "active": true
+        "category": "billing",
+        "urgency": "high",
+        "sentiment": "negative",
+        "orderNumber": "ORD-10482",
+        "needsHuman": true
       }
     },
     {
-      "caseId": "text-json-002",
-      "inputText": "CASE_ID=text-json-002\nParse this fictional record. customer=Kite Lab; nickname=null; dueDate=2025-03-31; balance=0. The memo field is missing.",
+      "caseId": "inquiry-002",
+      "inputText": "Hello! Could you tell me when order ORD-20917 will arrive? The tracking page hasn't updated since Tuesday. Thanks.",
       "expected": {
-        "customer": "Kite Lab",
-        "nickname": null,
-        "dueDate": "2025-03-31",
-        "balance": 0
+        "category": "shipping",
+        "urgency": "medium",
+        "sentiment": "neutral",
+        "orderNumber": "ORD-20917",
+        "needsHuman": false
       }
     },
     {
-      "caseId": "text-json-003",
-      "inputText": "CASE_ID=text-json-003\nParse this fictional record. customer=Lantern Guild; dueDate=2024-02-29; offset=-17.25; attempts=0; note=null.",
+      "caseId": "inquiry-003",
+      "inputText": "Your app keeps crashing every time I try to log in on my phone. I can't get into my account at all and it's really frustrating.",
       "expected": {
-        "customer": "Lantern Guild",
-        "dueDate": "2024-02-29",
-        "offset": -17.25,
-        "attempts": 0,
-        "note": null
+        "category": "technical",
+        "urgency": "high",
+        "sentiment": "negative",
+        "orderNumber": null,
+        "needsHuman": false
       }
     },
     {
-      "caseId": "text-json-004",
-      "inputText": "CASE_ID=text-json-004\nParse this fictional record. customer=Moonbase Supply; active=false. The seats and dueDate fields are intentionally omitted.",
+      "caseId": "inquiry-004",
+      "inputText": "How do I change the email address on my account? I'm moving to a new work address next month.",
       "expected": {
-        "customer": "Moonbase Supply",
-        "active": false
+        "category": "account",
+        "urgency": "low",
+        "sentiment": "neutral",
+        "orderNumber": null,
+        "needsHuman": false
       }
     },
     {
-      "caseId": "text-json-005",
-      "inputText": "CASE_ID=text-json-005\nFrom: ops@northstar.example\nSubject: Fictional annual allowance\nNorthstar Fabrication has an annual limit of 1,000,000.25 and a utilization ratio of 0.125. The allowance is due on December 31, 2026, and the account is active.\nThis is a synthetic note for parser testing only.",
+      "caseId": "inquiry-005",
+      "inputText": "Loving my new kettle! Quick question before I buy a second one for my parents: does it work with 220V outlets?",
       "expected": {
-        "customer": "Northstar Fabrication",
-        "dueDate": "2026-12-31",
-        "annualLimit": 1000000.25,
-        "ratio": 0.125,
-        "active": true
+        "category": "product_question",
+        "urgency": "low",
+        "sentiment": "positive",
+        "orderNumber": null,
+        "needsHuman": false
       }
     },
     {
-      "caseId": "text-json-006",
-      "inputText": "CASE_ID=text-json-006\nParse this fictional record. customer=Orchid Transit; dueDate=2025-07-04; count=3; unitPrice=19.99; total=59.97; comment=null.",
+      "caseId": "inquiry-006",
+      "inputText": "The lamp from order ORD-33105 arrived with a cracked base. I'd like a replacement sent out, please. Photos attached.",
       "expected": {
-        "customer": "Orchid Transit",
-        "dueDate": "2025-07-04",
-        "count": 3,
-        "unitPrice": 19.99,
-        "total": 59.97,
-        "comment": null
+        "category": "shipping",
+        "urgency": "high",
+        "sentiment": "negative",
+        "orderNumber": "ORD-33105",
+        "needsHuman": true
+      }
+    },
+    {
+      "caseId": "inquiry-007",
+      "inputText": "Please cancel my monthly subscription at the end of this billing period. Nothing wrong, I just don't need it anymore.",
+      "expected": {
+        "category": "billing",
+        "urgency": "low",
+        "sentiment": "neutral",
+        "orderNumber": null,
+        "needsHuman": true
+      }
+    },
+    {
+      "caseId": "inquiry-008",
+      "inputText": "Thanks for the fast delivery on ORD-41877, everything looks great. Is the warranty one year or two?",
+      "expected": {
+        "category": "product_question",
+        "urgency": "low",
+        "sentiment": "positive",
+        "orderNumber": "ORD-41877",
+        "needsHuman": false
       }
     }
   ]

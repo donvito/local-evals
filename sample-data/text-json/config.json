@@ -1,10 +1,10 @@
 {
-  "datasetVersion": "synthetic-text-json-v1",
-  "schemaVersion": "synthetic-text-json-schema-v1",
+  "datasetVersion": "customer-inquiries-v1",
+  "schemaVersion": "customer-inquiry-triage-v1",
   "taskKind": "text-json",
   "stagePrompts": {
     "ocr": "",
-    "extraction": "Read the supplied fictional record and return exactly one JSON object. Preserve missing fields as missing, preserve explicit null values as null, and preserve dates and numbers as typed JSON values. Do not add commentary."
+    "extraction": "You triage customer support messages. Read the message and return exactly one JSON object that follows the schema. category: billing (charges, refunds, subscriptions, cancellations), shipping (delivery, tracking, damaged items), technical (bugs, errors, login problems), account (profile and settings changes), or product_question. urgency: high if the customer is blocked, was charged incorrectly, or received a damaged item; medium if they are waiting on something; otherwise low. sentiment: positive, neutral, or negative. orderNumber: copy it exactly as written (for example ORD-10482), or null. needsHuman: true only when the customer asks for a refund, cancellation, replacement, or escalation. summary: one short sentence. Return only the JSON object, with no commentary."
   },
   "extractionTarget": {
     "name": "local-mock-text-json",
@@ -12,30 +12,74 @@
     "model": "mock-text-json",
     "provider": "openai-compatible"
   },
-  "fieldRules": [],
+  "fieldRules": [
+    {
+      "path": "orderNumber",
+      "match": "normalized"
+    },
+    {
+      "path": "summary",
+      "match": "ignore"
+    }
+  ],
   "outputMode": "prompted-json",
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Customer inquiry triage",
     "type": "object",
     "additionalProperties": false,
+    "required": [
+      "category",
+      "urgency",
+      "sentiment",
+      "orderNumber",
+      "needsHuman"
+    ],
     "properties": {
-      "customer": { "type": "string" },
-      "nickname": { "type": ["string", "null"] },
-      "opened": { "type": "string", "format": "date" },
-      "dueDate": { "type": ["string", "null"], "format": "date" },
-      "seats": { "type": "integer" },
-      "monthlyRate": { "type": "number" },
-      "balance": { "type": ["number", "null"] },
-      "active": { "type": "boolean" },
-      "offset": { "type": "number" },
-      "attempts": { "type": "integer" },
-      "note": { "type": ["string", "null"] },
-      "annualLimit": { "type": "number" },
-      "ratio": { "type": "number" },
-      "count": { "type": "integer" },
-      "unitPrice": { "type": "number" },
-      "total": { "type": "number" },
-      "comment": { "type": ["string", "null"] }
+      "category": {
+        "type": "string",
+        "enum": [
+          "billing",
+          "shipping",
+          "technical",
+          "account",
+          "product_question"
+        ],
+        "description": "What the message is mainly about. Subscriptions and cancellations are billing; damaged deliveries are shipping."
+      },
+      "urgency": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "description": "high: blocked, charged incorrectly, or received a damaged item. medium: waiting on something. low: everything else."
+      },
+      "sentiment": {
+        "type": "string",
+        "enum": [
+          "positive",
+          "neutral",
+          "negative"
+        ],
+        "description": "The customer's tone."
+      },
+      "orderNumber": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "The order number exactly as written, such as ORD-10482, or null if none is mentioned."
+      },
+      "needsHuman": {
+        "type": "boolean",
+        "description": "true only when the customer asks for a refund, cancellation, replacement, or escalation."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Optional. One short sentence describing the request. Free text, so grading ignores it."
+      }
     }
   }
 }

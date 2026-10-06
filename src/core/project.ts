@@ -50,7 +50,7 @@ function validateFieldRules(rules: unknown): asserts rules is FieldRule[] {
       !rule ||
       typeof rule.path !== "string" ||
       (rule.match &&
-        !["exact", "normalized", "number", "date"].includes(rule.match))
+        !["exact", "normalized", "number", "date", "ignore"].includes(rule.match))
     )
       throw new Error("Invalid field rule.");
     if (

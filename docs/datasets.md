@@ -16,7 +16,7 @@ Use the quick-sample import buttons in Datasets, or import one of these paths:
 | Text → JSON | `sample-data/text-json/manifest.json` | [Text config](../sample-data/text-json/config.json) |
 | Tool calling | `sample-data/tool-calling/manifest.json` | [Tool config](../sample-data/tool-calling/config.json) |
 
-These fixtures use fictional data. Their mock responses test the app's behavior; they are not model-quality benchmarks. The text/tool fixtures include `CASE_ID=...` markers for the mock's deterministic responses.
+These fixtures use fictional data. Their mock responses test the app's behavior; they are not model-quality benchmarks. The mock provider recognizes each sample case by its input text (the tool-calling fixture also carries `CASE_ID=...` markers) and returns the expected answer.
 
 ## Document images
 
@@ -60,15 +60,23 @@ Use a JSON manifest that declares the workflow:
   "taskKind": "text-json",
   "cases": [
     {
-      "caseId": "record-001",
-      "inputText": "Avery ordered 3 notebooks at $4 each.",
-      "expected": { "customer": "Avery", "quantity": 3, "total": 12 }
+      "caseId": "inquiry-001",
+      "inputText": "I was charged twice for order ORD-10482. Please refund the duplicate.",
+      "expected": {
+        "category": "billing",
+        "urgency": "high",
+        "sentiment": "negative",
+        "orderNumber": "ORD-10482",
+        "needsHuman": true
+      }
     }
   ]
 }
 ```
 
-Choose the same evaluation type in Setup. Define the output schema and instructions there, or in a run configuration file.
+Choose the same evaluation type in Setup. Every case shares one output schema, defined with the instructions in Setup or in a run configuration file. Each `expected` object holds that case's answer. Fields in the model's answer that `expected` doesn't list count as errors, so give free-text fields such as a summary an `{"path": "summary", "match": "ignore"}` field rule.
+
+The Text → JSON sample works this way: eight customer support messages, one triage schema (`category`, `urgency`, `sentiment`, `orderNumber`, `needsHuman`, and an optional `summary`), plus two rules: `orderNumber` is compared ignoring spacing and case, and `summary` is ignored.
 
 ## Tool-call expectations
 
