@@ -24,21 +24,26 @@ For the offline demo, run `npm run demo` and open [localhost:4180](http://127.0.
 
 ## Configure a run in Setup
 
-1. Select the evaluation type and an imported dataset.
-2. Assign provider/model targets to the pipeline stages.
-3. Set the instructions and output schema, or tool definitions for tool calling.
-4. Choose the run settings, save the configuration, and start the evaluation.
-5. Open **Runs** to inspect cases, outputs, logs, timing, and grading evidence. Run controls include stopping an active evaluation.
+Setup opens as a guided wizard with six steps. Use **Full form** at the top to see every setting on one page; both views share the same values.
+
+1. **Type**: choose Document → JSON, Text → JSON, or Tool calling.
+2. **Data**: pick a dataset, or add the sample or import a file without leaving Setup. Choose **Graded** or **Save outputs only**.
+3. **Model**: pick the model(s), or select **+ Add a model** to connect one inline. Document runs can skip reading images when every case already includes its text.
+4. **Instructions**: choose **Edit in the app** to write the prompts and schema (or tool definitions) in Setup, or **Use a configuration file** to read them from a `.json` file in the project. Setup previews the file's prompts, schema, and grading rules. **Use example** fills in the sample settings, and **Save as file…** writes the current settings to a new or existing file (never including API keys).
+5. **Grading**: choose how strict the checks are. Fields without a rule must match exactly; add field rules (`exact`, `normalized`, `number` with a `tolerance`, `date`, `ignore` for free text, or `"required": false`), or select **Suggest rules from schema**. Optionally pick a **judge model** and describe what it should check. Tool-calling runs choose whether call order matters. Runs that only save outputs skip grading.
+6. **Review & run**: check the summary, optionally choose or create an experiment ([about experiments](experiments.md)), open **Advanced options** if needed, then select **Run evaluation**.
+
+Open **Runs** to inspect cases, outputs, logs, timing, and grading evidence. Run controls include stopping an active evaluation.
 
 | Evaluation type | Required stages and definitions |
 | --- | --- |
-| Document → JSON | OCR target, extraction target, stage prompts, JSON Schema |
-| Text → JSON | Extraction target and instructions; JSON Schema required for schema-constrained output |
-| Tool calling | Tool-capable target, instructions, tool definitions and argument schemas |
+| Document → JSON | OCR model, extraction model, stage prompts, JSON Schema |
+| Text → JSON | Extraction model and instructions; JSON Schema required for schema-constrained output |
+| Tool calling | Tool-capable model, instructions, tool definitions and argument schemas |
 
-Use **Load sample settings** for the selected workflow's fixtures. An active configuration file owns its schema, prompts, and grading definitions; select **Use native editors** to edit those values in the app.
+**Advanced options** (open by default on the last step) hold JSON mode, temperature, max tokens, and tool choice. An active configuration file owns its schema, prompts, and grading definitions; select **Edit in the app** to copy them into the editors.
 
-Enable **inference-only** for unlabeled datasets: outputs are stored without expected-output grading. For extraction-only document evaluation, choose reference transcription as the extraction source; every case must contain one. Ordinary document runs use model OCR.
+Choose **Save outputs only** for unlabeled datasets: outputs are stored without expected-output grading. For extraction-only document evaluation, tick **My cases already include the document text**; every case must contain a reference transcription. Ordinary document runs use model OCR.
 
 ## Output and grading settings
 

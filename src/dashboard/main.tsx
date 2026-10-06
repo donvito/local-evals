@@ -11,6 +11,17 @@ import {
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import { describeRunError } from "./errors.js";
+import { HighlightedJson } from "./json-highlight.js";
+import type { SchemaCheck } from "../core/schema-check.js";
+import { CliHelp, Help } from "./help.js";
+import { PageTitle } from "./page-title.js";
+import {
+  SETUP_STEPS,
+  issuesForStep,
+  validateSetup,
+  type SetupStep,
+} from "./setup-validation.js";
+import { THEME_OPTIONS, applyTheme, readTheme, type ThemePreference } from "./theme.js";
 
 type Json = unknown;
 type TaskKind = "document-json" | "text-json" | "tool-calling";
@@ -59,6 +70,20 @@ type Run = {
   passedCount: number | null;
   inferenceOnly?: boolean;
   metrics?: Record<string, unknown>;
+  experimentId?: string | null;
+  experimentName?: string | null;
+  datasetVersion?: string;
+  datasetName?: string | null;
+  taskKind?: TaskKind;
+  targetName?: string | null;
+  modelName?: string | null;
+};
+type Experiment = {
+  experimentId: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  runCount: number;
 };
 type Target = {
   name: string;
@@ -102,7 +127,7 @@ type CaseResult = {
   ocrGrade?: Record<string, number | string | boolean>;
   timings?: Record<string, number>;
   error?: string;
-  judge?: { verdict?: string; evidence?: string };
+  judge?: { verdict?: string | boolean; evidence?: string; error?: string };
 };
 type RunDetail = Run & {
   config?: Record<string, Json>;
@@ -263,7 +288,7 @@ type ActiveExecution = {
   phase?: "starting" | "running" | "stopping" | "external";
   runId?: string;
 };
-type Tab = "overview" | "runs" | "datasets" | "targets" | "compare" | "setup";
+type Tab = "overview" | "runs" | "experiments" | "datasets" | "targets" | "compare" | "setup" | "help" | "cli";
 type CaseTab =
   | "transcription"
   | "input-output"
@@ -274,13 +299,27 @@ type CaseTab =
 const TAB_VALUES: Tab[] = [
   "overview",
   "runs",
+  "experiments",
   "datasets",
   "targets",
   "compare",
   "setup",
+  "help",
+  "cli",
 ];
+const DOC_TABS: Tab[] = ["help", "cli"];
+const NAV_GROUPS: { id: string; label?: string; tabs: Tab[] }[] = [
+  { id: "home", tabs: ["overview"] },
+  { id: "prepare", label: "Prepare", tabs: ["targets", "datasets"] },
+  { id: "evaluate", label: "Evaluate", tabs: ["setup", "runs"] },
+  { id: "analyze", label: "Analyze", tabs: ["compare", "experiments"] },
+  { id: "resources", label: "Resources", tabs: DOC_TABS },
+];
+const MOBILE_PRIMARY_TABS: Tab[] = ["overview", "datasets", "setup", "runs"];
+const tabLabel = (tab: Tab) =>
+  tab === "targets" ? "Providers" : tab === "cli" ? "CLI" : tab[0].toUpperCase() + tab.slice(1);
 const tabFromLocation = (): Tab => {
-  const value = window.location.hash.replace(/^#/, "") as Tab;
+  const value = window.location.hash.replace(/^#/, "").split("/")[0] as Tab;
   return TAB_VALUES.includes(value) ? value : "overview";
 };
 type Notice = { message: string; kind: "success" | "error" };
@@ -415,8 +454,18 @@ const modelContextLabel = (value: number | null) => {
   if (value >= 1000) return `${Math.round(value / 100) / 10}k context`;
   return `${value} context`;
 };
-const modelPriceLabel = (value: number | null) =>
-  value == null ? "Unknown" : `$${(value * 1_000_000).toFixed(4)}/1M`;
+const modelPriceLabel = (value: number | null) => {
+  if (value == null) return "price unknown";
+  if (value === 0) return "free";
+  const perMillion = value * 1_000_000;
+  const amount =
+    perMillion >= 10
+      ? perMillion.toFixed(0)
+      : perMillion >= 1
+        ? perMillion.toFixed(2).replace(/\.?0+$/, "")
+        : perMillion.toFixed(3).replace(/0+$/, "");
+  return `$${amount}/M`;
+};
 const parsedToolCalls = (item: CaseResult): Json => {
   const candidate =
     item.proposedToolCalls ??
@@ -669,19 +718,6 @@ const metricValue = (
     };
   return null;
 };
-const supportedMetrics = (metrics?: Record<string, unknown>) =>
-  Object.entries(metrics || {})
-    .map(([key, value]) => ({ key, ...metricValue(key, value) }))
-    .filter(
-      (
-        item,
-      ): item is {
-        key: string;
-        label: string;
-        display: string;
-        kind: "percent" | "count" | "ms" | "text";
-      } => Boolean(item.label),
-    );
 const numericRunMetric = (run: Run, key: string) => {
   const value = run.metrics?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -715,15 +751,6 @@ const runPassRate = (run: Run) => {
   const total = runSampleCount(run);
   return total ? runPassedCount(run) / total : undefined;
 };
-const runAverageStageTime = (run: Run) => {
-  const values = [
-    numericRunMetric(run, "meanOcrMs"),
-    numericRunMetric(run, "meanExtractionMs"),
-  ].filter((value): value is number => value !== undefined);
-  return values.length
-    ? values.reduce((sum, value) => sum + value, 0)
-    : undefined;
-};
 const failedRunStatuses = new Set([
   "failed",
   "error",
@@ -744,15 +771,6 @@ const isOverviewScoredRun = (run: Run) => {
     !failedRunStatuses.has(status || "")
   );
 };
-const isOverviewPerformanceRun = (run: Run) => {
-  const status = run.status?.toLowerCase();
-  return (
-    runAverageStageTime(run) !== undefined &&
-    status !== "running" &&
-    status !== "pending" &&
-    !failedRunStatuses.has(status || "")
-  );
-};
 const newestRuns = (runs: Run[]) =>
   runs
     .slice()
@@ -760,6 +778,73 @@ const newestRuns = (runs: Run[]) =>
       (left, right) =>
         (Date.parse(right.createdAt) || 0) - (Date.parse(left.createdAt) || 0),
     );
+const runLabel = (run: Run) =>
+  [run.datasetName || "Untitled dataset", run.modelName || run.targetName]
+    .filter(Boolean)
+    .join(" · ");
+type RunTone = "pass" | "fail" | "running" | "neutral";
+const runOutcome = (run: Run): { label: string; tone: RunTone } => {
+  const status = run.status?.toLowerCase() || "";
+  if (status === "running" || status === "pending") return { label: "Running", tone: "running" };
+  if (failedRunStatuses.has(status))
+    return { label: status[0].toUpperCase() + status.slice(1), tone: "fail" };
+  if (run.inferenceOnly) return { label: "Outputs saved", tone: "neutral" };
+  const rate = runPassRate(run);
+  if (rate === undefined) return { label: "Complete", tone: "neutral" };
+  return {
+    label: `${metric(rate)} passed`,
+    tone: rate >= 1 ? "pass" : rate === 0 ? "fail" : "neutral",
+  };
+};
+function RunStatusBadge({ run }: { run: Run }) {
+  const outcome = runOutcome(run);
+  return <span className={`status-pill ${outcome.tone}`}>{outcome.label}</span>;
+}
+function AdvancedOptions({
+  children,
+  changed = 0,
+  label = "Advanced options",
+  defaultOpen = false,
+}: {
+  children: ReactNode;
+  changed?: number;
+  label?: string;
+  defaultOpen?: boolean;
+}) {
+  return (
+    <details className="advanced-options" open={defaultOpen || undefined}>
+      <summary>
+        {label}
+        {changed > 0 && <span className="advanced-count">{changed} changed</span>}
+      </summary>
+      <div className="advanced-options-body">{children}</div>
+    </details>
+  );
+}
+const SAMPLE_DATASETS: Record<TaskKind, string> = {
+  "document-json": "sample-data/manifest.json",
+  "text-json": "sample-data/text-json/manifest.json",
+  "tool-calling": "sample-data/tool-calling/manifest.json",
+};
+const importDatasetPath = (datasetPath: string) =>
+  api<Dataset>("/api/datasets/import", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: datasetPath }),
+  });
+const schemaFieldsMissing = (schemaText: string, dataset?: Dataset) => {
+  const schema = parseEditorJson(schemaText) as { properties?: Record<string, unknown> } | undefined;
+  const properties =
+    schema && typeof schema === "object" && schema.properties && typeof schema.properties === "object"
+      ? Object.keys(schema.properties)
+      : null;
+  const expected = dataset?.cases.find(
+    (item) => item.expected && typeof item.expected === "object" && !Array.isArray(item.expected),
+  )?.expected as Record<string, unknown> | undefined;
+  return properties && expected ? Object.keys(expected).filter((key) => !properties.includes(key)) : [];
+};
+const datasetHasExpected = (dataset?: Dataset) =>
+  Boolean(dataset?.cases.length) && dataset!.cases.every((item) => item.expected !== undefined);
 const deltaLabel = (key: string, left: unknown, right: unknown) => {
   if (typeof left !== "number" || typeof right !== "number")
     return "No baseline";
@@ -774,11 +859,13 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       const preference = window.localStorage.getItem("local-evals-sidebar");
-      return preference === null || preference === "collapsed";
+      return preference === "collapsed";
     } catch {
-      return true;
+      return false;
     }
   });
+  const [theme, setTheme] = useState<ThemePreference>(readTheme);
+  useEffect(() => applyTheme(theme), [theme]);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreButton = useRef<HTMLButtonElement>(null);
   const morePanel = useRef<HTMLDivElement>(null);
@@ -795,7 +882,12 @@ function App() {
     return () => window.removeEventListener("keydown", dismiss);
   }, [moreOpen]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [selectedExperimentId, setSelectedExperimentId] = useState<string | null>(() => {
+    try { return window.localStorage.getItem("local-evals-selected-experiment"); } catch { return null; }
+  });
   const [selectedRun, setSelectedRun] = useState<RunDetail | null>(null);
+  const [comparePair, setComparePair] = useState<[string, string] | null>(null);
   const [selectedCase, setSelectedCase] = useState<CaseResult | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [targets, setTargets] = useState<Target[]>([]);
@@ -825,8 +917,20 @@ function App() {
   const fallbackEvents = useRef<RunEvent[]>([]);
   const liveEventsAvailable = useRef(false);
   useEffect(() => {
+    const openHelpLink = () => {
+      const next = tabFromLocation();
+      if (DOC_TABS.includes(next)) setTab(next);
+    };
+    window.addEventListener("hashchange", openHelpLink);
+    return () => window.removeEventListener("hashchange", openHelpLink);
+  }, []);
+  useEffect(() => {
     const nextHash = tab === "overview" ? "" : `#${tab}`;
-    if (window.location.hash !== nextHash) {
+    const currentHash = window.location.hash;
+    if (
+      currentHash !== nextHash &&
+      !(DOC_TABS.includes(tab) && currentHash.startsWith(`${nextHash}/`))
+    ) {
       window.history.replaceState(
         null,
         "",
@@ -854,6 +958,33 @@ function App() {
       setLoading(false);
     }
   }, []);
+  const loadExperiments = useCallback(async () => {
+    try {
+      const next = await api<Experiment[]>('/api/experiments');
+      setExperiments(next);
+      setSelectedExperimentId((current) => current && next.some((item) => item.experimentId === current) ? current : null);
+    } catch {
+      // Older servers may not expose experiments yet.
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      if (selectedExperimentId) window.localStorage.setItem("local-evals-selected-experiment", selectedExperimentId);
+      else window.localStorage.removeItem("local-evals-selected-experiment");
+    } catch { /* best effort */ }
+  }, [selectedExperimentId]);
+  const stopActiveRun = async () => {
+    try {
+      await api("/api/runs/stop", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      await Promise.all([loadActiveExecution(), loadRuns()]);
+    } catch (err) {
+      setNotice({ message: err instanceof Error ? err.message : "Could not stop evaluation", kind: "error" });
+    }
+  };
   const loadActiveExecution = useCallback(async () => {
     try {
       setActiveExecution(await api<ActiveExecution>("/api/runs/active"));
@@ -863,6 +994,7 @@ function App() {
   }, []);
   useEffect(() => {
     void loadRuns();
+    void loadExperiments();
     void loadActiveExecution();
     void api<Dataset[]>("/api/datasets")
       .then(setDatasets)
@@ -873,14 +1005,15 @@ function App() {
     void api<Setup>("/api/setup")
       .then(setSetup)
       .catch(() => undefined);
-  }, [loadActiveExecution, loadRuns]);
+  }, [loadActiveExecution, loadExperiments, loadRuns]);
   useEffect(() => {
     const id = window.setInterval(() => {
       void loadRuns();
+      void loadExperiments();
       void loadActiveExecution();
     }, 2500);
     return () => window.clearInterval(id);
-  }, [loadActiveExecution, loadRuns]);
+  }, [loadActiveExecution, loadExperiments, loadRuns]);
   useEffect(() => {
     const runId = selectedRun?.runId;
     if (!runId) return;
@@ -1103,15 +1236,30 @@ function App() {
     <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <header className="topbar">
         <div className="brand">
-          <div>
-            <div className="eyebrow">LOCAL-FIRST MODEL EVALUATION</div>
-            <h1>Local Evals</h1>
-          </div>
+          <span className="brand-mark" aria-hidden="true">
+            LE
+          </span>
+          <h1>Local Evals</h1>
         </div>
         <div className="top-actions">
           <span className="connection">
             <i /> Local workspace
           </span>
+          <div className="theme-toggle" role="radiogroup" aria-label="Color theme">
+            {THEME_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={theme === option.value}
+                aria-label={option.label}
+                title={option.label}
+                onClick={() => setTheme(option.value)}
+              >
+                <span aria-hidden="true">{option.icon}</span>
+              </button>
+            ))}
+          </div>
           <button
             className="icon-btn"
             aria-label="Refresh runs"
@@ -1142,39 +1290,34 @@ function App() {
               {sidebarCollapsed ? "Show navigation" : "Hide navigation"}
             </span>
           </button>
-          <div className="nav-label">Workspace</div>
-          {(
-            [
-              "overview",
-              "runs",
-              "datasets",
-              "targets",
-              "compare",
-              "setup",
-            ] as Tab[]
-          ).map((item) => (
-            <button
-              className={tab === item ? "nav-item active" : "nav-item"}
-              aria-current={tab === item ? "page" : undefined}
-              title={
-                sidebarCollapsed
-                  ? item === "targets"
-                    ? "Providers"
-                    : item[0].toUpperCase() + item.slice(1)
-                  : undefined
-              }
-              disabled={setupBusy && item !== "setup"}
-              onClick={() => changeTab(item)}
-              key={item}
+          {NAV_GROUPS.map((group) => (
+            <div
+              key={group.id}
+              className={`nav-group nav-group-${group.id}`}
+              role="group"
+              aria-labelledby={group.label ? `nav-group-${group.id}` : undefined}
+              aria-label={group.label ? undefined : "Home"}
             >
-              <span className={`nav-icon icon-${item}`} aria-hidden="true" />
-              {item === "targets"
-                ? "Providers"
-                : item[0].toUpperCase() + item.slice(1)}
-              {item === "runs" && runs.some((r) => r.status === "running") ? (
-                <b className="live-dot" />
-              ) : null}
-            </button>
+              {group.label && (
+                <div className="nav-label" id={`nav-group-${group.id}`}>
+                  {group.label}
+                </div>
+              )}
+              {group.tabs.map((item) => (
+                <button
+                  className={tab === item ? "nav-item active" : "nav-item"}
+                  aria-current={tab === item ? "page" : undefined}
+                  disabled={setupBusy && item !== "setup"}
+                  onClick={() => changeTab(item)}
+                  key={item}
+                >
+                  {tabLabel(item)}
+                  {item === "runs" && runs.some((r) => r.status === "running") ? (
+                    <b className="live-dot" />
+                  ) : null}
+                </button>
+              ))}
+            </div>
           ))}
           <div className="sidebar-footer">
             <span className="version">
@@ -1207,37 +1350,70 @@ function App() {
               </button>
             </div>
           )}
-          {activeExecution.active && (
-            <div className="alert success" role="status" aria-live="polite">
-              <strong>
-                {activeExecution.ownedByDashboard
-                  ? activeExecution.phase === "starting"
-                    ? "Evaluation is starting."
-                    : "Evaluation is running."
-                  : "A terminal-owned evaluation is running."}
-              </strong>{" "}
-              {activeExecution.ownedByDashboard
-                ? "You can stop it from Setup."
-                : "Stop it from the terminal that started it."}{" "}
-              <button
-                className="text-button"
-                disabled={setupBusy}
-                onClick={() => {
-                  if (activeExecution.runId)
-                    void openRun(activeExecution.runId);
-                  else changeTab("runs");
-                }}
-              >
-                Open Runs →
-              </button>
-            </div>
-          )}
+          {activeExecution.active && (() => {
+            const activeRun = runs.find((run) => run.runId === activeExecution.runId);
+            const total = activeRun ? runSampleCount(activeRun) : 0;
+            const done = activeRun ? runCompletedCount(activeRun) : 0;
+            const viewing = tab === "runs" && selectedRun?.runId === activeExecution.runId;
+            const title =
+              activeExecution.phase === "starting"
+                ? "Starting evaluation…"
+                : activeExecution.phase === "stopping"
+                  ? "Stopping evaluation…"
+                  : activeExecution.ownedByDashboard
+                    ? "Evaluation running"
+                    : "Evaluation running from a terminal";
+            return (
+              <div className="alert running-banner" role="status" aria-live="polite">
+                <span className="live-dot" aria-hidden="true" />
+                <span className="running-banner-copy">
+                  <strong>{title}</strong>
+                  <span>
+                    {activeRun ? runLabel(activeRun) : "Preparing cases"}
+                    {total > 0 && ` · ${done} of ${total} cases`}
+                    {!activeExecution.ownedByDashboard && " · stop it from that terminal"}
+                  </span>
+                </span>
+                {total > 0 && (
+                  <span className="running-banner-progress" aria-hidden="true">
+                    <span style={{ width: `${Math.min(100, (done / total) * 100)}%` }} />
+                  </span>
+                )}
+                <span className="running-banner-actions">
+                  {!viewing && (
+                    <button
+                      type="button"
+                      className="text-button"
+                      disabled={setupBusy}
+                      onClick={() => {
+                        if (activeExecution.runId) void openRun(activeExecution.runId);
+                        else changeTab("runs");
+                      }}
+                    >
+                      View progress
+                    </button>
+                  )}
+                  {activeExecution.canStop && (
+                    <button
+                      type="button"
+                      className="text-button destructive"
+                      disabled={activeExecution.phase === "stopping"}
+                      onClick={() => void stopActiveRun()}
+                    >
+                      Stop
+                    </button>
+                  )}
+                </span>
+              </div>
+            );
+          })()}
           {tab === "overview" && (
             <Overview
               runs={runs}
               latest={latest}
-              passRate={passRate}
               loading={loading}
+              hasTargets={targets.length > 0}
+              hasDatasets={datasets.length > 0}
               onRun={openRun}
               onTab={changeTab}
             />
@@ -1254,6 +1430,25 @@ function App() {
               onOpen={openRun}
               onCase={setSelectedCase}
               onTab={changeTab}
+            />
+          )}
+          {tab === "experiments" && (
+            <Experiments
+              experiments={experiments}
+              runs={runs}
+              selectedId={selectedExperimentId}
+              onSelect={setSelectedExperimentId}
+              onOpenRun={openRun}
+              onRefresh={async () => { await Promise.all([loadExperiments(), loadRuns()]); }}
+              onNotice={(message, kind = "success") => setNotice({ message, kind })}
+              onNewRun={(experimentId) => {
+                setSelectedExperimentId(experimentId);
+                changeTab("setup");
+              }}
+              onCompare={(left, right) => {
+                setComparePair([left, right]);
+                changeTab("compare");
+              }}
             />
           )}
           {tab === "datasets" && (
@@ -1275,11 +1470,24 @@ function App() {
             />
           )}
           {tab === "compare" && (
-            <Compare runs={runs} preferredRun={selectedRun?.runId} />
+            <Compare runs={runs} preferredRun={selectedRun?.runId} preferredPair={comparePair} />
           )}
+          {tab === "help" && <Help onTab={changeTab} />}
+          {tab === "cli" && <CliHelp onTab={changeTab} />}
           {tab === "setup" && (
             <SetupPanel
               setup={setup}
+              experiments={experiments}
+              selectedExperimentId={selectedExperimentId}
+              onSelectExperiment={setSelectedExperimentId}
+              onCreateExperiment={async (name) => {
+                const created = await api<Experiment>('/api/experiments', {
+                  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+                });
+                setExperiments((current) => [...current, created]);
+                setSelectedExperimentId(created.experimentId);
+                return created;
+              }}
               targets={targets}
               datasets={datasets}
               activeExecution={activeExecution}
@@ -1292,6 +1500,8 @@ function App() {
               }
               onOpenRun={openRun}
               onBusyChange={setSetupBusy}
+              setTargets={setTargets}
+              onRefreshDatasets={async () => setDatasets(await api<Dataset[]>("/api/datasets"))}
             />
           )}
         </main>
@@ -1299,32 +1509,28 @@ function App() {
       <nav className="mobile-nav" aria-label="Mobile workspace">
         {moreOpen && (
           <div className="mobile-more" id="mobile-more" ref={morePanel}>
-            <span className="eyebrow">Workspace</span>
-            {(
-              [
-                ["targets", "Model connections"],
-                ["compare", "Compare runs"],
-              ] as [Tab, string][]
-            ).map(([value, label]) => (
-              <button
-                key={value}
-                aria-current={tab === value ? "page" : undefined}
-                disabled={setupBusy}
-                onClick={() => changeTab(value)}
-              >
-                {label}
-              </button>
-            ))}
+            {NAV_GROUPS.map((group) => {
+              const items = group.tabs.filter((item) => !MOBILE_PRIMARY_TABS.includes(item));
+              return items.length ? (
+                <div key={group.id} className="mobile-more-group">
+                  <span className="eyebrow">{group.label}</span>
+                  {items.map((value) => (
+                    <button
+                      key={value}
+                      aria-current={tab === value ? "page" : undefined}
+                      disabled={setupBusy}
+                      onClick={() => changeTab(value)}
+                    >
+                      <span className={`nav-icon icon-${value}`} aria-hidden="true" />
+                      {tabLabel(value)}
+                    </button>
+                  ))}
+                </div>
+              ) : null;
+            })}
           </div>
         )}
-        {(
-          [
-            ["overview", "Home"],
-            ["runs", "Runs"],
-            ["datasets", "Datasets"],
-            ["setup", "New run"],
-          ] as [Tab, string][]
-        ).map(([value, label]) => (
+        {MOBILE_PRIMARY_TABS.map((value) => (
           <button
             key={value}
             aria-current={tab === value ? "page" : undefined}
@@ -1332,16 +1538,14 @@ function App() {
             onClick={() => changeTab(value)}
           >
             <span className={`nav-icon icon-${value}`} aria-hidden="true" />
-            {label}
+            {tabLabel(value)}
           </button>
         ))}
         <button
           ref={moreButton}
           aria-expanded={moreOpen}
           aria-controls="mobile-more"
-          aria-current={
-            ["targets", "compare"].includes(tab) ? "page" : undefined
-          }
+          aria-current={!MOBILE_PRIMARY_TABS.includes(tab) ? "page" : undefined}
           disabled={setupBusy}
           onClick={() => setMoreOpen(!moreOpen)}
         >
@@ -1355,28 +1559,6 @@ function App() {
   );
 }
 
-function PageTitle({
-  eyebrow,
-  title,
-  sub,
-  action,
-}: {
-  eyebrow: string;
-  title: string;
-  sub?: string;
-  action?: ReactNode;
-}) {
-  return (
-    <header className="page-title">
-      <div>
-        <div className="eyebrow">{eyebrow}</div>
-        <h2 tabIndex={-1}>{title}</h2>
-        {sub && <p>{sub}</p>}
-      </div>
-      {action}
-    </header>
-  );
-}
 function Stat({
   label,
   value,
@@ -1391,65 +1573,6 @@ function Stat({
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{note}</small>
-    </div>
-  );
-}
-function RunRow({ run, onClick }: { run: Run; onClick: () => void }) {
-  const total = run.totalCases || run.caseCount || 0;
-  return (
-    <button className="run-row" onClick={onClick}>
-      <span
-        className={`status-pill ${run.status === "running" ? "running" : run.inferenceOnly ? "neutral" : run.passedCount === total && total ? "pass" : "neutral"}`}
-      >
-        {run.status === "running"
-          ? "RUNNING"
-          : run.inferenceOnly
-            ? "INFERENCE"
-            : run.status || "COMPLETE"}
-      </span>
-      <span className="run-name">
-        {run.runId.slice(0, 12)}
-        <small>{date(run.createdAt)}</small>
-      </span>
-      <span className="run-count">
-        {run.inferenceOnly ? (
-          "outputs stored"
-        ) : (
-          <>
-            <>{run.passedCount}</>
-            <em>/{total}</em> passed
-          </>
-        )}
-      </span>
-      <span className="row-arrow">→</span>
-    </button>
-  );
-}
-function AnalyticsBar({
-  label,
-  value,
-}: {
-  label: string;
-  value?: number;
-}) {
-  const percentage =
-    value === undefined ? 0 : Math.max(0, Math.min(1, value)) * 100;
-  return (
-    <div className="analytics-bar">
-      <div className="analytics-bar-label">
-        <span>{label}</span>
-        <strong>{value === undefined ? "Unavailable" : metric(value)}</strong>
-      </div>
-      <div
-        className="analytics-bar-track"
-        role="progressbar"
-        aria-label={label}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={value === undefined ? undefined : percentage}
-      >
-        <span style={{ width: `${percentage}%` }} />
-      </div>
     </div>
   );
 }
@@ -1524,7 +1647,7 @@ function PassRateTrend({
                     rx="1"
                     role="button"
                     tabIndex={0}
-                    aria-label={`${point.run.runId.slice(0, 12)} pass rate ${metric(point.value)}`}
+                    aria-label={`${runLabel(point.run)}, ${date(point.run.createdAt)}: ${metric(point.value)} passed`}
                     onClick={() => onRun(point.run.runId)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
@@ -1534,45 +1657,11 @@ function PassRateTrend({
                     }}
                   />
                   <title>
-                    {point.run.runId.slice(0, 12)} · {metric(point.value)}
+                    {runLabel(point.run)} · {date(point.run.createdAt)} · {metric(point.value)}
                   </title>
                 </g>
               ))}
             </svg>
-          </div>
-          <div className="analytics-run-list" aria-label="Recent scored runs">
-            {runs
-              .slice()
-              .reverse()
-              .slice(0, 4)
-              .map((run) => {
-                const passRate = runPassRate(run);
-                const stageTime = runAverageStageTime(run);
-                return (
-                  <button
-                    type="button"
-                    className="analytics-run-row"
-                    key={run.runId}
-                    onClick={() => onRun(run.runId)}
-                  >
-                    <span className="analytics-run-name">
-                      <code>{run.runId.slice(0, 12)}</code>
-                      <small>{date(run.createdAt)}</small>
-                    </span>
-                    <span>
-                      <b>{passRate === undefined ? "—" : metric(passRate)}</b>
-                      <small>pass rate</small>
-                    </span>
-                    <span>
-                      <b>{stageTime === undefined ? "—" : `${Math.round(stageTime)} ms`}</b>
-                      <small>avg latency</small>
-                    </span>
-                    <span className="row-arrow" aria-hidden="true">
-                      →
-                    </span>
-                  </button>
-                );
-              })}
           </div>
         </>
       ) : (
@@ -1584,418 +1673,159 @@ function PassRateTrend({
     </>
   );
 }
-function LatencyTrend({
-  runs,
-  onRun,
-}: {
-  runs: Run[];
-  onRun: (id: string) => void;
-}) {
-  const width = 360;
-  const height = 148;
-  const left = 42;
-  const right = 12;
-  const top = 12;
-  const bottom = 26;
-  const plotWidth = width - left - right;
-  const plotHeight = height - top - bottom;
-  const values = runs.map((run) => runAverageStageTime(run) ?? 0);
-  const minimum = Math.min(...values);
-  const maximum = Math.max(...values);
-  const range = Math.max(maximum - minimum, maximum * 0.4, 1);
-  const domainMin = Math.max(0, minimum - range * 0.5);
-  const domainMax = maximum + range * 0.5;
-  const points = runs.map((run, index) => {
-    const value = runAverageStageTime(run) ?? 0;
-    return {
-      run,
-      value,
-      x:
-        runs.length === 1
-          ? left + plotWidth / 2
-          : left + (plotWidth * index) / (runs.length - 1),
-      y: top + ((domainMax - value) / (domainMax - domainMin)) * plotHeight,
-    };
-  });
-  return points.length ? (
-    <>
-      <div className="analytics-chart-wrap">
-        <svg
-          className="analytics-chart"
-          viewBox={`0 0 ${width} ${height}`}
-          role="img"
-          aria-label="Average stage latency by recent run"
-        >
-          <title>Average latency by run</title>
-          <desc>
-            Recent completed runs with timing data shown as independent bars.
-            Inference-only runs can be included.
-          </desc>
-          {[domainMax, (domainMax + domainMin) / 2, domainMin].map(
-            (value) => {
-              const y =
-                top + ((domainMax - value) / (domainMax - domainMin)) * plotHeight;
-              return (
-                <g key={value}>
-                  <line
-                    className="analytics-chart-grid"
-                    x1={left}
-                    x2={width - right}
-                    y1={y}
-                    y2={y}
-                  />
-                  <text className="analytics-chart-label" x="0" y={y + 4}>
-                    {Math.round(value)} ms
-                  </text>
-                </g>
-              );
-            },
-          )}
-          {points.map((point) => (
-            <g key={point.run.runId}>
-              <rect
-                className="analytics-chart-bar"
-                x={point.x - Math.min(16, plotWidth / Math.max(points.length * 2, 2))}
-                y={point.y}
-                width={Math.min(32, plotWidth / Math.max(points.length * 1.5, 1))}
-                height={top + plotHeight - point.y}
-                rx="1"
-                role="button"
-                tabIndex={0}
-                aria-label={`${point.run.runId.slice(0, 12)} average latency ${Math.round(point.value)} milliseconds`}
-                onClick={() => onRun(point.run.runId)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    onRun(point.run.runId);
-                  }
-                }}
-              />
-              <title>
-                {point.run.runId.slice(0, 12)} · {Math.round(point.value)} ms
-              </title>
-            </g>
-          ))}
-        </svg>
-      </div>
-      <div className="analytics-run-list" aria-label="Recent timed runs">
-        {runs
-          .slice()
-          .reverse()
-          .slice(0, 4)
-          .map((run) => {
-            const stageTime = runAverageStageTime(run);
-            return (
-              <button
-                type="button"
-                className="analytics-run-row"
-                key={run.runId}
-                onClick={() => onRun(run.runId)}
-              >
-                <span className="analytics-run-name">
-                  <code>{run.runId.slice(0, 12)}</code>
-                  <small>{date(run.createdAt)}</small>
-                </span>
-                <span>
-                  <b>{stageTime === undefined ? "—" : `${Math.round(stageTime)} ms`}</b>
-                  <small>avg latency</small>
-                </span>
-                <span>
-                  <b>{runSampleCount(run)}</b>
-                  <small>cases</small>
-                </span>
-                <span className="row-arrow" aria-hidden="true">
-                  →
-                </span>
-              </button>
-            );
-          })}
-      </div>
-    </>
-  ) : (
-    <div className="analytics-empty">
-      <strong>Timing data will appear here</strong>
-      <span>Completed runs with recorded stage timings will populate this trend.</span>
-    </div>
-  );
-}
 function Overview({
   runs,
   latest,
-  passRate,
   loading,
+  hasTargets,
+  hasDatasets,
   onRun,
   onTab,
 }: {
   runs: Run[];
   latest?: Run;
-  passRate?: number;
   loading: boolean;
+  hasTargets: boolean;
+  hasDatasets: boolean;
   onRun: (id: string) => void;
   onTab: (tab: Tab) => void;
 }) {
   const orderedRuns = newestRuns(runs);
-  const qualityRuns = orderedRuns.filter(isOverviewScoredRun);
-  const scoredCases = qualityRuns.reduce(
-    (total, run) => total + runSampleCount(run),
-    0,
-  );
-  const scoredPasses = qualityRuns.reduce(
-    (total, run) => total + runPassedCount(run),
-    0,
-  );
-  const overallPassRate = scoredCases ? scoredPasses / scoredCases : undefined;
-  const failedRuns = orderedRuns.filter((run) =>
-    failedRunStatuses.has(run.status?.toLowerCase() || ""),
-  ).length;
-  const activeRuns = orderedRuns.filter(
-    (run) => run.status === "running" || run.status === "pending",
-  ).length;
-  const trendRuns = qualityRuns.slice(0, 8).reverse();
-  const performanceRuns = orderedRuns
-    .filter(isOverviewPerformanceRun)
-    .slice(0, 8)
-    .reverse();
-  const latestPassRate = latest ? runPassRate(latest) : passRate;
-  const latestSampleCount = latest ? runSampleCount(latest) : 0;
-  const latestCompleted = latest
-    ? runCompletedCount(latest)
-    : 0;
-  const latestStageTime = latest ? runAverageStageTime(latest) : undefined;
-  const latestCost = latest
-    ? numericRunMetric(latest, "knownCostUsd")
-    : undefined;
-  const latestQuality = latest && isOverviewScoredRun(latest);
-  const latestScoredRun = qualityRuns[0];
+  const trendRuns = orderedRuns.filter(isOverviewScoredRun).slice(0, 8).reverse();
+  const latestRun = latest ?? orderedRuns[0];
+  const steps: { done: boolean; title: string; text: string; tab: Tab; action: string }[] = [
+    { done: hasTargets, title: "Connect a model", text: "A local server or a cloud provider.", tab: "targets", action: "Add model" },
+    { done: hasDatasets, title: "Add a dataset", text: "Start with a sample, or import your cases.", tab: "datasets", action: "Add dataset" },
+    { done: runs.length > 0, title: "Run an evaluation", text: "The guided setup walks you through it.", tab: "setup", action: "Set up a run" },
+  ];
+  const nextStep = steps.find((item) => !item.done);
+  const outcome = latestRun ? runOutcome(latestRun) : undefined;
+  const latestRate = latestRun ? runPassRate(latestRun) : undefined;
   return (
     <>
       <PageTitle
-        eyebrow="OPERATIONS"
-        title="Evaluation overview"
-        sub="Track quality across document, text, and tool-calling evaluations."
+        eyebrow="OVERVIEW"
+        title="Overview"
+        sub="Your latest results at a glance."
         action={
           <button className="button primary" onClick={() => onTab("setup")}>
-            Set up a run <span>→</span>
+            New evaluation <span aria-hidden="true">→</span>
           </button>
         }
       />
-      <section className="stats">
-        <Stat
-          label="Latest pass rate"
-          value={
-            latest ? metric(latestQuality ? latestPassRate : undefined) : "—"
-          }
-          note={
-            latest
-              ? latest.inferenceOnly
-                ? "Inference-only; outputs stored, not scored"
-                : latestQuality
-                  ? `${runPassedCount(latest)} of ${latestSampleCount} cases`
-                  : "Quality score unavailable for this run"
-              : "No runs yet"
-          }
-        />
-        <Stat
-          label="Overall pass rate"
-          value={metric(overallPassRate)}
-          note={
-            qualityRuns.length
-              ? `${scoredCases} scored cases across ${qualityRuns.length} completed runs`
-              : "Awaiting a completed scored run"
-          }
-        />
-        <Stat
-          label="Cases evaluated"
-          value={String(
-            runs.reduce((total, run) => total + runCompletedCount(run), 0),
+      {loading ? (
+        <Loading />
+      ) : (
+        <>
+          {nextStep && (
+            <section className="panel getting-started" aria-labelledby="getting-started-title">
+              <div className="panel-head">
+                <div>
+                  <h3 id="getting-started-title">Get started</h3>
+                  <p>Three steps to your first result.</p>
+                </div>
+              </div>
+              <ol className="checklist">
+                {steps.map((item) => (
+                  <li key={item.title} className={item.done ? "done" : item === nextStep ? "current" : undefined}>
+                    <span className="checklist-mark" aria-hidden="true">
+                      {item.done ? "✓" : steps.indexOf(item) + 1}
+                    </span>
+                    <span className="checklist-copy">
+                      <strong>{item.title}</strong>
+                      <span>{item.done ? "Done" : item.text}</span>
+                    </span>
+                    {!item.done && (
+                      <button
+                        type="button"
+                        className={item === nextStep ? "button primary" : "button secondary"}
+                        onClick={() => onTab(item.tab)}
+                      >
+                        {item.action}
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </section>
           )}
-          note={`${runs.length} recorded run${runs.length === 1 ? "" : "s"}`}
-        />
-        <Stat
-          label="Active runs"
-          value={String(activeRuns)}
-          note={
-            failedRuns
-              ? `${failedRuns} failed run${failedRuns === 1 ? "" : "s"}`
-              : "Dashboard or terminal"
-          }
-        />
-      </section>
-      {latest?.metrics && (
-        <section className="metric-strip">
-          {supportedMetrics(latest.metrics).map((item) => (
-            <span key={item.key}>
-              <b>{item.label}</b>
-              <strong>{item.display}</strong>
-            </span>
-          ))}
-        </section>
-      )}
-      <section className="overview-analytics">
-        <section className="panel analytics-panel analytics-trend-panel">
-          <div className="panel-head">
-            <div>
-              <h3>{trendRuns.length ? "Pass rate by run" : "Average latency by run"}</h3>
-              <p>
-                {trendRuns.length
-                  ? "Recent completed scored runs · click a run to inspect its cases"
-                  : "Completed runs with timing data · inference-only runs can be included"}
-              </p>
-            </div>
-            <span className="analytics-scope">
-              {trendRuns.length ? `${qualityRuns.length} scored` : `${performanceRuns.length} timed`}
-            </span>
-          </div>
-          {trendRuns.length ? (
-            <PassRateTrend runs={trendRuns} onRun={onRun} />
-          ) : (
-            <LatencyTrend runs={performanceRuns} onRun={onRun} />
+          {latestRun && outcome && (
+            <section className="overview-grid">
+              <article className="panel latest-run" aria-labelledby="latest-run-title">
+                <span className="eyebrow">LATEST RUN</span>
+                <h3 id="latest-run-title">{runLabel(latestRun)}</h3>
+                <p className="latest-run-meta">
+                  {TASK_KIND_LABELS[asTaskKind(latestRun.taskKind)]} · {date(latestRun.createdAt)}
+                  {latestRun.experimentName ? ` · ${latestRun.experimentName}` : ""}
+                </p>
+                <div className="latest-run-score">
+                  <strong className={`tone-${outcome.tone}`}>
+                    {latestRun.inferenceOnly || latestRate === undefined ? "—" : metric(latestRate)}
+                  </strong>
+                  <span>
+                    {latestRun.inferenceOnly
+                      ? `${runCompletedCount(latestRun)} outputs saved, not scored`
+                      : latestRate === undefined
+                        ? outcome.label
+                        : `${runPassedCount(latestRun)} of ${runSampleCount(latestRun)} cases passed`}
+                  </span>
+                </div>
+                <div className="latest-run-actions">
+                  <RunStatusBadge run={latestRun} />
+                  <button type="button" className="button secondary" onClick={() => onRun(latestRun.runId)}>
+                    Open run
+                  </button>
+                </div>
+              </article>
+              <section className="panel trend-panel">
+                <div className="panel-head">
+                  <div>
+                    <h3>Pass rate by run</h3>
+                    <p>Recent graded runs. Select a bar to open it.</p>
+                  </div>
+                </div>
+                {trendRuns.length ? (
+                  <PassRateTrend runs={trendRuns} onRun={onRun} />
+                ) : (
+                  <div className="analytics-empty analytics-empty-compact">
+                    <strong>No graded runs yet</strong>
+                    <span>Runs with expected answers will appear here.</span>
+                  </div>
+                )}
+              </section>
+            </section>
           )}
-        </section>
-        <section className="panel analytics-panel analytics-breakdown-panel">
-          <div className="panel-head">
-            <div>
-              <h3>Latest quality signals</h3>
-              <p>Checks available from the latest completed scored run</p>
-            </div>
-          </div>
-          {latestScoredRun ? (
-            <div className="analytics-bars">
-              <AnalyticsBar label="Pass rate" value={runPassRate(latestScoredRun)} />
-              <AnalyticsBar
-                label="JSON parse success"
-                value={numericRunMetric(latestScoredRun, "parseRate")}
-              />
-              <AnalyticsBar
-                label="Schema compliance"
-                value={numericRunMetric(latestScoredRun, "schemaRate")}
-              />
-              <AnalyticsBar
-                label="Field accuracy"
-                value={numericRunMetric(latestScoredRun, "fieldAccuracy")}
-              />
-            </div>
-          ) : (
-            <div className="analytics-empty analytics-empty-compact">
-              <strong>No quality score available yet</strong>
-              <span>
-                Complete a scored run to see pass, parse, schema, and field
-                accuracy here.
-              </span>
-            </div>
-          )}
-          {latest && (
-            <button
-              type="button"
-              className="text-button analytics-open-button"
-              onClick={() => onRun((latestScoredRun || latest).runId)}
-            >
-              Open latest run details →
-            </button>
-          )}
-        </section>
-      </section>
-      {latest && (
-        <section className="panel analytics-detail-panel">
-          <div className="panel-head">
-            <div>
-              <h3>Latest run detail</h3>
-              <p>
-                <code>{latest.runId.slice(0, 12)}</code> ·{" "}
-                {date(latest.createdAt)}
-              </p>
-            </div>
-            <span className="analytics-status">
-              {latest.status || "Complete"}
-              {latest.inferenceOnly ? " · Inference only" : ""}
-            </span>
-          </div>
-          <div className="analytics-detail-grid">
-            <div>
-              <span>Cases complete</span>
-              <strong>
-                {latestCompleted}/{latestSampleCount || "—"}
-              </strong>
-              <small>Outputs recorded for this run</small>
-            </div>
-            <div>
-              <span>Pass rate</span>
-              <strong>
-                {latestQuality ? metric(latestPassRate) : "Unavailable"}
-              </strong>
-              <small>
-                {latest.inferenceOnly
-                  ? "Inference-only run"
-                  : "Requires scored cases"}
-              </small>
-            </div>
-            <div>
-              <span>Average stage time</span>
-              <strong>
-                {latestStageTime === undefined
-                  ? "Unavailable"
-                  : `${Math.round(latestStageTime)} ms`}
-              </strong>
-              <small>OCR plus extraction mean</small>
-            </div>
-            <div>
-              <span>Known cost</span>
-              <strong>
-                {latestCost === undefined
-                  ? "Not reported"
-                  : `$${latestCost.toFixed(4)}`}
-              </strong>
-              <small>Provider usage when available</small>
-            </div>
-          </div>
-        </section>
-      )}
-      <section className="panel recent">
-        <div className="panel-head">
-          <div>
-            <h3>Recent runs</h3>
-            <p>Your latest evaluation snapshots</p>
-          </div>
-          <button className="text-button" onClick={() => onTab("runs")}>
-            View all runs →
-          </button>
-        </div>
-        {loading ? (
-          <Loading />
-        ) : runs.length ? (
-          runs
-            .slice(0, 4)
-            .map((r) => (
-              <RunRow key={r.runId} run={r} onClick={() => onRun(r.runId)} />
-            ))
-        ) : (
-          <Empty
-            icon="◎"
-            title="No evaluations yet"
-            text="Follow the three steps below to make your first evaluation."
-            action={
-              <div className="onboarding-checklist">
-                <button
-                  className="text-button"
-                  onClick={() => onTab("targets")}
-                >
-                  <strong>1. Configure and test a target</strong>{" "}
-                  <span>Targets →</span>
-                </button>
-                <button
-                  className="text-button"
-                  onClick={() => onTab("datasets")}
-                >
-                  <strong>2. Import a dataset</strong> <span>Datasets →</span>
-                </button>
-                <button className="text-button" onClick={() => onTab("setup")}>
-                  <strong>3. Configure and run</strong> <span>Setup →</span>
+          {runs.length > 0 && (
+            <section className="panel recent">
+              <div className="panel-head">
+                <div>
+                  <h3>Recent runs</h3>
+                </div>
+                <button className="text-button" onClick={() => onTab("runs")}>
+                  View all runs →
                 </button>
               </div>
-            }
-          />
-        )}
-      </section>
+              <div className="recent-runs">
+                {orderedRuns.slice(0, 5).map((run) => (
+                  <button key={run.runId} type="button" className="recent-run" onClick={() => onRun(run.runId)}>
+                    <span>
+                      <strong>{runLabel(run)}</strong>
+                      <small>
+                        {date(run.createdAt)}
+                        {run.experimentName ? ` · ${run.experimentName}` : ""}
+                      </small>
+                    </span>
+                    <RunStatusBadge run={run} />
+                    <span className="row-arrow" aria-hidden="true">
+                      →
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+        </>
+      )}
     </>
   );
 }
@@ -2030,11 +1860,11 @@ function Runs({
             <span className="eyebrow">RUNS</span>
             <h2 tabIndex={-1}>{runs.length}</h2>
             <span className="run-list-count">
-              evaluation snapshot{runs.length === 1 ? "" : "s"}
+              run{runs.length === 1 ? "" : "s"}
             </span>
           </div>
           <button className="button secondary" onClick={() => onTab("setup")}>
-            Setup <span aria-hidden="true">→</span>
+            New run
           </button>
         </header>
         <div className="run-list-body">
@@ -2053,8 +1883,7 @@ function Runs({
                   <option value="">Select a run</option>
                   {runs.map((r) => (
                     <option key={r.runId} value={r.runId}>
-                      {r.runId.slice(0, 12)} · {date(r.createdAt)} ·{" "}
-                      {r.status || "Complete"}
+                      {runLabel(r)} · {date(r.createdAt)} · {runOutcome(r).label}
                     </option>
                   ))}
                 </select>
@@ -2073,33 +1902,14 @@ function Runs({
                     aria-pressed={selected?.runId === r.runId}
                   >
                     <span className="run-row-main">
-                      <code className="run-name" title={r.runId}>
-                        {r.runId.slice(0, 12)}
-                      </code>
+                      <strong className="run-name" title={`Run ${r.runId}`}>
+                        {runLabel(r)}
+                      </strong>
+                      {r.experimentName && <span className="run-row-experiment">{r.experimentName}</span>}
                       <time dateTime={r.createdAt}>{date(r.createdAt)}</time>
                     </span>
-                    <span
-                      className={`run-row-status ${
-                        r.status === "failed" || r.status === "cancelled"
-                          ? "fail"
-                          : r.status === "running"
-                            ? "running"
-                            : r.inferenceOnly
-                              ? "neutral"
-                              : r.passedCount ===
-                                    (r.totalCases || r.caseCount || 0) &&
-                                  (r.totalCases || r.caseCount || 0)
-                                ? "pass"
-                                : "neutral"
-                      }`}
-                    >
-                      {r.status === "failed" || r.status === "cancelled"
-                        ? r.status
-                        : r.status === "running"
-                          ? "RUNNING"
-                          : r.inferenceOnly
-                            ? "INFERENCE"
-                            : r.status || "COMPLETE"}
+                    <span className={`run-row-status ${runOutcome(r).tone}`}>
+                      {runOutcome(r).label}
                     </span>
                     <span className="run-count" title="Passed cases">
                       {r.inferenceOnly
@@ -2117,7 +1927,7 @@ function Runs({
             <Empty
               icon="◎"
               title="No runs"
-              text="Open Run setup to start your first evaluation."
+              text="Open Setup to start your first evaluation."
             />
           )}
         </div>
@@ -2440,11 +2250,13 @@ function Inspector({
               <details className="run-details empty-run-metadata">
                 <summary>Metadata · snapshot & attempts</summary>
                 <pre tabIndex={0} aria-label="Run snapshot and attempts">
-                  {pretty({
-                    snapshot: run.snapshot,
-                    attempts: run.attempts,
-                    config: run.config,
-                  })}
+                  <HighlightedJson
+                    text={pretty({
+                      snapshot: run.snapshot,
+                      attempts: run.attempts,
+                      config: run.config,
+                    })}
+                  />
                 </pre>
               </details>
             </div>
@@ -2572,7 +2384,7 @@ function FailureChip({
           <details>
             <summary>Technical details</summary>
             <pre tabIndex={0} aria-label={`${context} error details`}>
-              {error}
+              <HighlightedJson text={error} />
             </pre>
           </details>
         </div>
@@ -2807,7 +2619,13 @@ function CaseView({
   const attemptCount = storedAttempts.length || eventAttempts.size;
   const judgeSummary = isToolWorkflow
     ? "N/A"
-    : item.judge?.verdict || "Not configured";
+    : !item.judge
+      ? "Not used"
+      : item.judge.verdict === "ungraded"
+        ? "Couldn't grade"
+        : item.judge.verdict === true || item.judge.verdict === "pass"
+          ? "Pass"
+          : "Fail";
   const expectedLabel = isToolWorkflow
     ? "Expected tool calls"
     : "Expected JSON";
@@ -2952,13 +2770,31 @@ function CaseView({
             </div>
             {!isToolWorkflow &&
               (item.judge ? (
-                <div className="judge">
-                  <span className="eyebrow">SEMANTIC JUDGE</span>
-                  <strong>{item.judge.verdict || "Recorded"}</strong>
-                  <p>{item.judge.evidence || "No evidence supplied."}</p>
+                <div
+                  className={`judge ${
+                    item.judge.verdict === "ungraded"
+                      ? "judge-ungraded"
+                      : item.judge.verdict === true || item.judge.verdict === "pass"
+                        ? "judge-pass"
+                        : "judge-fail"
+                  }`}
+                >
+                  <span className="eyebrow">JUDGE MODEL</span>
+                  <strong>
+                    {item.judge.verdict === "ungraded"
+                      ? "Couldn't grade this case"
+                      : item.judge.verdict === true || item.judge.verdict === "pass"
+                        ? "Pass"
+                        : "Fail"}
+                  </strong>
+                  <p>
+                    {item.judge.verdict === "ungraded"
+                      ? item.judge.error || "The judge model didn't return a usable verdict."
+                      : item.judge.evidence || "No explanation given."}
+                  </p>
                 </div>
               ) : (
-                <p className="muted">No semantic judge configured.</p>
+                <p className="muted">No judge model was used for this run.</p>
               ))}
           </div>
         </div>
@@ -3070,13 +2906,13 @@ function CodeCard({
     <div className="code-card">
       <h4>{title}</h4>
       <pre tabIndex={0} aria-label={title}>
-        {pretty(value)}
+        <HighlightedJson text={pretty(value)} />
       </pre>
       {details !== undefined && (
         <details className="code-card-details">
           <summary>Raw provider envelope</summary>
           <pre tabIndex={0} aria-label="Raw provider envelope">
-            {pretty(details)}
+            <HighlightedJson text={pretty(details)} />
           </pre>
         </details>
       )}
@@ -3116,6 +2952,7 @@ function Datasets({
   const [message, setMessage] = useState("");
   const [messageKind, setMessageKind] = useState<Notice["kind"]>("success");
   const [createOpen, setCreateOpen] = useState(false);
+  const [addMode, setAddMode] = useState<"sample" | "import" | "generate">("sample");
   const [jobs, setJobs] = useState<DatasetJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
   const [jobsError, setJobsError] = useState("");
@@ -3616,14 +3453,11 @@ function Datasets({
     setImportBusy(true);
     setMessage("");
     try {
-      const imported = await api<Dataset>("/api/datasets/import", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ path: datasetPath }),
-      });
+      const imported = await importDatasetPath(datasetPath);
       await onRefresh();
       setSelectedVersion(imported.version);
       setPath("");
+      setCreateOpen(false);
       setMessageKind("success");
       setMessage(`${label} imported.`);
     } catch (err) {
@@ -3696,198 +3530,186 @@ function Datasets({
       setGenerationSubmitting(false);
     }
   };
-  const sampleDatasets: { taskKind: TaskKind; path: string }[] = [
-    { taskKind: "document-json", path: "sample-data/manifest.json" },
-    { taskKind: "text-json", path: "sample-data/text-json/manifest.json" },
-    {
-      taskKind: "tool-calling",
-      path: "sample-data/tool-calling/manifest.json",
-    },
-  ];
+  const sampleDatasets = (Object.keys(SAMPLE_DATASETS) as TaskKind[]).map((taskKind) => ({
+    taskKind,
+    path: SAMPLE_DATASETS[taskKind],
+  }));
+  const addPanelOpen = createOpen || (!datasets.length && !jobs.length && !jobsLoading);
   return (
     <>
-      <PageTitle eyebrow="DATASETS" title="Datasets" />
-      <section className="panel dataset-panel">
-        <div
-          className="dataset-management-toolbar"
-          aria-label="Dataset management"
-        >
-          <form
-            className="inline-form dataset-import-form"
-            onSubmit={importDataset}
-            aria-busy={importBusy}
-          >
-            <label
-              className="dataset-toolbar-label"
-              htmlFor="dataset-import-path"
+      <PageTitle
+        eyebrow="PREPARE"
+        title="Datasets"
+        sub="The examples your model answers, with optional expected answers."
+        action={
+          addPanelOpen ? undefined : (
+            <button
+              type="button"
+              className="button primary"
+              onClick={() => setCreateOpen(true)}
+              aria-controls="dataset-create-panel"
             >
-              Import JSONL
-            </label>
-            <div className="import-controls">
-              <input
-                id="dataset-import-path"
-                required
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-                placeholder="manifests/invoices.jsonl"
-                aria-describedby="dataset-path-help"
-              />
-              <button className="button secondary" disabled={importBusy}>
-                {importBusy ? "Importing…" : "Import"}
-              </button>
+              Add dataset
+            </button>
+          )
+        }
+      />
+      <section className="panel dataset-panel">
+        {addPanelOpen ? (
+          <div className="add-dataset" id="dataset-create-panel">
+            <div className="add-dataset-head">
+              <h3>Add a dataset</h3>
+              {(datasets.length > 0 || jobs.length > 0) && (
+                <button type="button" className="text-button" onClick={() => setCreateOpen(false)}>
+                  Close
+                </button>
+              )}
             </div>
-            <small id="dataset-path-help" className="sr-only">
-              Use a path relative to the project root, for example{" "}
-              <code>datasets/receipts.jsonl</code>.
-            </small>
-          </form>
-          <button
-            type="button"
-            className="button primary dataset-create-toggle"
-            onClick={() => setCreateOpen((value) => !value)}
-            aria-expanded={createOpen}
-            aria-controls="dataset-create-panel"
-          >
-            {createOpen ? "Close creator" : "Create new dataset"}
-          </button>
-          <div className="sample-imports">
-            <span className="dataset-toolbar-label">Quick samples</span>
-            <div className="sample-import-actions">
-              {sampleDatasets.map((sample) => (
+            <div className="add-dataset-modes" role="tablist" aria-label="How to add a dataset">
+              {(
+                [
+                  ["sample", "⚡", "Quick sample", "One click. Best for learning."],
+                  ["import", "⇪", "Import a file", "A JSONL or JSON manifest."],
+                  ["generate", "✦", "Generate", "A model drafts the cases."],
+                ] as const
+              ).map(([mode, icon, title, text]) => (
                 <button
-                  key={sample.taskKind}
+                  key={mode}
                   type="button"
-                  className="button mini"
-                  disabled={importBusy}
-                  onClick={() =>
-                    void importPath(
-                      sample.path,
-                      TASK_KIND_LABELS[sample.taskKind],
-                    )
-                  }
+                  role="tab"
+                  aria-selected={addMode === mode}
+                  className={`add-dataset-mode${addMode === mode ? " selected" : ""}`}
+                  onClick={() => setAddMode(mode)}
                 >
-                  Import {TASK_KIND_LABELS[sample.taskKind]}
+                  <span className="add-dataset-icon" aria-hidden="true">{icon}</span>
+                  <strong>{title}</strong>
+                  <span>{text}</span>
                 </button>
               ))}
             </div>
-          </div>
-        </div>
-        {createOpen && (
-          <form
-            id="dataset-create-panel"
-            className="dataset-create-panel"
-            onSubmit={generateDataset}
-            aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
-          >
-            <div className="dataset-create-copy">
-              <span className="eyebrow">PROVIDER-POWERED</span>
-              <h3>Create a synthetic dataset</h3>
-              <p>
-                Generate labeled Text → JSON or Tool calling cases with a
-                configured provider and model. Credentials stay in the local
-                encrypted vault.
-              </p>
-              <small>
-                Image documents still come from imported files, so the creator
-                does not invent image assets.
-              </small>
-            </div>
-            <div className="dataset-create-fields">
-              <label>
-                Provider &amp; model
-                <select
-                  required
-                  value={generateTarget}
-                  onChange={(event) => setGenerateTarget(event.target.value)}
-                >
-                  <option value="" disabled>
-                    Choose a configured provider
-                  </option>
-                  {targets.map((target) => (
-                    <option key={target.name} value={target.name}>
-                      {target.name} · {providerLabel(target)} · {target.model}
-                    </option>
-                  ))}
-                </select>
-                {!targets.length && (
+            {addMode === "sample" && (
+              <div className="add-dataset-body sample-imports">
+                {sampleDatasets.map((sample) => (
+                  <button
+                    key={sample.taskKind}
+                    type="button"
+                    className="button secondary"
+                    disabled={importBusy}
+                    onClick={() => void importPath(sample.path, TASK_KIND_LABELS[sample.taskKind])}
+                  >
+                    {TASK_KIND_LABELS[sample.taskKind]} sample
+                  </button>
+                ))}
+              </div>
+            )}
+            {addMode === "import" && (
+              <form className="add-dataset-body" onSubmit={importDataset} aria-busy={importBusy}>
+                <label htmlFor="dataset-import-path">
+                  File path
+                  <div className="inline-form">
+                    <input
+                      id="dataset-import-path"
+                      required
+                      value={path}
+                      onChange={(e) => setPath(e.target.value)}
+                      placeholder="datasets/receipts.jsonl"
+                    />
+                    <button className="button primary" disabled={importBusy}>
+                      {importBusy ? "Importing…" : "Import"}
+                    </button>
+                  </div>
                   <small>
-                    Add a provider and model in Providers &amp; models first.
+                    Relative to the project folder. See Help → Use your own data for the file format.
                   </small>
-                )}
-              </label>
-              <label>
-                Dataset type
-                <select
-                  value={generateTaskKind}
-                  onChange={(event) =>
-                    setGenerateTaskKind(
-                      event.target.value as "text-json" | "tool-calling",
-                    )
-                  }
-                >
-                  <option value="text-json">Text → JSON</option>
-                  <option value="tool-calling">Tool calling</option>
-                </select>
-              </label>
-              <label>
-                Dataset name <span className="optional">optional</span>
-                <input
-                  value={generateName}
-                  onChange={(event) => setGenerateName(event.target.value)}
-                  placeholder="Support intents — generated"
-                />
-              </label>
-              <label>
-                Cases
-                <input
-                  type="number"
-                  min="1"
-                  max="50"
-                  required
-                  value={generateCount}
-                  onChange={(event) => setGenerateCount(event.target.value)}
-                />
-              </label>
-              <label>
-                Generation timeout (minutes)
-                <input
-                  type="number"
-                  min="0.5"
-                  max="60"
-                  step="0.5"
-                  required
-                  value={generateTimeoutMinutes}
-                  onChange={(event) =>
-                    setGenerateTimeoutMinutes(event.target.value)
-                  }
-                />
-                <small>Starts when generation begins, not while queued waiting.</small>
-              </label>
-              <label className="dataset-create-brief">
-                What should the cases cover?
-                <textarea
-                  value={generateBrief}
-                  onChange={(event) => setGenerateBrief(event.target.value)}
-                  placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
-                  rows={3}
-                />
-              </label>
-              <button
-                className="button primary"
-                type="submit"
-                disabled={
-                  generationSubmitting || !targets.length
-                }
+                </label>
+              </form>
+            )}
+            {addMode === "generate" && (
+              <form
+                className="add-dataset-body dataset-create-fields"
+                onSubmit={generateDataset}
+                aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
               >
-                {generationSubmitting
-                  ? "Starting…"
-                  : activeGenerationJob || queuedGenerationCount
-                    ? "Add to queue"
-                    : "Generate dataset"}
-              </button>
-            </div>
-          </form>
-        )}
+                <div className="field">
+                  <span className="field-label" id="generate-model-label">Model</span>
+                  <Dropdown
+                    labelledBy="generate-model-label"
+                    value={generateTarget}
+                    onChange={setGenerateTarget}
+                    options={targetOptions(targets).slice(1)}
+                    placeholder="Choose a model"
+                  />
+                  {!targets.length && <small>Add a model in Providers first.</small>}
+                </div>
+                <div className="field">
+                  <span className="field-label" id="generate-type-label">Type</span>
+                  <Dropdown
+                    labelledBy="generate-type-label"
+                    value={generateTaskKind}
+                    onChange={(kind) => setGenerateTaskKind(kind as "text-json" | "tool-calling")}
+                    options={[
+                      { value: "text-json", label: "Text → JSON", detail: "Inputs with expected JSON fields" },
+                      { value: "tool-calling", label: "Tool calling", detail: "Requests with expected tool calls" },
+                    ]}
+                  />
+                </div>
+                <label className="dataset-create-brief">
+                  What should the cases cover?
+                  <textarea
+                    value={generateBrief}
+                    onChange={(event) => setGenerateBrief(event.target.value)}
+                    placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
+                    rows={3}
+                  />
+                </label>
+                <label>
+                  Number of cases
+                  <input
+                    type="number"
+                    min="1"
+                    max="50"
+                    required
+                    value={generateCount}
+                    onChange={(event) => setGenerateCount(event.target.value)}
+                  />
+                </label>
+                <AdvancedOptions>
+                  <label>
+                    <span>
+                      Dataset name <span className="optional">optional</span>
+                    </span>
+                    <input
+                      value={generateName}
+                      onChange={(event) => setGenerateName(event.target.value)}
+                      placeholder="Support intents — generated"
+                    />
+                  </label>
+                  <label>
+                    Time limit (minutes)
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="60"
+                      step="0.5"
+                      required
+                      value={generateTimeoutMinutes}
+                      onChange={(event) => setGenerateTimeoutMinutes(event.target.value)}
+                    />
+                    <small>Counts from when generation starts, not while waiting in the queue.</small>
+                  </label>
+                </AdvancedOptions>
+                <p className="setup-hint">Images can't be generated. Import document datasets from files.</p>
+                <button className="button primary" type="submit" disabled={generationSubmitting || !targets.length}>
+                  {generationSubmitting
+                    ? "Starting…"
+                    : activeGenerationJob || queuedGenerationCount
+                      ? "Add to queue"
+                      : "Generate dataset"}
+                </button>
+              </form>
+            )}
+          </div>
+        ) : null}
         {message && (
           <div
             className={`import-message ${messageKind}`}
@@ -3958,16 +3780,9 @@ function Datasets({
                         <span className="dataset-choice-copy">
                           <strong title={d.name || "Untitled dataset"}>{d.name || "Untitled dataset"}</strong>
                           <span>
-                            {TASK_KIND_LABELS[datasetTaskKind(d)]} ·{" "}
-                            {d.cases.length}{" "}
+                            {TASK_KIND_LABELS[datasetTaskKind(d)]} · {d.cases.length}{" "}
                             {d.cases.length === 1 ? "case" : "cases"}
                           </span>
-                        </span>
-                        <span
-                          className="dataset-choice-arrow"
-                          aria-hidden="true"
-                        >
-                          →
                         </span>
                       </button>
                     );
@@ -4168,6 +3983,16 @@ function Datasets({
                   <DatasetViewer
                     dataset={selectedDataset}
                     onTitleDoubleClick={beginRename}
+                    actions={
+                      <ActionsMenu
+                        label={`Actions for ${selectedDataset.name || "dataset"}`}
+                        items={[
+                          { label: "Rename", onSelect: () => beginRename(selectedDataset) },
+                          { label: "Duplicate", disabled: Boolean(datasetMutation), onSelect: () => void duplicateDataset(selectedDataset) },
+                          { label: "Delete", destructive: true, disabled: Boolean(datasetMutation), onSelect: () => void deleteDataset(selectedDataset) },
+                        ]}
+                      />
+                    }
                     titleEditor={renameOpen ? (
                       <>
                       <h3
@@ -4214,13 +4039,7 @@ function Datasets({
               </section>
             </div>
           </div>
-        ) : (
-          <Empty
-            icon="▦"
-            title="No datasets imported"
-            text="Import a JSONL manifest with a project-relative path."
-          />
-        )}
+        ) : null}
       </section>
     </>
   );
@@ -4268,7 +4087,7 @@ const providerLabel = (target: Target) =>
         ? "OpenAI"
         : "OpenAI-compatible";
 
-function DatasetViewer({ dataset, onTitleDoubleClick, titleEditor }: { dataset: Dataset; onTitleDoubleClick?: () => void; titleEditor?: ReactNode }) {
+function DatasetViewer({ dataset, onTitleDoubleClick, titleEditor, actions }: { dataset: Dataset; onTitleDoubleClick?: () => void; titleEditor?: ReactNode; actions?: ReactNode }) {
   const taskKind = datasetTaskKind(dataset);
   const [query, setQuery] = useState("");
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(
@@ -4370,6 +4189,7 @@ function DatasetViewer({ dataset, onTitleDoubleClick, titleEditor }: { dataset: 
           onMaximize={() => setMaximized(true)}
           onRaw={() => setRawOpen(true)}
           maximizeButtonRef={maximizeButton}
+          actions={actions}
         />
         <DatasetViewerSurface
           dataset={dataset}
@@ -4470,7 +4290,7 @@ function DatasetViewer({ dataset, onTitleDoubleClick, titleEditor }: { dataset: 
             tabIndex={0}
             aria-label="Raw dataset JSONL"
           >
-            {rawBusy ? "Loading JSONL…" : rawText}
+            {rawBusy ? "Loading JSONL…" : <HighlightedJson text={rawText} />}
           </pre>
         </div>
       </dialog>
@@ -4489,7 +4309,9 @@ function DatasetHeader({
   onRaw,
   onClose,
   maximizeButtonRef,
+  actions,
 }: {
+  actions?: ReactNode;
   dataset: Dataset;
   onTitleDoubleClick?: () => void;
   titleEditor?: ReactNode;
@@ -4523,7 +4345,7 @@ function DatasetHeader({
           </div>
           <div className="dataset-meta">
             <span className="data-version" title={dataset.version}>
-              Version {dataset.version}
+              Version {dataset.version.slice(0, 8)}
             </span>
           </div>
         </div>
@@ -4571,6 +4393,7 @@ function DatasetHeader({
             Close
           </button>
         )}
+        {actions}
       </div>
     </div>
   );
@@ -4851,7 +4674,7 @@ function DatasetTableValue({
       className={`dataset-table-value ${code ? "dataset-table-value-code" : ""}`}
       title={text}
     >
-      {code ? <code>{text}</code> : text}
+      {code ? <HighlightedJson text={text} /> : text}
     </span>
   );
 }
@@ -4966,7 +4789,11 @@ function DatasetDetailBlock({
     >
       <h5>{title}</h5>
       <pre tabIndex={0} aria-label={title}>
-        <code>{datasetDisplayValue(value, empty || "Not supplied")}</code>
+        {code ? (
+          <HighlightedJson text={datasetDisplayValue(value, empty || "Not supplied")} />
+        ) : (
+          <code>{datasetDisplayValue(value, empty || "Not supplied")}</code>
+        )}
       </pre>
     </section>
   );
@@ -4990,7 +4817,7 @@ function ModelPicker({
   const [catalogError, setCatalogError] = useState("");
   const [catalogAttempt, setCatalogAttempt] = useState(0);
   const [query, setQuery] = useState("");
-  const [minimumContext, setMinimumContext] = useState("");
+  const [browsing, setBrowsing] = useState(!value);
   const [filters, setFilters] = useState({
     vision: false,
     structured: false,
@@ -5020,24 +4847,17 @@ function ModelPicker({
       cancelled = true;
     };
   }, [catalogAttempt, endpoint, providerName]);
-  const minimumContextValue = Number(minimumContext);
+  const search = query.trim().toLowerCase();
   const filteredModels = (catalog?.models || [])
     .filter((model) => {
       const capabilities = modelCapabilities(model);
-      const search = query.trim().toLowerCase();
       const matchesSearch =
         !search ||
-        `${model.id} ${model.name} ${model.description || ""}`
-          .toLowerCase()
-          .includes(search);
-      const matchesContext =
-        !minimumContext ||
-        (model.contextLength != null &&
-          Number.isFinite(minimumContextValue) &&
-          model.contextLength >= minimumContextValue);
+        search
+          .split(/\s+/)
+          .every((term) => `${model.id} ${model.name} ${model.description || ""}`.toLowerCase().includes(term));
       return (
         matchesSearch &&
-        matchesContext &&
         (!filters.vision || capabilities.vision) &&
         (!filters.structured || capabilities.structured) &&
         (!filters.tools || capabilities.tools) &&
@@ -5045,7 +4865,6 @@ function ModelPicker({
       );
     })
     .sort((left, right) => {
-      const search = query.trim().toLowerCase();
       if (!search) return left.name.localeCompare(right.name);
       const score = (model: ModelCatalogModel) => {
         const id = model.id.toLowerCase();
@@ -5053,171 +4872,772 @@ function ModelPicker({
         if (id === search) return 0;
         if (id.startsWith(search)) return 1;
         if (name.startsWith(search)) return 2;
-        if (id.includes(search) || name.includes(search)) return 3;
-        return 4;
+        return 3;
       };
       return score(left) - score(right) || left.name.localeCompare(right.name);
     });
-  const activeFilterCount =
-    Number(Boolean(query.trim())) +
-    Number(Boolean(minimumContext)) +
-    Object.values(filters).filter(Boolean).length;
-  const clearFilters = () => {
+  const selectedModel = catalog?.models.find((model) => model.id === value);
+  const narrowing = Boolean(search) || Object.values(filters).some(Boolean);
+  const catalogSource =
+    catalog?.source === "openrouter" ? "OpenRouter's live model list" : `the models ${providerName} reports`;
+  const typedId = query.trim();
+  const canUseTyped =
+    typedId.length > 0 && !/\s/.test(typedId) && !(catalog?.models || []).some((model) => model.id === typedId);
+  const filterChips: [keyof typeof filters, string][] = [
+    ["vision", "Reads images"],
+    ["structured", "JSON schema"],
+    ["tools", "Tools"],
+    ...(providerName === "OpenRouter" ? ([["free", "Free"]] as [keyof typeof filters, string][]) : []),
+  ];
+  const choose = (model: ModelCatalogModel) => {
+    onSelect(model);
+    setBrowsing(false);
     setQuery("");
-    setMinimumContext("");
-    setFilters({ vision: false, structured: false, tools: false, free: false });
+  };
+  const capabilityBadges = (model: ModelCatalogModel) => {
+    const capabilities = modelCapabilities(model);
+    return (
+      <span className="model-badges">
+        {capabilities.vision && <span>Images</span>}
+        {capabilities.structured && <span>JSON</span>}
+        {capabilities.tools && <span>Tools</span>}
+        {capabilities.free && providerName === "OpenRouter" && <span>Free</span>}
+      </span>
+    );
   };
   return (
     <div className="model-picker">
-      <label>
-        Model ID
-        <input
-          required
-          value={value}
-          onChange={(e) => onManualChange(e.target.value)}
-          placeholder="anthropic/claude-3.5-sonnet"
-          aria-describedby="model-picker-help"
-        />
-      </label>
-      <div className="model-picker-toolbar">
-        <label>
-          Search {providerName} models
+      <span className="field-label" id="model-picker-label">
+        Model
+      </span>
+      {value && !browsing ? (
+        <div className="model-selected">
+          <span className="model-option-name">
+            <strong>{selectedModel?.name || value}</strong>
+            <code>{value}</code>
+          </span>
+          {selectedModel && capabilityBadges(selectedModel)}
+          <button type="button" className="button secondary" onClick={() => setBrowsing(true)}>
+            Change
+          </button>
+        </div>
+      ) : (
+        <div className="model-browser">
           <input
             type="search"
+            aria-labelledby="model-picker-label"
+            autoFocus={Boolean(value)}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search model name or ID"
-          />
-        </label>
-        <label>
-          Min context
-          <input
-            type="number"
-            min="0"
-            step="1000"
-            value={minimumContext}
-            onChange={(e) => setMinimumContext(e.target.value)}
-            placeholder="Any"
-          />
-        </label>
-      </div>
-      <div
-        className="model-picker-filters"
-        aria-label="Advertised model capabilities"
-      >
-        {(
-          [
-            ["vision", "Vision"],
-            ["structured", "Structured JSON"],
-            ["tools", "Tools"],
-            ["free", "Free"],
-          ] as [keyof typeof filters, string][]
-        ).map(([key, label]) => (
-          <label key={key}>
-            <input
-              type="checkbox"
-              checked={filters[key]}
-              onChange={(e) =>
-                setFilters((current) => ({
-                  ...current,
-                  [key]: e.target.checked,
-                }))
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                if (filteredModels[0]) choose(filteredModels[0]);
+                else if (canUseTyped) {
+                  onManualChange(typedId);
+                  setBrowsing(false);
+                  setQuery("");
+                }
               }
-            />
-            {label}
-          </label>
-        ))}
-      </div>
-      {activeFilterCount > 0 && (
-        <button
-          type="button"
-          className="text-button model-picker-clear"
-          onClick={clearFilters}
-        >
-          Clear search and filters ({activeFilterCount})
-        </button>
-      )}
-      <div className="model-picker-status" aria-live="polite">
-        {loading
-          ? `Loading ${providerName} models…`
-          : catalogError
-            ? catalogError
-            : `${filteredModels.length} of ${catalog?.models.length || 0} models`}
-        {catalog?.stale && !catalogError ? " · cached data" : ""}
-        {catalogError && (
-          <button
-            type="button"
-            className="text-button model-picker-retry"
-            onClick={() => setCatalogAttempt((attempt) => attempt + 1)}
-          >
-            Retry catalog
-          </button>
-        )}
-      </div>
-      {!loading && !catalogError && (
-        <div
-          className="model-picker-results"
-          role="group"
-          aria-label={`${providerName} models`}
-        >
-          {filteredModels.slice(0, 100).map((model) => {
-            const capabilities = modelCapabilities(model);
-            const selected = model.id === value;
-            return (
+              if (event.key === "Escape" && value) setBrowsing(false);
+            }}
+            placeholder={`Search ${providerName} models, or type a model ID`}
+          />
+          <div className="model-filter-chips" role="group" aria-label="Only show models that">
+            {filterChips.map(([key, label]) => (
               <button
+                key={key}
                 type="button"
-                aria-pressed={selected}
-                className={selected ? "model-option selected" : "model-option"}
-                key={model.id}
-                onClick={() => onSelect(model)}
+                aria-pressed={filters[key]}
+                className={filters[key] ? "chip-toggle on" : "chip-toggle"}
+                onClick={() => setFilters((current) => ({ ...current, [key]: !current[key] }))}
               >
-                <span className="model-option-name">
-                  <strong>{model.name || model.id}</strong>
-                  <code>{model.id}</code>
-                </span>
-                <span className="model-badges">
-                  {capabilities.vision && <span>Vision</span>}
-                  {capabilities.structured && <span>JSON</span>}
-                  {capabilities.tools && <span>Tools</span>}
-                  {capabilities.free && providerName === "OpenRouter" && (
-                    <span>Free</span>
-                  )}
-                </span>
-                <small>
-                  {modelContextLabel(model.contextLength)}
-                  {providerName === "OpenRouter" && (
-                    <>
-                      {" · In "}
-                      {modelPriceLabel(model.promptPrice)}
-                      {" · Out "}
-                      {modelPriceLabel(model.completionPrice)}
-                    </>
-                  )}
-                  {!capabilities.known && " · Capabilities not advertised"}
-                </small>
+                {label}
               </button>
-            );
-          })}
-          {!filteredModels.length && (
-            <p className="model-picker-empty">
-              No {providerName} models match these filters.
+            ))}
+            <span className="model-picker-status" aria-live="polite">
+              {loading
+                ? `Loading ${providerName} models…`
+                : catalogError
+                  ? "Couldn't load the model list."
+                  : narrowing
+                    ? `${filteredModels.length} of ${catalog?.models.length || 0}`
+                    : ""}
+              {catalogError && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setCatalogAttempt((attempt) => attempt + 1)}
+                >
+                  Retry
+                </button>
+              )}
+            </span>
+          </div>
+          {!narrowing && !loading && !catalogError && (
+            <p className="model-picker-idle">
+              {catalog?.models.length || 0} models from {catalogSource}
+              {catalog?.cachedAt &&
+                ` · updated ${new Date(catalog.cachedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
+              {catalog?.stale ? " (offline copy)" : ""}. Type a name like “qwen vl”, or pick a filter.
             </p>
           )}
-          {filteredModels.length > 100 && (
-            <p className="model-picker-empty">
-              Showing the first 100 matches. Search or filter to narrow the
-              list.
-            </p>
+          {(narrowing || catalogError) && (
+          <div className="model-picker-results" role="listbox" aria-labelledby="model-picker-label">
+            {canUseTyped && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={false}
+                className="model-option model-option-manual"
+                onClick={() => {
+                  onManualChange(typedId);
+                  setBrowsing(false);
+                  setQuery("");
+                }}
+              >
+                <span className="model-option-name">
+                  <strong>Use “{typedId}”</strong>
+                  <code>Enter this model ID exactly as your provider shows it</code>
+                </span>
+              </button>
+            )}
+            {!loading &&
+              !catalogError &&
+              filteredModels.slice(0, 60).map((model) => (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={model.id === value}
+                  className={model.id === value ? "model-option selected" : "model-option"}
+                  key={model.id}
+                  onClick={() => choose(model)}
+                >
+                  <span className="model-option-name">
+                    <strong>{model.name || model.id}</strong>
+                    <code>{model.id}</code>
+                  </span>
+                  {capabilityBadges(model)}
+                  <small>
+                    {modelContextLabel(model.contextLength)}
+                    {providerName === "OpenRouter" &&
+                      (modelCapabilities(model).free
+                        ? " · free"
+                        : ` · ${modelPriceLabel(model.promptPrice)} in, ${modelPriceLabel(model.completionPrice)} out`)}
+                  </small>
+                </button>
+              ))}
+            {!loading && !catalogError && !filteredModels.length && !canUseTyped && (
+              <p className="model-picker-empty">No models match. Try fewer filters, or type the exact model ID.</p>
+            )}
+            {catalogError && (
+              <p className="model-picker-empty">
+                {catalogError} You can still type the model ID above.
+              </p>
+            )}
+            {filteredModels.length > 60 && (
+              <p className="model-picker-empty">Showing 60 of {filteredModels.length}. Keep typing to narrow it down.</p>
+            )}
+          </div>
+          )}
+          {value && (
+            <button type="button" className="text-button model-picker-cancel" onClick={() => setBrowsing(false)}>
+              Keep {value}
+            </button>
           )}
         </div>
       )}
-      <small id="model-picker-help" className="model-picker-help">
-        Choose a discovered model to fill in its ID. Advertised capabilities are
-        hints only; endpoint preflight remains authoritative. If this provider
-        does not expose model metadata, enter the model ID manually and set
-        capabilities below.
-      </small>
     </div>
+  );
+}
+
+type ProviderPreset = {
+  id: string;
+  label: string;
+  provider: NonNullable<Target["provider"]>;
+  baseUrl: string;
+  needsKey: boolean;
+  hint: string;
+};
+const PROVIDER_PRESETS: ProviderPreset[] = [
+  { id: "openrouter", label: "OpenRouter", provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1", needsKey: true, hint: "Many cloud models, one key" },
+  { id: "openai", label: "OpenAI", provider: "openai-compatible", baseUrl: "https://api.openai.com/v1", needsKey: true, hint: "GPT models" },
+  { id: "lmstudio", label: "LM Studio", provider: "openai-compatible", baseUrl: "http://127.0.0.1:1234/v1", needsKey: false, hint: "Runs on this computer" },
+  { id: "ollama", label: "Ollama", provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", needsKey: false, hint: "Runs on this computer" },
+  { id: "llamacpp", label: "llama.cpp", provider: "llama.cpp", baseUrl: "http://127.0.0.1:8080/v1", needsKey: false, hint: "llama-server on this computer" },
+  { id: "other", label: "Other", provider: "openai-compatible", baseUrl: "", needsKey: false, hint: "Any OpenAI-compatible URL" },
+];
+const presetForTarget = (target: Target) => {
+  const url = target.baseUrl.replace(/\/$/, "");
+  return (
+    PROVIDER_PRESETS.find((preset) => preset.provider === target.provider && preset.baseUrl === url) ??
+    PROVIDER_PRESETS.find((preset) =>
+      target.provider === "openrouter" ? preset.id === "openrouter" : target.provider === "llama.cpp" ? preset.id === "llamacpp" : preset.id === "other",
+    )!
+  );
+};
+const CAPABILITY_LABELS = {
+  supportsVision: "Can read images",
+  supportsStructuredOutput: "Follows a JSON schema",
+  supportsTools: "Can call tools",
+} as const;
+const targetNameFromModel = (model: string, taken: string[]) => {
+  const base =
+    (model.split("/").pop() || "model")
+      .toLowerCase()
+      .replace(/[^a-z0-9.-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "model";
+  let name = base;
+  for (let index = 2; taken.includes(name); index++) name = `${base}-${index}`;
+  return name;
+};
+type TargetTestResult = { ok: boolean; message: string };
+const targetMissingKey = (target: Target) =>
+  presetForTarget(target).needsKey && !target.hasApiKey && !target.apiKeyEnv;
+const emptyTarget = (preset: ProviderPreset): Target => ({
+  name: "",
+  baseUrl: preset.baseUrl,
+  provider: preset.provider,
+  model: "",
+  apiKeyEnv: "",
+  apiKey: "",
+  supportsVision: false,
+  supportsStructuredOutput: false,
+  supportsTools: false,
+});
+const testTarget = async (name: string, vision: boolean): Promise<TargetTestResult> => {
+  try {
+    const result = await api<{ message?: string }>(`/api/targets/${encodeURIComponent(name)}/test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ vision }),
+    });
+    return { ok: true, message: result.message || "Connected. The model answered." };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "Connection test failed" };
+  }
+};
+
+function SchemaStatus({ check, validLabel }: { check: SchemaCheck | null; validLabel: string }) {
+  if (!check) return null;
+  if (!check.issues.length)
+    return (
+      <p className="schema-status ok" role="status">
+        ✓ {validLabel}
+      </p>
+    );
+  const shown = check.issues.slice(0, 4);
+  return (
+    <ul className="schema-status" role="status" aria-label="Schema check">
+      {shown.map((issue, index) => (
+        <li key={`${issue.path}-${index}`} className={issue.severity}>
+          <span aria-hidden="true">{issue.severity === "error" ? "✗" : "!"}</span>
+          <span>
+            {issue.path !== "/" && <code>{issue.path}</code>} {issue.message}
+          </span>
+        </li>
+      ))}
+      {check.issues.length > shown.length && (
+        <li className="more">and {check.issues.length - shown.length} more</li>
+      )}
+    </ul>
+  );
+}
+type DropdownOption = {
+  value: string;
+  label: string;
+  detail?: string;
+  badges?: string[];
+  group?: string;
+  disabled?: boolean;
+};
+let dropdownCount = 0;
+function Dropdown({
+  value,
+  options,
+  onChange,
+  placeholder = "Choose…",
+  labelledBy,
+  ariaLabel,
+  disabled,
+}: {
+  value: string;
+  options: DropdownOption[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+  labelledBy?: string;
+  ariaLabel?: string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const [id] = useState(() => `dropdown-${++dropdownCount}`);
+  const root = useRef<HTMLDivElement>(null);
+  const list = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const searchable = options.length > 8;
+  const visible = query.trim()
+    ? options.filter((option) =>
+        `${option.label} ${option.detail ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()),
+      )
+    : options;
+  const selected = options.find((option) => option.value === value);
+  const close = (refocus = true) => {
+    setOpen(false);
+    setQuery("");
+    if (refocus) trigger.current?.focus();
+  };
+  const pick = (option?: DropdownOption) => {
+    if (!option || option.disabled) return;
+    onChange(option.value);
+    close();
+  };
+  useEffect(() => {
+    if (!open) return;
+    const index = visible.findIndex((option) => option.value === value);
+    setActive(index >= 0 ? index : 0);
+    const outside = (event: MouseEvent) => {
+      if (!root.current?.contains(event.target as Node)) close(false);
+    };
+    document.addEventListener("mousedown", outside);
+    requestAnimationFrame(() =>
+      (root.current?.querySelector<HTMLElement>(".dropdown-search") ?? list.current)?.focus(),
+    );
+    return () => document.removeEventListener("mousedown", outside);
+  }, [open]);
+  useEffect(() => {
+    list.current
+      ?.querySelector<HTMLElement>(`[data-index="${active}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+  const onKeyDown = (event: ReactKeyboardEvent) => {
+    const move = (delta: number) => {
+      event.preventDefault();
+      if (!visible.length) return;
+      let next = active;
+      for (let step = 0; step < visible.length; step++) {
+        next = (next + delta + visible.length) % visible.length;
+        if (!visible[next].disabled) break;
+      }
+      setActive(next);
+    };
+    if (event.key === "ArrowDown") move(1);
+    else if (event.key === "ArrowUp") move(-1);
+    else if (event.key === "Home") {
+      event.preventDefault();
+      setActive(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      setActive(visible.length - 1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      pick(visible[active]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    } else if (event.key === "Tab") close(false);
+  };
+  let lastGroup: string | undefined;
+  return (
+    <div className={`dropdown${open ? " open" : ""}`} ref={root}>
+      <button
+        ref={trigger}
+        type="button"
+        className="dropdown-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={`${id}-list`}
+        aria-labelledby={labelledBy ? `${labelledBy} ${id}-value` : undefined}
+        aria-label={labelledBy ? undefined : ariaLabel}
+        disabled={disabled}
+        onClick={() => (open ? close() : setOpen(true))}
+        onKeyDown={(event) => {
+          if (!open && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
+        <span className="dropdown-value" id={`${id}-value`}>
+          {selected ? (
+            <>
+              <strong>{selected.label}</strong>
+              {selected.detail && <small>{selected.detail}</small>}
+            </>
+          ) : (
+            <span className="dropdown-placeholder">{placeholder}</span>
+          )}
+        </span>
+        <span className="dropdown-chevron" aria-hidden="true">
+          ⌄
+        </span>
+      </button>
+      {open && (
+        <div className="dropdown-popover">
+          {searchable && (
+            <input
+              className="dropdown-search"
+              type="search"
+              aria-label="Filter options"
+              value={query}
+              placeholder="Type to filter"
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setActive(0);
+              }}
+              onKeyDown={onKeyDown}
+            />
+          )}
+          <div
+            ref={list}
+            id={`${id}-list`}
+            className="dropdown-list"
+            role="listbox"
+            tabIndex={-1}
+            aria-labelledby={labelledBy}
+            aria-activedescendant={visible[active] ? `${id}-option-${active}` : undefined}
+            onKeyDown={onKeyDown}
+          >
+            {visible.map((option, index) => {
+              const header = option.group && option.group !== lastGroup ? option.group : null;
+              lastGroup = option.group;
+              return (
+                <div key={option.value || `empty-${index}`} role="presentation">
+                  {header && (
+                    <div className="dropdown-group" role="presentation">
+                      {header}
+                    </div>
+                  )}
+                  <div
+                    id={`${id}-option-${index}`}
+                    data-index={index}
+                    role="option"
+                    aria-selected={option.value === value}
+                    aria-disabled={option.disabled || undefined}
+                    className={`dropdown-option${index === active ? " active" : ""}${option.value === value ? " selected" : ""}`}
+                    onMouseEnter={() => setActive(index)}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => pick(option)}
+                  >
+                    <span className="dropdown-option-text">
+                      <strong>{option.label}</strong>
+                      {option.detail && <small>{option.detail}</small>}
+                    </span>
+                    {option.badges?.length ? (
+                      <span className="model-badges">
+                        {option.badges.map((badge) => (
+                          <span key={badge}>{badge}</span>
+                        ))}
+                      </span>
+                    ) : null}
+                    {option.value === value && (
+                      <span className="dropdown-check" aria-hidden="true">
+                        ✓
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {!visible.length && <p className="dropdown-empty">No matches</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+const targetOptions = (targets: Target[], empty = "Choose a model"): DropdownOption[] => [
+  { value: "", label: empty },
+  ...targets.map((target) => ({
+    value: target.name,
+    label: target.name,
+    detail: target.model,
+    badges: [
+      ...(target.supportsVision ? ["Images"] : []),
+      ...(target.supportsStructuredOutput ? ["JSON"] : []),
+      ...(target.supportsTools ? ["Tools"] : []),
+    ],
+  })),
+];
+
+function ActionsMenu({
+  label,
+  items,
+}: {
+  label: string;
+  items: { label: string; onSelect: () => void; destructive?: boolean; disabled?: boolean }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+  return (
+    <div className="actions-menu" ref={ref}>
+      <button
+        type="button"
+        className="icon-btn actions-menu-toggle"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        ⋯
+      </button>
+      {open && (
+        <div className="actions-menu-list" role="menu">
+          {items.map((item) => (
+            <button
+              key={item.label}
+              type="button"
+              role="menuitem"
+              className={item.destructive ? "destructive" : undefined}
+              disabled={item.disabled}
+              onClick={() => {
+                setOpen(false);
+                item.onSelect();
+              }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TargetForm({
+  initial,
+  targets,
+  onSaved,
+  onCancel,
+  onNotice,
+}: {
+  initial?: Target;
+  targets: Target[];
+  onSaved: (target: Target, test?: TargetTestResult) => void;
+  onCancel?: () => void;
+  onNotice: (message: string, kind?: Notice["kind"]) => void;
+}) {
+  const isEdit = Boolean(initial);
+  const [preset, setPreset] = useState<ProviderPreset>(() =>
+    initial ? presetForTarget(initial) : PROVIDER_PRESETS[0],
+  );
+  const [editing, setEditing] = useState<Target>(() =>
+    initial ? { ...initial, apiKey: "" } : emptyTarget(PROVIDER_PRESETS[0]),
+  );
+  const [nameTouched, setNameTouched] = useState(isEdit);
+  const [busy, setBusy] = useState<"" | "save" | "test">("");
+  const [result, setResult] = useState<TargetTestResult | null>(null);
+  const takenNames = targets.map((target) => target.name).filter((name) => name !== initial?.name);
+  const update = (patch: Partial<Target>) => {
+    setResult(null);
+    setEditing((current) => {
+      const next = { ...current, ...patch };
+      if (!nameTouched && !isEdit && patch.model !== undefined)
+        next.name = patch.model ? targetNameFromModel(patch.model, takenNames) : "";
+      return next;
+    });
+  };
+  const choosePreset = (next: ProviderPreset) => {
+    setPreset(next);
+    update({ provider: next.provider, baseUrl: next.baseUrl || editing.baseUrl });
+  };
+  const savedTarget = targets.find((target) => target.name === editing.name);
+  const discoveryEndpoint =
+    editing.provider === "openrouter"
+      ? "/api/models/openrouter"
+      : savedTarget
+        ? `/api/models/target/${encodeURIComponent(editing.name)}`
+        : "";
+  const selectDiscovered = (model: ModelCatalogModel) => {
+    const capabilities = modelCapabilities(model);
+    update({
+      model: model.id,
+      ...(capabilities.known
+        ? {
+            supportsVision: capabilities.vision,
+            supportsStructuredOutput: capabilities.structured,
+            supportsTools: capabilities.tools,
+          }
+        : {}),
+    });
+  };
+  const persist = async () => {
+    const name = editing.name.trim() || targetNameFromModel(editing.model, takenNames);
+    return api<Target>(`/api/targets/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...editing, name }),
+    });
+  };
+  const submit = async (withTest: boolean) => {
+    if (!editing.model.trim() || !editing.baseUrl.trim()) {
+      setResult({ ok: false, message: editing.model.trim() ? "Enter the server URL under Advanced options." : "Enter a model ID." });
+      return;
+    }
+    if (preset.needsKey && !editing.hasApiKey && !editing.apiKeyEnv && !editing.apiKey?.trim()) {
+      setResult({ ok: false, message: `${preset.label} needs an API key. Paste it above.` });
+      return;
+    }
+    setBusy(withTest ? "test" : "save");
+    try {
+      const saved = await persist();
+      setEditing({ ...saved, apiKey: "" });
+      setNameTouched(true);
+      const test = withTest ? await testTarget(saved.name, Boolean(saved.supportsVision)) : undefined;
+      setResult(test ?? { ok: true, message: `Saved “${saved.name}”.` });
+      onSaved(saved, test);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save model";
+      setResult({ ok: false, message });
+      onNotice(message, "error");
+    } finally {
+      setBusy("");
+    }
+  };
+  const keyNeeded = preset.needsKey && !editing.hasApiKey;
+  return (
+    <form
+      className="target-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void submit(true);
+      }}
+    >
+      <fieldset className="preset-grid" disabled={Boolean(busy)}>
+        <legend>Where does the model run?</legend>
+        {PROVIDER_PRESETS.map((item) => (
+          <label key={item.id} className={`preset-card${preset.id === item.id ? " selected" : ""}`}>
+            <input
+              type="radio"
+              name="provider-preset"
+              checked={preset.id === item.id}
+              onChange={() => choosePreset(item)}
+            />
+            <strong>{item.label}</strong>
+            <span>{item.hint}</span>
+          </label>
+        ))}
+      </fieldset>
+      <fieldset className="target-form-fields" disabled={Boolean(busy)}>
+        {(preset.needsKey || editing.hasApiKey || preset.id === "other") && (
+          <label>
+            <span>
+              API key <span className="optional">{preset.needsKey ? "required" : "optional"}</span>
+            </span>
+            <input
+              type="password"
+              required={keyNeeded}
+              autoComplete="off"
+              value={editing.apiKey || ""}
+              onChange={(event) => update({ apiKey: event.target.value })}
+              placeholder={
+                editing.hasApiKey
+                  ? "Saved — enter a new key to replace it"
+                  : preset.id === "other"
+                    ? "Paste the key, if your server needs one"
+                    : `Paste your ${preset.label} key`
+              }
+            />
+            <small>Encrypted on this computer and never shown again.</small>
+          </label>
+        )}
+        {discoveryEndpoint ? (
+          <ModelPicker
+            value={editing.model}
+            onManualChange={(model) => update({ model })}
+            onSelect={selectDiscovered}
+            endpoint={discoveryEndpoint}
+            providerName={preset.id === "other" ? "your server" : preset.label}
+          />
+        ) : (
+          <label>
+            Model ID
+            <input
+              required
+              value={editing.model}
+              onChange={(event) => update({ model: event.target.value })}
+              placeholder={preset.id === "openai" ? "gpt-4o-mini" : preset.id === "ollama" ? "llama3.2" : "qwen2.5-vl"}
+            />
+            <small>
+              {preset.needsKey ? "The model name from your provider." : "The model name shown by your local server. Start the server first."}
+            </small>
+          </label>
+        )}
+        <label>
+          Name
+          <input
+            value={editing.name}
+            readOnly={isEdit}
+            onChange={(event) => {
+              setNameTouched(true);
+              setEditing({ ...editing, name: event.target.value });
+            }}
+            placeholder="Filled in from the model"
+          />
+          <small>{isEdit ? "Names can't be changed after saving." : "How this model appears in Setup."}</small>
+        </label>
+        <AdvancedOptions>
+          <label>
+            Server URL
+            <input
+              required
+              value={editing.baseUrl}
+              onChange={(event) => update({ baseUrl: event.target.value })}
+              placeholder="http://127.0.0.1:8080/v1"
+            />
+            <small>Usually ends in /v1.</small>
+          </label>
+          <fieldset className="checks">
+            <legend>What can this model do?</legend>
+            {(Object.keys(CAPABILITY_LABELS) as (keyof typeof CAPABILITY_LABELS)[]).map((key) => (
+              <label key={key}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(editing[key])}
+                  onChange={(event) => update({ [key]: event.target.checked })}
+                />
+                {CAPABILITY_LABELS[key]}
+              </label>
+            ))}
+            <small>Picking a model from the list fills these in when the provider reports them.</small>
+          </fieldset>
+        </AdvancedOptions>
+      </fieldset>
+      {result && (
+        <p className={`test-result ${result.ok ? "ok" : "error"}`} role={result.ok ? "status" : "alert"}>
+          <b aria-hidden="true">{result.ok ? "✓" : "✗"}</b> {result.message}
+        </p>
+      )}
+      <div className="form-actions">
+        <button className="button primary" type="submit" disabled={Boolean(busy)}>
+          {busy === "test" ? "Testing…" : "Save & test"}
+        </button>
+        <button className="button secondary" type="button" disabled={Boolean(busy)} onClick={() => void submit(false)}>
+          {busy === "save" ? "Saving…" : "Save"}
+        </button>
+        {onCancel && (
+          <button className="text-button" type="button" disabled={Boolean(busy)} onClick={onCancel}>
+            Cancel
+          </button>
+        )}
+      </div>
+    </form>
   );
 }
 
@@ -5230,320 +5650,134 @@ function Targets({
   setTargets: (x: Target[]) => void;
   onNotice: (message: string, kind?: Notice["kind"]) => void;
 }) {
-  const [editing, setEditing] = useState<Target>({
-    name: "",
-    baseUrl: "http://127.0.0.1:8080/v1",
-    provider: "openai-compatible",
-    model: "",
-    apiKeyEnv: "",
-    apiKey: "",
-    supportsVision: false,
-    supportsStructuredOutput: false,
-    supportsTools: false,
-  });
+  const [formFor, setFormFor] = useState<Target | "new" | null>(null);
   const [testing, setTesting] = useState("");
-  const save = async (e: FormEvent) => {
-    e.preventDefault();
+  const [results, setResults] = useState<Record<string, TargetTestResult>>({});
+  const showForm = formFor !== null || !targets.length;
+  const upsert = (target: Target) =>
+    setTargets([...targets.filter((item) => item.name !== target.name), target].sort((a, b) => a.name.localeCompare(b.name)));
+  const runTest = async (target: Target) => {
+    setTesting(target.name);
+    const result = await testTarget(target.name, Boolean(target.supportsVision));
+    setResults((current) => ({ ...current, [target.name]: result }));
+    onNotice(result.message, result.ok ? "success" : "error");
+    setTesting("");
+  };
+  const removeKey = async (target: Target) => {
+    if (!window.confirm(`Remove the saved API key for “${target.name}”?`)) return;
     try {
-      const result = await api<Target>(
-        `/api/targets/${encodeURIComponent(editing.name)}`,
-        {
+      upsert(
+        await api<Target>(`/api/targets/${encodeURIComponent(target.name)}`, {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(editing),
-        },
+          body: JSON.stringify({ ...target, apiKey: "", clearApiKey: true }),
+        }),
       );
-      setTargets([...targets.filter((t) => t.name !== result.name), result]);
-      setEditing({ ...result, apiKey: "" });
-      onNotice(`Target “${result.name}” saved.`);
-    } catch (err) {
-      onNotice(
-        err instanceof Error ? err.message : "Could not save target",
-        "error",
-      );
+      onNotice(`Saved key removed from “${target.name}”.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not remove key", "error");
     }
   };
-  const test = async (target: Target) => {
-    setTesting(target.name);
+  const remove = async (target: Target) => {
+    if (!window.confirm(`Delete “${target.name}”? Past runs keep their results.`)) return;
     try {
-      const result = await api<{ message?: string }>(
-        `/api/targets/${encodeURIComponent(target.name)}/test`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ vision: Boolean(target.supportsVision) }),
-        },
-      );
-      onNotice(result.message || `Connection to ${target.name} succeeded.`);
-    } catch (err) {
-      onNotice(
-        err instanceof Error ? err.message : "Connection test failed",
-        "error",
-      );
-    } finally {
-      setTesting("");
+      await api(`/api/targets/${encodeURIComponent(target.name)}`, { method: "DELETE" });
+      setTargets(targets.filter((item) => item.name !== target.name));
+      if (formFor !== "new" && formFor?.name === target.name) setFormFor(null);
+      onNotice(`Deleted “${target.name}”.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not delete model", "error");
     }
-  };
-  const savedEditingTarget = targets.find(
-    (target) => target.name === editing.name,
-  );
-  const modelDiscoveryEndpoint =
-    editing.provider === "openrouter"
-      ? "/api/models/openrouter"
-      : savedEditingTarget
-        ? `/api/models/target/${encodeURIComponent(editing.name)}`
-        : "";
-  const modelDiscoveryName =
-    editing.provider === "openrouter" ? "OpenRouter" : providerLabel(editing);
-  const selectDiscoveredModel = (model: ModelCatalogModel) => {
-    const capabilities = modelCapabilities(model);
-    setEditing((current) => ({
-      ...current,
-      model: model.id,
-      ...(capabilities.known
-        ? {
-            supportsVision: capabilities.vision,
-            supportsStructuredOutput: capabilities.structured,
-            supportsTools: capabilities.tools,
-          }
-        : {}),
-    }));
   };
   return (
     <>
       <PageTitle
-        eyebrow="PROVIDERS & MODELS"
-        title="Providers & models"
-        sub="Configure the local or cloud models used by each pipeline stage."
+        eyebrow="PREPARE"
+        title="Providers"
+        sub="Connect the models you want to evaluate. Local servers and cloud providers both work."
+        action={
+          targets.length > 0 && formFor === null ? (
+            <button className="button primary" type="button" onClick={() => setFormFor("new")}>
+              Add model
+            </button>
+          ) : undefined
+        }
       />
-      <div className="targets-layout">
-        <section className="panel">
-          <div className="panel-head">
-            <div>
-              <h3>Configured providers &amp; models</h3>
-              <p>
-                Credentials are encrypted locally and never shown after saving.
-              </p>
-            </div>
-          </div>
-          {targets.length ? (
-            targets.map((t) => (
-              <div className="target-row" key={t.name}>
-                <div className="target-info">
-                  <strong>{t.name}</strong>
-                  <span>
-                    {providerLabel(t)} · {t.model} · {t.baseUrl}
-                  </span>
-                  <small>
-                    {t.supportsVision ? "Vision" : "Text only"} ·{" "}
-                    {t.supportsStructuredOutput
-                      ? "Structured output"
-                      : "Prompted JSON"}{" "}
-                    · {t.supportsTools ? "Tools" : "No tools"} ·{" "}
-                    {t.hasApiKey ? "Credential saved" : "No credential"}
-                  </small>
-                </div>
-                <div className="target-actions">
-                  <button
-                    className="button mini"
-                    disabled={testing === t.name}
-                    onClick={() => void test(t)}
-                  >
-                    {testing === t.name ? "Testing…" : "Test"}
-                  </button>
-                  <button
-                    className="text-button"
-                    onClick={() => setEditing({ ...t, apiKey: "" })}
-                  >
-                    Edit
-                  </button>
-                  {t.hasApiKey && (
-                    <button
-                      className="text-button destructive"
-                      onClick={() => {
-                        if (
-                          !window.confirm(
-                            `Remove the saved credential for “${t.name}”?`,
-                          )
-                        )
-                          return;
-                        void api<Target>(
-                          `/api/targets/${encodeURIComponent(t.name)}`,
-                          {
-                            method: "PUT",
-                            headers: { "content-type": "application/json" },
-                            body: JSON.stringify({
-                              ...t,
-                              apiKey: "",
-                              clearApiKey: true,
-                            }),
-                          },
-                        )
-                          .then((result) => {
-                            setTargets([
-                              ...targets.filter((x) => x.name !== result.name),
-                              result,
-                            ]);
-                            setEditing((current) =>
-                              current.name === result.name
-                                ? { ...result, apiKey: "" }
-                                : current,
-                            );
-                            onNotice(
-                              `Saved credential removed from “${result.name}”.`,
-                            );
-                          })
-                          .catch((err) =>
-                            onNotice(
-                              err instanceof Error
-                                ? err.message
-                                : "Could not remove credential",
-                              "error",
-                            ),
-                          );
-                      }}
+      <div className={`targets-layout${showForm ? "" : " list-only"}`}>
+        {targets.length > 0 && (
+          <section className="target-list" aria-label="Connected models">
+            {targets.map((target) => {
+              const result = results[target.name];
+              return (
+                <article className="target-card" key={target.name}>
+                  <header>
+                    <div>
+                      <strong>{target.name}</strong>
+                      <span>
+                        {presetForTarget(target).label} · <code>{target.model}</code>
+                      </span>
+                    </div>
+                    <span
+                      className={`test-badge ${targetMissingKey(target) ? "error" : result ? (result.ok ? "ok" : "error") : ""}`}
+                      title={targetMissingKey(target) ? "Edit this model and paste its API key." : result?.message}
                     >
-                      Remove saved credential
+                      {targetMissingKey(target)
+                        ? "Needs API key"
+                        : result
+                          ? result.ok
+                            ? "✓ Connected"
+                            : "✗ Failed"
+                          : "Not tested"}
+                    </span>
+                  </header>
+                  <ul className="capability-chips" aria-label="Capabilities">
+                    {(Object.keys(CAPABILITY_LABELS) as (keyof typeof CAPABILITY_LABELS)[])
+                      .filter((key) => target[key])
+                      .map((key) => (
+                        <li key={key}>{CAPABILITY_LABELS[key]}</li>
+                      ))}
+                    {target.hasApiKey && <li className="muted-chip">Key saved</li>}
+                  </ul>
+                  <footer>
+                    <button className="button mini" type="button" disabled={testing === target.name} onClick={() => void runTest(target)}>
+                      {testing === target.name ? "Testing…" : "Test"}
                     </button>
-                  )}
-                </div>
-              </div>
-            ))
-          ) : (
-            <Empty
-              icon="⌁"
-              title="No targets configured"
-              text="Add a local or OpenAI-compatible endpoint to get started."
+                    <button className="text-button" type="button" onClick={() => setFormFor(target)}>
+                      Edit
+                    </button>
+                    <ActionsMenu
+                      label={`More actions for ${target.name}`}
+                      items={[
+                        ...(target.hasApiKey ? [{ label: "Remove saved key", onSelect: () => void removeKey(target) }] : []),
+                        { label: "Delete", destructive: true, onSelect: () => void remove(target) },
+                      ]}
+                    />
+                  </footer>
+                </article>
+              );
+            })}
+          </section>
+        )}
+        {showForm && (
+          <section className="panel target-form-panel" aria-label={formFor && formFor !== "new" ? "Edit model" : "Add a model"}>
+            <h3>{formFor && formFor !== "new" ? `Edit ${formFor.name}` : targets.length ? "Add a model" : "Connect your first model"}</h3>
+            <TargetForm
+              key={formFor && formFor !== "new" ? formFor.name : "new"}
+              initial={formFor && formFor !== "new" ? formFor : undefined}
+              targets={targets}
+              onNotice={onNotice}
+              onCancel={targets.length ? () => setFormFor(null) : undefined}
+              onSaved={(target, test) => {
+                upsert(target);
+                if (test) setResults((current) => ({ ...current, [target.name]: test }));
+                if (!test || test.ok) {
+                  onNotice(test ? `“${target.name}” saved and connected.` : `“${target.name}” saved.`);
+                  setFormFor(null);
+                } else setFormFor(target);
+              }}
             />
-          )}
-        </section>
-        <form className="panel target-form" onSubmit={save}>
-          <h3>{editing.name ? "Edit target" : "Add target"}</h3>
-          <p className="form-intro">
-            The name is used in run configuration and snapshots.
-          </p>
-          <label>
-            Provider
-            <select
-              value={editing.provider || "openai-compatible"}
-              onChange={(e) =>
-                setEditing({
-                  ...editing,
-                  provider: e.target.value as Target["provider"],
-                })
-              }
-            >
-              <option value="openrouter">OpenRouter</option>
-              <option value="llama.cpp">llama.cpp</option>
-              <option value="openai-compatible">OpenAI / compatible</option>
-            </select>
-          </label>
-          <label>
-            Name
-            <input
-              required
-              value={editing.name}
-              onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-              placeholder="local-llama"
-            />
-          </label>
-          <label>
-            Base URL
-            <input
-              required
-              value={editing.baseUrl}
-              onChange={(e) =>
-                setEditing({ ...editing, baseUrl: e.target.value })
-              }
-              placeholder="http://127.0.0.1:8080/v1"
-            />
-            <small>
-              OpenAI: https://api.openai.com/v1 · LM Studio:
-              http://127.0.0.1:1234/v1
-            </small>
-          </label>
-          {modelDiscoveryEndpoint ? (
-            <ModelPicker
-              value={editing.model}
-              onManualChange={(model) => setEditing({ ...editing, model })}
-              onSelect={selectDiscoveredModel}
-              endpoint={modelDiscoveryEndpoint}
-              providerName={modelDiscoveryName}
-            />
-          ) : (
-            <label>
-              Model ID
-              <input
-                required
-                value={editing.model}
-                onChange={(e) =>
-                  setEditing({ ...editing, model: e.target.value })
-                }
-                placeholder="qwen2.5-vl"
-              />
-              {editing.provider !== "openrouter" && editing.name && (
-                <small>Save this provider first to discover its models.</small>
-              )}
-            </label>
-          )}
-          <label>
-            API key <span className="optional">encrypted locally</span>
-            <input
-              type="password"
-              value={editing.apiKey || ""}
-              onChange={(e) =>
-                setEditing({ ...editing, apiKey: e.target.value })
-              }
-              placeholder={
-                editing.hasApiKey
-                  ? "Saved — enter a new key to replace"
-                  : "Paste your OpenRouter key"
-              }
-            />
-            <small>
-              Stored encrypted in the local database. It is not returned to the
-              browser or exported.
-            </small>
-          </label>
-          <div className="checks">
-            <label>
-              <input
-                type="checkbox"
-                checked={Boolean(editing.supportsVision)}
-                onChange={(e) =>
-                  setEditing({ ...editing, supportsVision: e.target.checked })
-                }
-              />{" "}
-              Supports vision
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={Boolean(editing.supportsStructuredOutput)}
-                onChange={(e) =>
-                  setEditing({
-                    ...editing,
-                    supportsStructuredOutput: e.target.checked,
-                  })
-                }
-              />{" "}
-              Structured output
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={Boolean(editing.supportsTools)}
-                onChange={(e) =>
-                  setEditing({ ...editing, supportsTools: e.target.checked })
-                }
-              />{" "}
-              Tool calling
-            </label>
-          </div>
-          <button className="button primary" type="submit">
-            Save target
-          </button>
-        </form>
+          </section>
+        )}
       </div>
     </>
   );
@@ -5551,9 +5785,11 @@ function Targets({
 function Compare({
   runs,
   preferredRun,
+  preferredPair,
 }: {
   runs: Run[];
   preferredRun?: string;
+  preferredPair?: [string, string] | null;
 }) {
   const [left, setLeft] = useState("");
   const [right, setRight] = useState("");
@@ -5561,6 +5797,18 @@ function Compare({
   const [resultKey, setResultKey] = useState("");
   const [busy, setBusy] = useState(false);
   const compareRequest = useRef(0);
+  useEffect(() => {
+    if (!preferredPair) return;
+    const [first, second] = preferredPair
+      .map((id) => runs.find((run) => run.runId === id))
+      .sort((a, b) => (Date.parse(a?.createdAt || "") || 0) - (Date.parse(b?.createdAt || "") || 0));
+    if (first && second) {
+      compareRequest.current += 1;
+      setResult(null);
+      setLeft(first.runId);
+      setRight(second.runId);
+    }
+  }, [preferredPair]);
   useEffect(() => {
     if (!left && runs[1]) setLeft(runs[1].runId);
     if (!right && preferredRun) setRight(preferredRun);
@@ -5602,7 +5850,7 @@ function Compare({
       <PageTitle
         eyebrow="COMPARISON"
         title="Compare runs"
-        sub="Find regressions across matching cases and compatible snapshots."
+        sub="See what got better or worse between two runs of the same dataset."
       />
       <form
         className="panel compare-form"
@@ -5611,35 +5859,41 @@ function Compare({
           if (left && right && !busy) void submit();
         }}
       >
-        <label>
-          Baseline (left)
-          <select
+        <div className="field">
+          <span className="field-label" id="compare-left-label">Before (baseline)</span>
+          <Dropdown
+            labelledBy="compare-left-label"
             value={left}
-            onChange={(e) => changeSelection("left", e.target.value)}
-          >
-            <option value="">Choose a run</option>
-            {runs.map((r) => (
-              <option key={r.runId} value={r.runId}>
-                {r.runId.slice(0, 12)} · {date(r.createdAt)}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(value) => changeSelection("left", value)}
+            placeholder="Choose a run"
+            options={runs.map((r) => ({ value: r.runId, label: runLabel(r), detail: `${date(r.createdAt)} · ${runOutcome(r).label}` }))}
+          />
+        </div>
         <span className="versus">VS</span>
-        <label>
-          Candidate (right)
-          <select
+        <div className="field">
+          <span className="field-label" id="compare-right-label">After (candidate)</span>
+          <Dropdown
+            labelledBy="compare-right-label"
             value={right}
-            onChange={(e) => changeSelection("right", e.target.value)}
-          >
-            <option value="">Choose a run</option>
-            {runs.map((r) => (
-              <option key={r.runId} value={r.runId}>
-                {r.runId.slice(0, 12)} · {date(r.createdAt)}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(value) => changeSelection("right", value)}
+            placeholder="Choose a run"
+            options={(() => {
+              const base = runs.find((r) => r.runId === left);
+              const others = runs.filter((r) => r.runId !== left);
+              const toOption = (r: Run, group?: string): DropdownOption => ({
+                value: r.runId,
+                label: runLabel(r),
+                detail: `${date(r.createdAt)} · ${runOutcome(r).label}`,
+                group,
+              });
+              if (!base?.datasetVersion) return others.map((r) => toOption(r));
+              return [
+                ...others.filter((r) => r.datasetVersion === base.datasetVersion).map((r) => toOption(r, "Same dataset (comparable)")),
+                ...others.filter((r) => r.datasetVersion !== base.datasetVersion).map((r) => toOption(r, "Other datasets")),
+              ];
+            })()}
+          />
+        </div>
         <button
           className="button primary"
           disabled={!left || !right || busy}
@@ -5649,31 +5903,34 @@ function Compare({
         </button>
       </form>
       {result && resultKey === selectionKey && result.error ? (
-        <div className="alert error">{result.error}</div>
+        <div className="alert error" role="alert">
+          <strong>These runs can't be compared.</strong> Compare works for graded runs of the same dataset with the same
+          scoring settings, such as two models tried in one experiment. <small>Details: {result.error}</small>
+        </div>
       ) : result && resultKey === selectionKey ? (
         <section className="comparison-results">
           <div className="stats">
             <Stat
               label="Matched cases"
               value={String(result.sampleCount)}
-              note="Comparable sample"
+              note="Cases in both runs"
             />
             <Stat
               label="Improved"
               value={String(result.improved)}
-              note="Candidate better"
+              note="Better in the after run"
             />
             <Stat
               label="Regressed"
               value={String(result.regressed)}
-              note="Candidate worse"
+              note="Worse in the after run"
             />
           </div>
           <div className="panel">
             <div className="panel-head">
               <div>
-                <h3>Field movement</h3>
-                <p>Positive and negative changes by JSON path.</p>
+                <h3>Changes by field</h3>
+                <p>How many cases improved or regressed for each field.</p>
               </div>
             </div>
             {result.fields?.length ? (
@@ -5698,15 +5955,372 @@ function Compare({
       ) : (
         <Empty
           icon="≈"
-          title="Choose two compatible runs"
-          text="Comparison requires matching dataset, schema, and grader versions."
+          title="Choose two runs"
+          text="Pick two graded runs of the same dataset, for example two models or two prompts."
         />
       )}
     </>
   );
 }
+
+function Experiments({
+  experiments,
+  runs,
+  selectedId,
+  onSelect,
+  onOpenRun,
+  onRefresh,
+  onNotice,
+  onNewRun,
+  onCompare,
+}: {
+  experiments: Experiment[];
+  runs: Run[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  onOpenRun: (id: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onNotice: (message: string, kind?: Notice["kind"]) => void;
+  onNewRun: (experimentId: string) => void;
+  onCompare: (left: string, right: string) => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [rename, setRename] = useState("");
+  const [picking, setPicking] = useState(false);
+  const [toAdd, setToAdd] = useState<string[]>([]);
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const selected =
+    experiments.find((item) => item.experimentId === selectedId) || experiments[0] || null;
+  const linkedRuns = selected
+    ? newestRuns(runs.filter((run) => run.experimentId === selected.experimentId))
+    : [];
+  const ungrouped = newestRuns(runs.filter((run) => !run.experimentId));
+  useEffect(() => {
+    setRenaming(false);
+    setPicking(false);
+    setToAdd([]);
+    setChosen([]);
+  }, [selected?.experimentId]);
+  const call = async (work: () => Promise<unknown>, success: string, failure: string) => {
+    setBusy(true);
+    try {
+      await work();
+      await onRefresh();
+      onNotice(success);
+      return true;
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : failure, "error");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  const json = (method: string, body: unknown) => ({
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    const name = newName.trim();
+    if (!name) return;
+    let createdId = "";
+    const ok = await call(
+      async () => {
+        createdId = (await api<Experiment>("/api/experiments", json("POST", { name }))).experimentId;
+      },
+      `Experiment “${name}” created.`,
+      "Could not create experiment",
+    );
+    if (ok) {
+      setNewName("");
+      setCreating(false);
+      onSelect(createdId);
+    }
+  };
+  const saveRename = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selected || !rename.trim()) return;
+    if (
+      await call(
+        () => api(`/api/experiments/${encodeURIComponent(selected.experimentId)}`, json("PATCH", { name: rename.trim() })),
+        "Experiment renamed.",
+        "Could not rename experiment",
+      )
+    )
+      setRenaming(false);
+  };
+  const remove = async () => {
+    if (!selected) return;
+    if (!window.confirm(`Delete “${selected.name}”? Its runs are kept and become ungrouped.`)) return;
+    if (
+      await call(
+        () => api(`/api/experiments/${encodeURIComponent(selected.experimentId)}`, { method: "DELETE" }),
+        "Experiment deleted.",
+        "Could not delete experiment",
+      )
+    )
+      onSelect(null);
+  };
+  const assign = (runIds: string[], experimentId: string | null) =>
+    call(
+      () =>
+        Promise.all(
+          runIds.map((runId) =>
+            api(`/api/runs/${encodeURIComponent(runId)}/experiment`, json("PUT", { experimentId })),
+          ),
+        ),
+      experimentId
+        ? `${runIds.length} run${runIds.length === 1 ? "" : "s"} added.`
+        : "Run removed from experiment.",
+      "Could not update the experiment",
+    );
+  const toggle = (list: string[], id: string) =>
+    list.includes(id) ? list.filter((item) => item !== id) : [...list, id];
+  return (
+    <div className="experiments-page" data-view-heading="experiments">
+      <PageTitle
+        eyebrow="ANALYZE"
+        title="Experiments"
+        sub="Group runs that answer one question, like “which model reads receipts best?”"
+      />
+      <div className="experiments-layout">
+        <section className="panel experiment-list-panel" aria-label="Experiments">
+          <div className="experiment-list-head">
+            <h3>Experiments</h3>
+            {!creating && (
+              <button type="button" className="button secondary" onClick={() => setCreating(true)}>
+                New experiment
+              </button>
+            )}
+          </div>
+          {creating && (
+            <form className="inline-form experiment-create" onSubmit={create}>
+              <input
+                autoFocus
+                aria-label="Experiment name"
+                value={newName}
+                onChange={(event) => setNewName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    setCreating(false);
+                    setNewName("");
+                  }
+                }}
+                placeholder="Name, e.g. Receipt models"
+              />
+              <button className="button primary" disabled={busy || !newName.trim()}>
+                Create
+              </button>
+              <button type="button" className="text-button" onClick={() => setCreating(false)}>
+                Cancel
+              </button>
+            </form>
+          )}
+          <div className="experiment-list">
+            {experiments.length ? (
+              experiments.map((experiment) => (
+                <button
+                  type="button"
+                  key={experiment.experimentId}
+                  className={selected?.experimentId === experiment.experimentId ? "experiment-item selected" : "experiment-item"}
+                  aria-pressed={selected?.experimentId === experiment.experimentId}
+                  onClick={() => onSelect(experiment.experimentId)}
+                >
+                  <span>
+                    <strong>{experiment.name}</strong>
+                    <small>
+                      {experiment.runCount} run{experiment.runCount === 1 ? "" : "s"} · updated {date(experiment.updatedAt)}
+                    </small>
+                  </span>
+                  <span aria-hidden="true">›</span>
+                </button>
+              ))
+            ) : (
+              !creating && (
+                <p className="muted experiment-empty">
+                  No experiments yet. Create one to keep related runs together.
+                </p>
+              )
+            )}
+          </div>
+        </section>
+        <section className="panel experiment-detail-panel" aria-label="Selected experiment">
+          {selected ? (
+            <>
+              <header className="experiment-detail-head">
+                {renaming ? (
+                  <form className="inline-form" onSubmit={saveRename}>
+                    <input
+                      autoFocus
+                      aria-label="Experiment name"
+                      value={rename}
+                      onChange={(event) => setRename(event.target.value)}
+                      onKeyDown={(event) => event.key === "Escape" && setRenaming(false)}
+                    />
+                    <button className="button primary" disabled={busy || !rename.trim()}>
+                      Save
+                    </button>
+                    <button type="button" className="text-button" onClick={() => setRenaming(false)}>
+                      Cancel
+                    </button>
+                  </form>
+                ) : (
+                  <div>
+                    <h3>{selected.name}</h3>
+                    <small>
+                      {linkedRuns.length} run{linkedRuns.length === 1 ? "" : "s"}
+                    </small>
+                  </div>
+                )}
+                <div className="experiment-detail-actions">
+                  <button type="button" className="button primary" onClick={() => onNewRun(selected.experimentId)}>
+                    New run in this experiment
+                  </button>
+                  <ActionsMenu
+                    label={`More actions for ${selected.name}`}
+                    items={[
+                      {
+                        label: "Rename",
+                        onSelect: () => {
+                          setRename(selected.name);
+                          setRenaming(true);
+                        },
+                      },
+                      { label: "Delete experiment", destructive: true, onSelect: () => void remove() },
+                    ]}
+                  />
+                </div>
+              </header>
+              {linkedRuns.length ? (
+                <div className="experiment-table" role="table" aria-label="Runs in this experiment">
+                  <div className="experiment-table-row head" role="row">
+                    <span role="columnheader" aria-label="Select" />
+                    <span role="columnheader">Run</span>
+                    <span role="columnheader">Result</span>
+                    <span role="columnheader" aria-label="Actions" />
+                  </div>
+                  {linkedRuns.map((run) => (
+                    <div className="experiment-table-row" role="row" key={run.runId}>
+                      <span role="cell">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${runLabel(run)} to compare`}
+                          checked={chosen.includes(run.runId)}
+                          disabled={!chosen.includes(run.runId) && chosen.length >= 2}
+                          onChange={() => setChosen((current) => toggle(current, run.runId))}
+                        />
+                      </span>
+                      <button type="button" role="cell" className="experiment-run-link" onClick={() => void onOpenRun(run.runId)}>
+                        <strong>{runLabel(run)}</strong>
+                        <small>{date(run.createdAt)}</small>
+                      </button>
+                      <span role="cell">
+                        <RunStatusBadge run={run} />
+                      </span>
+                      <span role="cell">
+                        <button
+                          type="button"
+                          className="text-button"
+                          disabled={busy}
+                          onClick={() => void assign([run.runId], null)}
+                        >
+                          Remove
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="experiment-empty-runs">
+                  <strong>No runs here yet</strong>
+                  <span>Start a new run in this experiment, or add runs you already have.</span>
+                </div>
+              )}
+              <div className="experiment-toolbar">
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={chosen.length !== 2}
+                  onClick={() => onCompare(chosen[0], chosen[1])}
+                  title={chosen.length === 2 ? undefined : "Select two runs to compare"}
+                >
+                  Compare selected{chosen.length ? ` (${chosen.length}/2)` : ""}
+                </button>
+                <button
+                  type="button"
+                  className="button secondary"
+                  aria-expanded={picking}
+                  disabled={!ungrouped.length}
+                  onClick={() => setPicking((value) => !value)}
+                >
+                  {ungrouped.length ? "Add existing runs" : "No ungrouped runs"}
+                </button>
+              </div>
+              {picking && (
+                <div className="inline-panel run-picker">
+                  <div className="inline-panel-head">
+                    <strong>Add runs that aren't in an experiment</strong>
+                    <button type="button" className="text-button" onClick={() => setPicking(false)}>
+                      Close
+                    </button>
+                  </div>
+                  <div className="run-picker-list">
+                    {ungrouped.map((run) => (
+                      <label key={run.runId} className="check-row">
+                        <input
+                          type="checkbox"
+                          checked={toAdd.includes(run.runId)}
+                          onChange={() => setToAdd((current) => toggle(current, run.runId))}
+                        />
+                        <span>
+                          <strong>{runLabel(run)}</strong>
+                          <small>{date(run.createdAt)}</small>
+                        </span>
+                        <RunStatusBadge run={run} />
+                      </label>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="button primary"
+                    disabled={busy || !toAdd.length}
+                    onClick={() =>
+                      void assign(toAdd, selected.experimentId).then((ok) => {
+                        if (ok) {
+                          setToAdd([]);
+                          setPicking(false);
+                        }
+                      })
+                    }
+                  >
+                    Add {toAdd.length || ""} run{toAdd.length === 1 ? "" : "s"}
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            <Empty
+              icon="◫"
+              title="No experiment selected"
+              text="Create an experiment to group related runs and compare them."
+            />
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function SetupPanel({
   setup,
+  experiments,
+  selectedExperimentId,
+  onSelectExperiment,
+  onCreateExperiment,
   targets,
   datasets,
   activeExecution,
@@ -5715,8 +6329,16 @@ function SetupPanel({
   onNotice,
   onOpenRun,
   onBusyChange,
+  setTargets,
+  onRefreshDatasets,
 }: {
+  setTargets: (targets: Target[]) => void;
+  onRefreshDatasets: () => Promise<void>;
   setup: Setup;
+  experiments: Experiment[];
+  selectedExperimentId: string | null;
+  onSelectExperiment: (id: string | null) => void;
+  onCreateExperiment: (name: string) => Promise<Experiment>;
   targets: Target[];
   datasets: Dataset[];
   activeExecution: ActiveExecution;
@@ -5726,6 +6348,8 @@ function SetupPanel({
   onOpenRun: (runId: string) => Promise<void>;
   onBusyChange: (busy: boolean) => void;
 }) {
+  const [inlineExperimentName, setInlineExperimentName] = useState("");
+  const [creatingExperiment, setCreatingExperiment] = useState(false);
   const initialTaskKind = asTaskKind(setup.config?.taskKind);
   const [form, setForm] = useState(() => ({
     taskKind: initialTaskKind,
@@ -5786,7 +6410,30 @@ function SetupPanel({
     onBusyChange(saving || starting || exampleBusy);
     return () => onBusyChange(false);
   }, [exampleBusy, onBusyChange, saving, starting]);
+  const syncedConfig = useRef<unknown>(Symbol("unsynced"));
   useEffect(() => {
+    if (syncedConfig.current === setup.config) {
+      setForm((current) => {
+        const kind = asTaskKind(current.taskKind);
+        const matching = datasets.filter((dataset) => datasetTaskKind(dataset) === kind);
+        const has = (name: string) => targets.some((target) => target.name === name);
+        return {
+          ...current,
+          datasetVersion: matching.some((dataset) => dataset.version === current.datasetVersion)
+            ? current.datasetVersion
+            : matching[0]?.version || "",
+          extractionTarget: has(current.extractionTarget) ? current.extractionTarget : targets[0]?.name || "",
+          ocrTarget:
+            kind !== "document-json"
+              ? ""
+              : has(current.ocrTarget)
+                ? current.ocrTarget
+                : targets.find((target) => target.supportsVision)?.name || "",
+        };
+      });
+      return;
+    }
+    syncedConfig.current = setup.config;
     const taskKind =
       taskKindOverride.current ||
       asTaskKind(setup.config?.taskKind ?? form.taskKind);
@@ -5911,6 +6558,25 @@ function SetupPanel({
   const selectedExtractionTarget = targets.find(
     (target) => target.name === form.extractionTarget,
   );
+  /** Copy a configuration's prompts, schema, and rules into the in-app editors. */
+  const applyConfig = (example: SetupConfig) => {
+    setSourceMode("editor");
+    setForm((current) => ({
+      ...current,
+      baseConfigPath: "",
+      outputMode: example.outputMode ?? current.outputMode,
+      judgeTarget: currentTaskKind === "tool-calling" ? "" : current.judgeTarget,
+      judgeRubric:
+        currentTaskKind === "tool-calling" ? "" : (example.judgeRubric ?? current.judgeRubric),
+      schema: example.schema === undefined ? current.schema : editorText(example.schema),
+      stagePrompts: { ...current.stagePrompts, ...(example.stagePrompts || {}) },
+      fieldRules:
+        example.fieldRules === undefined ? current.fieldRules : editorText(example.fieldRules, "[]"),
+      tools: example.tools === undefined ? current.tools : editorText(example.tools, "[]"),
+      toolChoice: example.toolChoice ?? current.toolChoice,
+      toolCallOrder: example.toolCallOrder ?? current.toolCallOrder,
+    }));
+  };
   const loadSampleSettings = async () => {
     setExampleBusy(true);
     try {
@@ -5922,39 +6588,9 @@ function SetupPanel({
         candidate.config && typeof candidate.config === "object"
           ? candidate.config
           : (payload as SetupConfig);
-      setForm((current) => ({
-        ...current,
-        // Sample settings are copied into the native editors. Clear the
-        // advanced path so the copied values are the only active source.
-        baseConfigPath: "",
-        outputMode: example.outputMode ?? current.outputMode,
-        judgeTarget:
-          currentTaskKind === "tool-calling" ? "" : current.judgeTarget,
-        judgeRubric:
-          currentTaskKind === "tool-calling"
-            ? ""
-            : (example.judgeRubric ?? current.judgeRubric),
-        schema:
-          example.schema === undefined
-            ? current.schema
-            : editorText(example.schema),
-        stagePrompts: {
-          ...current.stagePrompts,
-          ...(example.stagePrompts || {}),
-        },
-        fieldRules:
-          example.fieldRules === undefined
-            ? current.fieldRules
-            : editorText(example.fieldRules, "[]"),
-        tools:
-          example.tools === undefined
-            ? current.tools
-            : editorText(example.tools, "[]"),
-        toolChoice: example.toolChoice ?? current.toolChoice,
-        toolCallOrder: example.toolCallOrder ?? current.toolCallOrder,
-      }));
+      applyConfig(example);
       onNotice(
-        `${TASK_KIND_LABELS[currentTaskKind]} sample settings loaded into the native editors. Your dataset and targets were kept.`,
+        `${TASK_KIND_LABELS[currentTaskKind]} example loaded into the editors. Your dataset and models were kept.`,
       );
     } catch (err) {
       onNotice(
@@ -6037,85 +6673,42 @@ function SetupPanel({
           : "[]",
     }));
   };
-  const saveConfig = async (): Promise<boolean> => {
+  const setupPayload = () => {
     const taskKind = asTaskKind(form.taskKind);
-    if (
-      taskKind === "document-json" &&
-      form.extractionSource === "ocr" &&
-      !form.ocrTarget
-    ) {
-      onNotice(
-        "Choose a vision-capable OCR target, or select reference transcription.",
-        "error",
-      );
-      return false;
-    }
-    if (
-      taskKind === "tool-calling" &&
-      !selectedExtractionTarget?.supportsTools
-    ) {
-      onNotice(
-        "Choose a target marked as tool-capable before saving a tool-calling run.",
-        "error",
-      );
-      return false;
-    }
-    const schema = parseEditorJson(form.schema);
     const fieldRules = parseEditorJson(form.fieldRules);
-    const tools = parseEditorJson(form.tools);
-    const fieldRulesPayload =
-      taskKind === "document-json" &&
-      form.fieldRules.trim() === "[]" &&
-      setup.config?.fieldRules === undefined
-        ? undefined
-        : fieldRules;
-    if (taskKind === "text-json") {
-      if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
-        onNotice(
-          "Enter a valid JSON object schema for the text workflow.",
-          "error",
-        );
-        return false;
-      }
-      if (!form.stagePrompts.extraction.trim()) {
-        onNotice("Add an extraction prompt for the text workflow.", "error");
-        return false;
-      }
-    }
-    if (taskKind === "tool-calling" && !form.stagePrompts.extraction.trim()) {
-      onNotice("Add tool-calling instructions before saving.", "error");
-      return false;
-    }
-    if (
-      taskKind !== "tool-calling" &&
-      ((form.fieldRules.trim() !== "" && !Array.isArray(fieldRules)) ||
-        (taskKind !== "document-json" && !Array.isArray(fieldRules)))
-    ) {
-      onNotice("Field rules must be a JSON array.", "error");
-      return false;
-    }
-    if (taskKind === "tool-calling") {
-      if (!Array.isArray(tools)) {
-        onNotice("Tool definitions must be a JSON array.", "error");
-        return false;
-      }
-      if (form.toolChoice !== "none" && tools.length === 0) {
-        onNotice(
-          "Add at least one tool or choose tool choice “none”.",
-          "error",
-        );
-        return false;
-      }
-    }
-    if (
-      taskKind !== "tool-calling" &&
-      form.judgeTarget &&
-      !form.judgeRubric.trim()
-    ) {
-      onNotice(
-        "Add a judge rubric when a semantic judge is configured.",
-        "error",
-      );
+    return {
+      ...form,
+      taskKind,
+      schema: parseEditorJson(form.schema),
+      stagePrompts: form.stagePrompts,
+      fieldRules:
+        taskKind === "tool-calling"
+          ? []
+          : taskKind === "document-json" &&
+              form.fieldRules.trim() === "[]" &&
+              setup.config?.fieldRules === undefined
+            ? undefined
+            : fieldRules,
+      tools: taskKind === "tool-calling" ? parseEditorJson(form.tools) : undefined,
+      toolChoice: form.toolChoice,
+      toolCallOrder: form.toolCallOrder,
+      judgeTarget: taskKind === "tool-calling" ? "" : form.judgeTarget,
+      judgeRubric: taskKind === "tool-calling" ? "" : form.judgeRubric,
+      outputMode: taskKind === "tool-calling" ? "prompted-json" : form.outputMode,
+      generation: {
+        temperature: Number(form.temperature),
+        maxTokens: Number(form.maxTokens),
+      },
+    };
+  };
+  const saveConfig = async (quiet = false): Promise<boolean> => {
+    const taskKind = asTaskKind(form.taskKind);
+    const issues = validateSetup(
+      { ...form, taskKind, checks: { schema: schemaCheck ?? undefined, tools: toolsCheck ?? undefined } },
+      targets.map((target) => ({ ...target, missingKey: targetMissingKey(target) })),
+    );
+    if (issues.length) {
+      onNotice(issues[0].message, "error");
       return false;
     }
     setSaving(true);
@@ -6123,34 +6716,12 @@ function SetupPanel({
       const result = await api<Setup>("/api/setup/config", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          ...form,
-          taskKind,
-          schema,
-          // Legacy document mode inherits the proven OCR/extraction prompts
-          // from its defaults or base config. Native text/tool modes submit
-          // their editors.
-          stagePrompts: form.stagePrompts,
-          fieldRules: taskKind === "tool-calling" ? [] : fieldRulesPayload,
-          tools: taskKind === "tool-calling" ? tools : undefined,
-          toolChoice: form.toolChoice,
-          toolCallOrder: form.toolCallOrder,
-          judgeTarget: taskKind === "tool-calling" ? "" : form.judgeTarget,
-          judgeRubric: taskKind === "tool-calling" ? "" : form.judgeRubric,
-          outputMode:
-            taskKind === "tool-calling" ? "prompted-json" : form.outputMode,
-          generation: {
-            temperature: Number(form.temperature),
-            maxTokens: Number(form.maxTokens),
-          },
-        }),
+        body: JSON.stringify(setupPayload()),
       });
       taskKindOverride.current = null;
       onSaved({ ...setup, ...result });
       setSavedFormKey(JSON.stringify(form));
-      onNotice(
-        "Run configuration saved. You can start it here or from your terminal.",
-      );
+      if (!quiet) onNotice("Settings saved. You can run them here or from a terminal.");
       return true;
     } catch (err) {
       onNotice(
@@ -6180,17 +6751,15 @@ function SetupPanel({
   const start = async () => {
     setStarting(true);
     try {
-      if (JSON.stringify(form) !== savedFormKey && !(await saveConfig()))
+      if (JSON.stringify(form) !== savedFormKey && !(await saveConfig(true)))
         return;
       const result = await api<{ runId?: string }>("/api/runs/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: "{}",
+        body: JSON.stringify(selectedExperimentId ? { experimentId: selectedExperimentId } : {}),
       });
-      onNotice("Evaluation started. Watch progress in Run history.");
       await onRefreshRuns();
       if (result.runId) await onOpenRun(result.runId);
-      else onNotice("Evaluation started. Open Runs to watch progress.");
     } catch (err) {
       onNotice(
         err instanceof Error ? err.message : "Could not start evaluation",
@@ -6198,6 +6767,20 @@ function SetupPanel({
       );
     } finally {
       setStarting(false);
+    }
+  };
+  const createInlineExperiment = async () => {
+    const name = inlineExperimentName.trim();
+    if (!name || creatingExperiment) return;
+    setCreatingExperiment(true);
+    try {
+      await onCreateExperiment(name);
+      setInlineExperimentName("");
+      onNotice(`Experiment “${name}” created and selected.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not create experiment", "error");
+    } finally {
+      setCreatingExperiment(false);
     }
   };
   const stop = async () => {
@@ -6216,558 +6799,1268 @@ function SetupPanel({
       );
     }
   };
+  const [view, setView] = useState<"guided" | "full">(() => {
+    try {
+      return window.localStorage.getItem("local-evals-setup-view") === "full" ? "full" : "guided";
+    } catch {
+      return "guided";
+    }
+  });
+  const changeView = (next: "guided" | "full") => {
+    setView(next);
+    try {
+      window.localStorage.setItem("local-evals-setup-view", next);
+    } catch {
+      /* View preference is best-effort. */
+    }
+  };
+  const [step, setStep] = useState<SetupStep>("type");
+  const [addingModel, setAddingModel] = useState(false);
+  const [importPathValue, setImportPathValue] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [newExperimentOpen, setNewExperimentOpen] = useState(false);
+  const [sourceMode, setSourceMode] = useState<"editor" | "file">(() => (form.baseConfigPath ? "file" : "editor"));
+  const [lastFilePath, setLastFilePath] = useState("");
+  const [preview, setPreview] = useState<{
+    path: string;
+    loading: boolean;
+    error?: string;
+    summary?: SetupConfig & { crossFieldRules?: unknown[] };
+    content?: Record<string, unknown>;
+  } | null>(null);
+  const [previewAttempt, setPreviewAttempt] = useState(0);
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [saveAsPath, setSaveAsPath] = useState("");
+  const [saveAsBusy, setSaveAsBusy] = useState(false);
+  useEffect(() => {
+    if (form.baseConfigPath) setSourceMode("file");
+  }, [form.baseConfigPath]);
+  const fileMode = sourceMode === "file";
+  const [schemaCheck, setSchemaCheck] = useState<SchemaCheck | null>(null);
+  const [toolsCheck, setToolsCheck] = useState<SchemaCheck | null>(null);
+  useEffect(() => {
+    const kind = currentTaskKind === "tool-calling" ? "tools" : "schema";
+    const setCheck = kind === "tools" ? setToolsCheck : setSchemaCheck;
+    if (fileMode) {
+      setCheck(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void api<SchemaCheck>("/api/schema-check", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          kind === "tools"
+            ? { kind, text: form.tools }
+            : { kind, text: form.schema, fieldRules: parseEditorJson(form.fieldRules) },
+        ),
+      })
+        .then((result) => !cancelled && setCheck(result))
+        .catch(() => !cancelled && setCheck(null));
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [fileMode, currentTaskKind, form.schema, form.fieldRules, form.tools]);
+  const toolCount = (() => {
+    const tools = parseEditorJson(form.tools);
+    return Array.isArray(tools) ? tools.length : 0;
+  })();
+  useEffect(() => {
+    const requested = form.baseConfigPath.trim();
+    if (!fileMode || !requested) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    setPreview((current) => ({ ...(current?.path === requested ? current : {}), path: requested, loading: true }));
+    const timer = window.setTimeout(() => {
+      void api<{ path: string; summary: SetupConfig; content: Record<string, unknown> }>(
+        `/api/config-file?path=${encodeURIComponent(requested)}`,
+      )
+        .then((result) => {
+          if (!cancelled) setPreview({ path: requested, loading: false, summary: result.summary, content: result.content });
+        })
+        .catch((error) => {
+          if (!cancelled)
+            setPreview({
+              path: requested,
+              loading: false,
+              error: error instanceof Error ? error.message : "Could not open this file.",
+            });
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [fileMode, form.baseConfigPath, previewAttempt]);
+  const useFile = () => {
+    setSourceMode("file");
+    setForm((current) => ({
+      ...current,
+      baseConfigPath: current.baseConfigPath || lastFilePath || sampleConfigPath,
+    }));
+  };
+  const editInApp = () => {
+    if (preview?.summary) {
+      applyConfig(preview.summary);
+      setLastFilePath(preview.path);
+      onNotice(`Copied ${preview.path} into the editors. Save as file to update it.`);
+    } else {
+      setSourceMode("editor");
+      setForm((current) => ({ ...current, baseConfigPath: "" }));
+    }
+  };
+  const saveAsFile = async (overwrite = false): Promise<void> => {
+    const target = saveAsPath.trim();
+    if (!target) return;
+    const blocking = issuesForStep(issues, "instructions");
+    if (blocking.length) {
+      onNotice(blocking[0].message, "error");
+      return;
+    }
+    setSaveAsBusy(true);
+    try {
+      const response = await fetch("/api/config-file", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: target, setup: setupPayload(), overwrite }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 409 && result.exists) {
+        if (window.confirm(`${target} already exists. Replace it with these settings?`)) {
+          setSaveAsBusy(false);
+          return saveAsFile(true);
+        }
+        return;
+      }
+      if (!response.ok) throw new Error(result.error || "Could not save the file.");
+      setLastFilePath(result.path);
+      setSaveAsOpen(false);
+      onNotice(`Saved ${result.path}. Choose “Use a configuration file” to run from it later.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not save the file.", "error");
+    } finally {
+      setSaveAsBusy(false);
+    }
+  };
+  const issues = validateSetup(
+    { ...form, taskKind: currentTaskKind, checks: { schema: schemaCheck ?? undefined, tools: toolsCheck ?? undefined } },
+    targets.map((target) => ({ ...target, missingKey: targetMissingKey(target) })),
+  );
+  const stepIndex = SETUP_STEPS.indexOf(step);
+  const selectedDataset = datasets.find((dataset) => dataset.version === form.datasetVersion);
+  const selectedOcrTarget = targets.find((target) => target.name === form.ocrTarget);
+  const busy = saving || starting || exampleBusy;
+  const advancedChanged = [
+    form.outputMode !== "prompted-json",
+    form.temperature !== "0.2",
+    form.maxTokens !== "2048",
+    currentTaskKind === "tool-calling" && form.toolChoice !== "auto",
+  ].filter(Boolean).length;
+  const importForWizard = async (datasetPath: string) => {
+    if (!datasetPath.trim()) return;
+    setImporting(true);
+    try {
+      const imported = await importDatasetPath(datasetPath.trim());
+      await onRefreshDatasets();
+      if (datasetTaskKind(imported) !== currentTaskKind) changeTaskKind(datasetTaskKind(imported));
+      setForm((current) => ({ ...current, datasetVersion: imported.version }));
+      setImportPathValue("");
+      if (datasetPath === SAMPLE_DATASETS[datasetTaskKind(imported)]) await loadSampleSettings();
+      onNotice(`${imported.name || "Dataset"} added.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Import failed", "error");
+    } finally {
+      setImporting(false);
+    }
+  };
+  const describeTarget = (target?: Target) =>
+    target ? target.name : "Not chosen";
+  const capabilityNote = (target: Target | undefined, need: "vision" | "tools" | "structured") => {
+    if (!target) return null;
+    const ok =
+      need === "vision" ? target.supportsVision : need === "tools" ? target.supportsTools : target.supportsStructuredOutput;
+    const text =
+      need === "vision"
+        ? ok ? "Can read images" : "Not marked as able to read images"
+        : need === "tools"
+          ? ok ? "Can call tools" : "Not marked as able to call tools"
+          : ok ? "Follows a JSON schema" : "Will be asked for JSON in the prompt";
+    return (
+      <small className={`capability-check ${ok ? "good" : need === "structured" ? "" : "bad"}`}>
+        {ok ? "✓" : need === "structured" ? "ℹ" : "⚠"} {text}
+      </small>
+    );
+  };
+
+  const typeCards = (
+    <fieldset className="choice-cards" aria-label="Evaluation type">
+      {(Object.keys(TASK_KIND_LABELS) as TaskKind[]).map((kind) => (
+        <label key={kind} className={`choice-card${currentTaskKind === kind ? " selected" : ""}`}>
+          <input
+            type="radio"
+            name="setup-task-kind"
+            checked={currentTaskKind === kind}
+            onChange={() => changeTaskKind(kind)}
+          />
+          <strong>{TASK_KIND_LABELS[kind]}</strong>
+          <span>{taskKindDescription(kind)}</span>
+          <small>
+            {kind === "document-json"
+              ? "Image → model reads it → JSON fields"
+              : kind === "text-json"
+                ? "Text → model → JSON fields"
+                : "Text + tools → model → proposed call"}
+          </small>
+        </label>
+      ))}
+    </fieldset>
+  );
+
+  const datasetChooser = (
+    <div className="setup-block">
+      {matchingDatasets.length > 0 ? (
+        <fieldset className="choice-list" aria-label="Dataset">
+          {matchingDatasets.map((dataset) => (
+            <label key={dataset.version} className={`choice-row${form.datasetVersion === dataset.version ? " selected" : ""}`}>
+              <input
+                type="radio"
+                name="setup-dataset"
+                checked={form.datasetVersion === dataset.version}
+                onChange={() => setForm({ ...form, datasetVersion: dataset.version })}
+              />
+              <span>
+                <strong>{dataset.name || "Untitled dataset"}</strong>
+                <small>
+                  {dataset.cases.length} {dataset.cases.length === 1 ? "case" : "cases"} ·{" "}
+                  {datasetHasExpected(dataset) ? "has expected answers" : "no expected answers"}
+                </small>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      ) : (
+        <p className="setup-empty">No {TASK_KIND_LABELS[currentTaskKind]} datasets yet. Add one below.</p>
+      )}
+      <div className="inline-add">
+        <button
+          type="button"
+          className="button secondary"
+          disabled={importing}
+          onClick={() => void importForWizard(SAMPLE_DATASETS[currentTaskKind])}
+        >
+          {importing ? "Adding…" : `Use the ${TASK_KIND_LABELS[currentTaskKind]} sample`}
+        </button>
+        <span className="inline-add-or">or import a file</span>
+        <div className="inline-form">
+          <input
+            aria-label="Dataset file path"
+            value={importPathValue}
+            onChange={(event) => setImportPathValue(event.target.value)}
+            placeholder="datasets/my-cases.jsonl"
+          />
+          <button
+            type="button"
+            className="button secondary"
+            disabled={importing || !importPathValue.trim()}
+            onClick={() => void importForWizard(importPathValue)}
+          >
+            Import
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const scoringControl = (
+    <div className="setup-block">
+      <span className="field-label">How should results be checked?</span>
+      <div className="segmented" role="radiogroup" aria-label="Scoring">
+        <button
+          type="button"
+          role="radio"
+          aria-checked={!form.inferenceOnly}
+          onClick={() => setForm({ ...form, inferenceOnly: false })}
+        >
+          <strong>Graded</strong>
+          <small>Compare with expected answers</small>
+        </button>
+        <button
+          type="button"
+          role="radio"
+          aria-checked={form.inferenceOnly}
+          onClick={() => setForm({ ...form, inferenceOnly: true })}
+        >
+          <strong>Save outputs only</strong>
+          <small>No scores, review answers later</small>
+        </button>
+      </div>
+      {selectedDataset && !datasetHasExpected(selectedDataset) && !form.inferenceOnly && (
+        <small className="form-warning">
+          Some cases in this dataset have no expected answer. Choose “Save outputs only”, or those cases will fail.
+        </small>
+      )}
+    </div>
+  );
+
+  const targetSelect = (
+    label: string,
+    value: string,
+    onChange: (value: string) => void,
+    options: Target[],
+    note: ReactNode,
+  ) => (
+    <div className="field">
+      <span className="field-label" id={`setup-field-${label.replace(/\W+/g, "-").toLowerCase()}`}>
+        {label}
+      </span>
+      <Dropdown
+        labelledBy={`setup-field-${label.replace(/\W+/g, "-").toLowerCase()}`}
+        value={value}
+        onChange={onChange}
+        options={targetOptions(options, label.includes("optional") ? "No judge" : "Choose a model")}
+      />
+      {note}
+    </div>
+  );
+
+  const modelChooser = (
+    <div className="setup-block">
+      {currentTaskKind === "document-json" && (
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={form.extractionSource === "reference"}
+            onChange={(event) =>
+              setForm({ ...form, extractionSource: event.target.checked ? "reference" : "ocr" })
+            }
+          />
+          My cases already include the document text (skip reading images)
+        </label>
+      )}
+      {currentTaskKind === "document-json" &&
+        form.extractionSource === "ocr" &&
+        targetSelect(
+          "Model that reads the image",
+          form.ocrTarget,
+          (ocrTarget) => setForm({ ...form, ocrTarget }),
+          targets.filter((target) => target.supportsVision),
+          targets.some((target) => target.supportsVision) ? (
+            capabilityNote(selectedOcrTarget, "vision")
+          ) : (
+            <small className="capability-check bad">⚠ No model is marked as able to read images. Add one below.</small>
+          ),
+        )}
+      {targetSelect(
+        currentTaskKind === "document-json" ? "Model that extracts the JSON" : "Model",
+        form.extractionTarget,
+        (extractionTarget) => setForm({ ...form, extractionTarget }),
+        targets,
+        capabilityNote(selectedExtractionTarget, currentTaskKind === "tool-calling" ? "tools" : "structured"),
+      )}
+      {addingModel ? (
+        <div className="inline-panel">
+          <div className="inline-panel-head">
+            <strong>Add a model</strong>
+            <button type="button" className="text-button" onClick={() => setAddingModel(false)}>
+              Close
+            </button>
+          </div>
+          <TargetForm
+            targets={targets}
+            onNotice={onNotice}
+            onSaved={(target, test) => {
+              setTargets([...targets.filter((item) => item.name !== target.name), target]);
+              setForm((current) => ({
+                ...current,
+                extractionTarget: target.name,
+                ocrTarget:
+                  current.taskKind === "document-json" && target.supportsVision ? target.name : current.ocrTarget,
+              }));
+              if (!test || test.ok) {
+                setAddingModel(false);
+                onNotice(`“${target.name}” ${test ? "connected and " : ""}selected.`);
+              }
+            }}
+          />
+        </div>
+      ) : (
+        <button type="button" className="button secondary inline-add-button" onClick={() => setAddingModel(true)}>
+          + Add a model
+        </button>
+      )}
+    </div>
+  );
+
+  const configLocked = fileMode;
+  const ruleRows = (rules: unknown) =>
+    Array.isArray(rules)
+      ? (rules as Record<string, unknown>[]).filter((rule) => rule && typeof rule === "object")
+      : [];
+  const configPreview = (
+    <div className="config-preview" aria-live="polite">
+      {!preview ? (
+        <p className="setup-hint">Enter the path of a .json file inside the project folder.</p>
+      ) : preview.loading && !preview.summary ? (
+        <p className="setup-hint">Opening {preview.path}…</p>
+      ) : preview.error ? (
+        <div className="alert error" role="alert">
+          <strong>Couldn't open {preview.path}.</strong> {preview.error}
+        </div>
+      ) : preview.summary ? (
+        <>
+          <header className="config-preview-head">
+            <div>
+              <span className="eyebrow">FILE CONTENTS</span>
+              <strong>{preview.path}</strong>
+            </div>
+            <div className="config-preview-actions">
+              <button type="button" className="text-button" onClick={() => setPreviewAttempt((value) => value + 1)}>
+                Reload
+              </button>
+              <button type="button" className="button secondary" onClick={editInApp}>
+                Edit in the app
+              </button>
+            </div>
+          </header>
+          <p className="setup-hint">
+            The file supplies the prompts, schema, and grading rules. Your dataset, models, and JSON mode come from
+            Setup.
+          </p>
+          {currentTaskKind === "document-json" && preview.summary.stagePrompts?.ocr && (
+            <section className="config-preview-section">
+              <h5>Reading prompt</h5>
+              <p className="config-prompt">{preview.summary.stagePrompts.ocr}</p>
+            </section>
+          )}
+          <section className="config-preview-section">
+            <h5>{currentTaskKind === "tool-calling" ? "Instructions" : "Extraction prompt"}</h5>
+            <p className="config-prompt">{preview.summary.stagePrompts?.extraction || "Not set"}</p>
+          </section>
+          {currentTaskKind === "tool-calling" ? (
+            <section className="config-preview-section">
+              <h5>Tools ({Array.isArray(preview.summary.tools) ? preview.summary.tools.length : 0})</h5>
+              <pre className="config-json">
+                <HighlightedJson text={editorText(preview.summary.tools, "[]")} />
+              </pre>
+            </section>
+          ) : (
+            <section className="config-preview-section">
+              <h5>Fields to return (schema)</h5>
+              {preview.summary.schema ? (
+                <pre className="config-json">
+                  <HighlightedJson text={editorText(preview.summary.schema)} />
+                </pre>
+              ) : (
+                <p className="setup-hint">No schema. The model is only asked for JSON in the prompt.</p>
+              )}
+            </section>
+          )}
+          {ruleRows(preview.summary.fieldRules).length > 0 && (
+            <section className="config-preview-section">
+              <h5>How fields are graded</h5>
+              <table className="config-rules">
+                <thead>
+                  <tr>
+                    <th scope="col">Field</th>
+                    <th scope="col">Match</th>
+                    <th scope="col">Tolerance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ruleRows(preview.summary.fieldRules).map((rule, index) => (
+                    <tr key={`${String(rule.path)}-${index}`}>
+                      <td>
+                        <code>{String(rule.path ?? "")}</code>
+                      </td>
+                      <td>{String(rule.match ?? "exact")}</td>
+                      <td>{rule.tolerance === undefined ? "—" : String(rule.tolerance)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+          {ruleRows(preview.content?.crossFieldRules).length > 0 && (
+            <section className="config-preview-section">
+              <h5>Cross-field checks</h5>
+              <ul className="config-checks">
+                {ruleRows(preview.content?.crossFieldRules).map((rule, index) => (
+                  <li key={index}>{String(rule.name ?? rule.type ?? "Check")}</li>
+                ))}
+              </ul>
+            </section>
+          )}
+          <details className="config-raw">
+            <summary>Show the whole file</summary>
+            <pre className="config-json">
+              <HighlightedJson text={JSON.stringify(preview.content ?? {}, null, 2)} />
+            </pre>
+          </details>
+        </>
+      ) : null}
+    </div>
+  );
+  const instructions = (
+    <div className="setup-block">
+      <div className="segmented" role="radiogroup" aria-label="Where the instructions come from">
+        <button type="button" role="radio" aria-checked={!fileMode} onClick={editInApp}>
+          <strong>Edit in the app</strong>
+          <small>Write the prompt and schema here</small>
+        </button>
+        <button type="button" role="radio" aria-checked={fileMode} onClick={useFile}>
+          <strong>Use a configuration file</strong>
+          <small>Read them from a .json file in the project</small>
+        </button>
+      </div>
+      {fileMode ? (
+        <>
+          <label>
+            Configuration file
+            <input
+              value={form.baseConfigPath}
+              placeholder={sampleConfigPath}
+              spellCheck={false}
+              onChange={(event) => setForm({ ...form, baseConfigPath: event.target.value })}
+            />
+          </label>
+          {configPreview}
+        </>
+      ) : (
+        <>
+          {currentTaskKind === "document-json" && form.extractionSource === "ocr" && (
+            <label>
+              Reading prompt
+              <textarea
+                value={form.stagePrompts.ocr}
+                rows={3}
+                onChange={(event) =>
+                  setForm({ ...form, stagePrompts: { ...form.stagePrompts, ocr: event.target.value } })
+                }
+                placeholder={DEFAULT_DOCUMENT_OCR_PROMPT}
+              />
+              <small>Tells the image model what to transcribe.</small>
+            </label>
+          )}
+          <label>
+            {currentTaskKind === "tool-calling"
+              ? "Instructions for the model"
+              : currentTaskKind === "document-json"
+                ? "Extraction prompt"
+                : "Prompt"}
+            <textarea
+              value={form.stagePrompts.extraction}
+              rows={4}
+              onChange={(event) =>
+                setForm({ ...form, stagePrompts: { ...form.stagePrompts, extraction: event.target.value } })
+              }
+              placeholder={
+                currentTaskKind === "tool-calling"
+                  ? "Read the request and propose the right tool calls."
+                  : currentTaskKind === "document-json"
+                    ? DEFAULT_DOCUMENT_EXTRACTION_PROMPT
+                    : DEFAULT_TEXT_PROMPT
+              }
+            />
+            <small>
+              {currentTaskKind === "tool-calling"
+                ? "Say when to call each tool and what the arguments mean. Tools are never executed."
+                : "Tell the model which fields to return."}
+            </small>
+          </label>
+          {currentTaskKind !== "tool-calling" && schemaFieldsMissing(form.schema, selectedDataset).length > 0 && (
+            <div className="alert warning" role="status">
+              The schema doesn't include fields your expected answers use (
+              {schemaFieldsMissing(form.schema, selectedDataset).slice(0, 4).join(", ")}). Select{" "}
+              <strong>Use example</strong> for the sample dataset, or add them to the schema.
+            </div>
+          )}
+          {currentTaskKind !== "tool-calling" ? (
+            <label>
+              Fields to return (JSON schema)
+              <textarea
+                className={`json-editor${schemaCheck && !schemaCheck.ok ? " invalid" : ""}`}
+                value={form.schema}
+                spellCheck={false}
+                aria-invalid={schemaCheck ? !schemaCheck.ok : undefined}
+                onChange={(event) => setForm({ ...form, schema: event.target.value })}
+              />
+              <SchemaStatus check={schemaCheck} validLabel="Valid JSON Schema" />
+            </label>
+          ) : (
+            <label>
+              Tools the model can use (JSON)
+              <textarea
+                className={`json-editor tools-editor${toolsCheck && !toolsCheck.ok ? " invalid" : ""}`}
+                value={form.tools}
+                spellCheck={false}
+                aria-invalid={toolsCheck ? !toolsCheck.ok : undefined}
+                onChange={(event) => setForm({ ...form, tools: event.target.value })}
+              />
+              <SchemaStatus
+                check={toolsCheck}
+                validLabel={`${toolCount} valid tool definition${toolCount === 1 ? "" : "s"}`}
+              />
+              <small>
+                An array of <code>{`{ "type": "function", "function": { … } }`}</code>. Don't put secrets here.
+              </small>
+            </label>
+          )}
+          <div className="config-preset-actions">
+            <button type="button" className="button secondary" disabled={exampleBusy} onClick={() => void loadSampleSettings()}>
+              {exampleBusy ? "Loading example…" : "Use example"}
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              aria-expanded={saveAsOpen}
+              onClick={() => {
+                setSaveAsPath(saveAsPath || lastFilePath || `configs/${currentTaskKind}-settings.json`);
+                setSaveAsOpen((value) => !value);
+              }}
+            >
+              Save as file…
+            </button>
+          </div>
+          {saveAsOpen && (
+            <div className="inline-panel save-as-panel">
+              <label>
+                Save these settings to
+                <div className="inline-form">
+                  <input
+                    autoFocus
+                    value={saveAsPath}
+                    spellCheck={false}
+                    onChange={(event) => setSaveAsPath(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void saveAsFile();
+                      }
+                      if (event.key === "Escape") setSaveAsOpen(false);
+                    }}
+                    placeholder="configs/receipts.json"
+                  />
+                  <button
+                    type="button"
+                    className="button primary"
+                    disabled={saveAsBusy || !saveAsPath.trim() || issuesForStep(issues, "instructions").length > 0}
+                    onClick={() => void saveAsFile()}
+                  >
+                    {saveAsBusy ? "Saving…" : "Save"}
+                  </button>
+                </div>
+                {issuesForStep(issues, "instructions").length > 0 ? (
+                  <small className="save-as-blocked">Can't save yet. {issuesForStep(issues, "instructions")[0].message}</small>
+                ) : (
+                  <small>
+                    A .json file inside the project folder. It includes the prompts, schema, rules, and model names, never
+                    API keys.
+                  </small>
+                )}
+              </label>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+
+  const advancedFields = (
+    <AdvancedOptions changed={advancedChanged} defaultOpen>
+      <div className="options">
+        {currentTaskKind !== "tool-calling" && (
+          <div className="field">
+            <span className="field-label" id="setup-json-mode">JSON mode</span>
+            <Dropdown
+              labelledBy="setup-json-mode"
+              value={form.outputMode}
+              onChange={(outputMode) => setForm({ ...form, outputMode })}
+              options={[
+                { value: "prompted-json", label: "Ask in the prompt", detail: "Works with any model" },
+                {
+                  value: "schema-constrained-json",
+                  label: "Enforce the schema",
+                  detail: "Needs a model that follows a JSON schema",
+                },
+              ]}
+            />
+          </div>
+        )}
+        <label>
+          Temperature
+          <input
+            type="number"
+            min="0"
+            max="2"
+            step="0.1"
+            value={form.temperature}
+            onChange={(event) => setForm({ ...form, temperature: event.target.value })}
+          />
+        </label>
+        <label>
+          Max tokens
+          <input
+            type="number"
+            min="1"
+            value={form.maxTokens}
+            onChange={(event) => setForm({ ...form, maxTokens: event.target.value })}
+          />
+          <small>Raise this if answers get cut off.</small>
+        </label>
+        {currentTaskKind === "tool-calling" && (
+          <>
+            <div className="field">
+              <span className="field-label" id="setup-tool-choice">Tool choice</span>
+              <Dropdown
+                labelledBy="setup-tool-choice"
+                value={form.toolChoice}
+                onChange={(toolChoice) => setForm({ ...form, toolChoice: toolChoice as ToolChoice })}
+                options={[
+                  { value: "auto", label: "Model decides" },
+                  { value: "required", label: "Must call a tool" },
+                  { value: "none", label: "No tools" },
+                ]}
+              />
+            </div>
+          </>
+        )}
+      </div>
+    </AdvancedOptions>
+  );
+
+  const suggestFieldRules = () => {
+    const schema = parseEditorJson(form.schema) as { properties?: Record<string, { type?: unknown; format?: unknown }> } | undefined;
+    const properties = schema?.properties && typeof schema.properties === "object" ? schema.properties : {};
+    const existing = parseEditorJson(form.fieldRules);
+    const rules: Record<string, unknown>[] = Array.isArray(existing) ? [...existing] : [];
+    const covered = new Set(rules.map((rule) => rule?.path));
+    let added = 0;
+    for (const [field, definition] of Object.entries(properties)) {
+      if (covered.has(field)) continue;
+      const types = Array.isArray(definition?.type) ? definition.type : [definition?.type];
+      const rule: Record<string, unknown> = { path: field };
+      if (types.includes("number") || types.includes("integer")) Object.assign(rule, { match: "number", tolerance: 0.01 });
+      else if (definition?.format === "date" || /date/i.test(field)) rule.match = "date";
+      else if (types.includes("string") && /(summary|description|notes?|comment|reason|explanation)$/i.test(field))
+        rule.match = "ignore";
+      else if (types.includes("string"))
+        rule.match = /(id|number|no|num|code|sku|order|reference|ref)$/i.test(field) ? "exact" : "normalized";
+      else continue;
+      rules.push(rule);
+      added += 1;
+    }
+    if (!added) {
+      onNotice(
+        Object.keys(properties).length
+          ? "Every text, number, and date field in the schema already has a rule."
+          : "Add a schema with properties first, then suggest rules.",
+      );
+      return;
+    }
+    setForm({ ...form, fieldRules: JSON.stringify(rules, null, 2) });
+    onNotice(`Added ${added} rule${added === 1 ? "" : "s"} from the schema. Adjust any that should be stricter.`);
+  };
+  const fieldRuleCount = (() => {
+    const rules = parseEditorJson(form.fieldRules);
+    return Array.isArray(rules) ? rules.length : 0;
+  })();
+  const grading = form.inferenceOnly ? (
+    <div className="setup-block">
+      <div className="callout">
+        <strong>Nothing to grade.</strong> This run only saves the model's answers. To score them, your cases need
+        expected answers.
+      </div>
+      {scoringControl}
+    </div>
+  ) : (
+    <div className="setup-block grading-block">
+      <p className="setup-hint">
+        {currentTaskKind === "tool-calling"
+          ? "Each answer's tool calls are compared with the expected tool calls: the tool names and every argument."
+          : "Each answer is compared with the case's expected answer. A case passes when the JSON is valid, matches the schema, and every expected field matches."}
+      </p>
+      {currentTaskKind === "tool-calling" ? (
+<>
+            <div className="field">
+              <span className="field-label" id="setup-call-order">Call order</span>
+              <Dropdown
+                labelledBy="setup-call-order"
+                value={form.toolCallOrder}
+                onChange={(toolCallOrder) => setForm({ ...form, toolCallOrder: toolCallOrder as ToolCallOrder })}
+                options={[
+                  { value: "ordered", label: "Order matters" },
+                  { value: "unordered", label: "Any order" },
+                ]}
+              />
+            </div>
+          <p className="setup-hint">Arguments are compared field by field. Tools are never executed.</p>
+        </>
+      ) : (
+        <>
+          <section className="grading-section">
+            <header>
+              <h4>How fields are compared</h4>
+              <span className="tag">{fieldRuleCount ? `${fieldRuleCount} rule${fieldRuleCount === 1 ? "" : "s"}` : "Exact match"}</span>
+            </header>
+            <p className="setup-hint">
+              Fields without a rule must match exactly, and fields that aren't in the expected answer count as
+              errors. Add rules to allow rounding, ignore spacing and case, compare dates, let a field be left out,
+              or skip free-text fields entirely.
+            </p>
+            <dl className="match-legend">
+              <div>
+                <dt>exact</dt>
+                <dd>Identical values (the default)</dd>
+              </div>
+              <div>
+                <dt>normalized</dt>
+                <dd>Text equal after trimming, collapsing spaces, ignoring case</dd>
+              </div>
+              <div>
+                <dt>number</dt>
+                <dd>Within <code>tolerance</code>, e.g. 0.01</dd>
+              </div>
+              <div>
+                <dt>date</dt>
+                <dd>Same calendar date</dd>
+              </div>
+              <div>
+                <dt>ignore</dt>
+                <dd>Not graded, e.g. a free-text summary</dd>
+              </div>
+            </dl>
+            {configLocked ? (
+              <div className="callout">The configuration file supplies the field rules. Review them in the Instructions step.</div>
+            ) : (
+              <>
+                <label>
+                  <span className="sr-only">Field rules (JSON)</span>
+                  <textarea
+                    className="json-editor field-rules-editor"
+                    value={form.fieldRules}
+                    spellCheck={false}
+                    onChange={(event) => setForm({ ...form, fieldRules: event.target.value })}
+                    placeholder='[ { "path": "total", "match": "number", "tolerance": 0.01 } ]'
+                  />
+                  <small>
+                    Use <code>*</code> for any list position, e.g. <code>lineItems.*.amount</code>. Add{" "}
+                    <code>"required": false</code> to let a field be left out.
+                  </small>
+                </label>
+                <div className="config-preset-actions">
+                  <button type="button" className="button secondary" onClick={suggestFieldRules}>
+                    Suggest rules from schema
+                  </button>
+                  {fieldRuleCount > 0 && (
+                    <button type="button" className="text-button" onClick={() => setForm({ ...form, fieldRules: "[]" })}>
+                      Clear rules
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </section>
+          <section className="grading-section">
+            <header>
+              <h4>Judge model</h4>
+              <span className="tag">{form.judgeTarget ? "On" : "Off"}</span>
+            </header>
+            <p className="setup-hint">
+              Optional. A second model reads each expected and actual answer and gives its own verdict, shown next to the
+              field checks. Useful for things exact rules can't capture.
+            </p>
+            {targetSelect(
+              "Judge model (optional)",
+              form.judgeTarget,
+              (judgeTarget) => setForm({ ...form, judgeTarget }),
+              targets,
+              null,
+            )}
+            {form.judgeTarget && (
+              <label>
+                What should the judge check?
+                <textarea
+                  required
+                  rows={3}
+                  value={form.judgeRubric}
+                  onChange={(event) => setForm({ ...form, judgeRubric: event.target.value })}
+                  placeholder="Is the vendor the legal entity rather than a brand name? Is every field supported by the document?"
+                />
+              </label>
+            )}
+          </section>
+        </>
+      )}
+    </div>
+  );
+
+  const experimentField = (
+    <div className="setup-block">
+      <div className="field">
+        <span className="field-label" id="setup-experiment-label">
+          Experiment <span className="optional">optional</span>
+        </span>
+        <Dropdown
+          labelledBy="setup-experiment-label"
+          disabled={creatingExperiment || starting}
+          value={newExperimentOpen ? "__new__" : selectedExperimentId || ""}
+          onChange={(next) => {
+            if (next === "__new__") {
+              setNewExperimentOpen(true);
+              return;
+            }
+            setNewExperimentOpen(false);
+            onSelectExperiment(next || null);
+          }}
+          options={[
+            { value: "", label: "Leave ungrouped" },
+            ...experiments.map((experiment) => ({
+              value: experiment.experimentId,
+              label: experiment.name,
+              detail: `${experiment.runCount} run${experiment.runCount === 1 ? "" : "s"}`,
+            })),
+            { value: "__new__", label: "+ New experiment…" },
+          ]}
+        />
+        <small>Group runs you want to compare, like different models on one dataset.</small>
+      </div>
+      {newExperimentOpen && (
+        <div className="inline-form">
+          <input
+            aria-label="New experiment name"
+            autoFocus
+            value={inlineExperimentName}
+            onChange={(event) => setInlineExperimentName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void createInlineExperiment().then(() => setNewExperimentOpen(false));
+              }
+            }}
+            placeholder="e.g. Receipt models"
+          />
+          <button
+            type="button"
+            className="button secondary"
+            disabled={!inlineExperimentName.trim() || creatingExperiment}
+            onClick={() => void createInlineExperiment().then(() => setNewExperimentOpen(false))}
+          >
+            {creatingExperiment ? "Creating…" : "Create"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  const summaryItems: { step: SetupStep; label: string; value: string }[] = [
+    { step: "type", label: "Type", value: TASK_KIND_LABELS[currentTaskKind] },
+    {
+      step: "data",
+      label: "Dataset",
+      value: selectedDataset
+        ? `${selectedDataset.name || "Untitled"} · ${selectedDataset.cases.length} ${selectedDataset.cases.length === 1 ? "case" : "cases"}`
+        : "Not chosen",
+    },
+    {
+      step: "model",
+      label: "Model",
+      value:
+        currentTaskKind === "document-json" && form.extractionSource === "ocr"
+          ? `${describeTarget(selectedOcrTarget)} → ${describeTarget(selectedExtractionTarget)}`
+          : describeTarget(selectedExtractionTarget),
+    },
+    {
+      step: "grading",
+      label: "Grading",
+      value: form.inferenceOnly
+        ? "None (outputs only)"
+        : currentTaskKind === "tool-calling"
+          ? form.toolCallOrder === "unordered"
+            ? "Tool calls, any order"
+            : "Tool calls, in order"
+          : [
+              configLocked ? "Rules from file" : fieldRuleCount ? `${fieldRuleCount} field rule${fieldRuleCount === 1 ? "" : "s"}` : "Exact match",
+              form.judgeTarget ? `judge: ${form.judgeTarget}` : "",
+            ]
+              .filter(Boolean)
+              .join(" · "),
+    },
+  ];
+  const summary = (onEdit?: (step: SetupStep) => void) => (
+    <dl className="setup-summary">
+      {summaryItems.map((item) => {
+        const missing = issuesForStep(issues, item.step).length > 0 && item.value === "Not chosen";
+        return (
+          <div key={item.label} className={missing ? "missing" : undefined}>
+            <dt>{item.label}</dt>
+            <dd>{item.value}</dd>
+            {onEdit && (
+              <button type="button" className="text-button" onClick={() => onEdit(item.step)}>
+                Edit
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </dl>
+  );
+
+  const runActions = (
+    <div className="setup-run-actions">
+      {issues.length > 0 && (
+        <ul className="step-issues" role="status">
+          {issues.map((issue) => (
+            <li key={issue.message}>
+              {issue.message}
+              {view === "guided" && issue.step !== step && (
+                <>
+                  {" "}
+                  <button type="button" className="text-button" onClick={() => setStep(issue.step)}>
+                    Fix
+                  </button>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="command-actions">
+        <button
+          type="button"
+          className="button primary"
+          disabled={busy || creatingExperiment || activeExecution.active || issues.length > 0}
+          onClick={() => void start()}
+        >
+          {starting
+            ? "Starting…"
+            : activeExecution.active
+              ? activeExecution.phase === "starting"
+                ? "Preparing…"
+                : "Evaluation running"
+              : "Run evaluation"}
+        </button>
+        <button type="button" className="button secondary" disabled={busy} onClick={() => void saveConfig()}>
+          {saving ? "Saving…" : "Save without running"}
+        </button>
+        {activeExecution.canStop && (
+          <button
+            type="button"
+            className="button secondary destructive"
+            disabled={activeExecution.phase === "stopping"}
+            onClick={() => void stop()}
+          >
+            {activeExecution.phase === "stopping" ? "Stopping…" : "Stop run"}
+          </button>
+        )}
+      </div>
+      {activeExecution.active && !activeExecution.canStop && (
+        <small className="execution-note">A run started from a terminal is active. Stop it from that terminal.</small>
+      )}
+      {JSON.stringify(form) !== savedFormKey && !issues.length && (
+        <small className="execution-note">Running saves these settings first.</small>
+      )}
+      <details className="terminal-option">
+        <summary>Run from a terminal</summary>
+        <div className="command">
+          <code tabIndex={0} aria-label="Terminal run command">
+            {command}
+          </code>
+          <button type="button" onClick={() => void copy()} aria-label="Copy run command">
+            ⧉
+          </button>
+        </div>
+        <small>Uses the saved settings: {setup.configPath || "save first"}</small>
+      </details>
+    </div>
+  );
+
+  const stepMeta: Record<SetupStep, { title: string; sub: string; body: ReactNode }> = {
+    type: { title: "What are you evaluating?", sub: "Pick the kind of input in your dataset.", body: typeCards },
+    data: {
+      title: "Choose your data",
+      sub: "The cases the model will answer.",
+      body: (
+        <>
+          {datasetChooser}
+          {scoringControl}
+        </>
+      ),
+    },
+    model: { title: "Pick a model", sub: "The model whose answers you want to check.", body: modelChooser },
+    instructions: {
+      title: "Tell the model what to do",
+      sub: "Start from the example, then adjust it for your data.",
+      body: instructions,
+    },
+    grading: {
+      title: "How answers are graded",
+      sub: "Decide how strict the checks are. The defaults work for most datasets.",
+      body: grading,
+    },
+    review: {
+      title: "Review & run",
+      sub: "Check your choices, optionally group the run, then start it.",
+      body: (
+        <>
+          {summary((target) => setStep(target))}
+          {experimentField}
+          {advancedFields}
+          {runActions}
+        </>
+      ),
+    },
+  };
+  const currentIssues = issuesForStep(issues, step);
+  const stepLabels: Record<SetupStep, string> = {
+    type: "Type",
+    data: "Data",
+    model: "Model",
+    instructions: "Instructions",
+    grading: "Grading",
+    review: "Review & run",
+  };
+
   return (
     <>
       <PageTitle
-        eyebrow="GET STARTED"
-        title="Prepare an evaluation"
-        sub="Choose your dataset and models, then start a run."
+        eyebrow="NEW EVALUATION"
+        title="Set up a run"
+        sub={view === "guided" ? "Six short steps. You can change anything before running." : "All settings on one page."}
+        action={
+          <div className="view-switch" role="radiogroup" aria-label="Setup view">
+            <button type="button" role="radio" aria-checked={view === "guided"} onClick={() => changeView("guided")}>
+              Guided
+            </button>
+            <button type="button" role="radio" aria-checked={view === "full"} onClick={() => changeView("full")}>
+              Full form
+            </button>
+          </div>
+        }
       />
-      <div className="setup-layout">
-        <form className="panel setup-form" onSubmit={save}>
-          <fieldset disabled={saving || starting || exampleBusy}>
-            <section
-              className="form-section"
-              aria-labelledby="setup-data-heading"
-            >
-              <div className="section-heading">
-                <h3 id="setup-data-heading">Dataset & configuration</h3>
-                <p>Choose the input type, dataset, and evaluation rules.</p>
-              </div>
-              <label>
-                Evaluation type
-                <select
-                  aria-label="Evaluation type"
-                  value={currentTaskKind}
-                  onChange={(e) => changeTaskKind(e.target.value as TaskKind)}
-                >
-                  {(Object.keys(TASK_KIND_LABELS) as TaskKind[]).map((kind) => (
-                    <option value={kind} key={kind}>
-                      {TASK_KIND_LABELS[kind]}
-                    </option>
+      <fieldset className="setup-fieldset" disabled={busy}>
+        {view === "guided" ? (
+          <div className="wizard">
+            <ol className="wizard-steps" aria-label="Steps">
+              {SETUP_STEPS.map((item, index) => {
+                const done = index < stepIndex && issuesForStep(issues, item).length === 0;
+                const reachable = index <= stepIndex || SETUP_STEPS.slice(0, index).every((prior) => issuesForStep(issues, prior).length === 0);
+                return (
+                  <li key={item} className={item === step ? "current" : done ? "done" : undefined}>
+                    <button
+                      type="button"
+                      aria-current={item === step ? "step" : undefined}
+                      disabled={!reachable}
+                      onClick={() => setStep(item)}
+                    >
+                      <span className="wizard-step-dot" aria-hidden="true">
+                        {done ? "✓" : index + 1}
+                      </span>
+                      {stepLabels[item]}
+                    </button>
+                  </li>
+                );
+              })}
+            </ol>
+            <div className={`wizard-columns${step === "review" ? " single" : ""}`}>
+            <section className="panel wizard-panel" aria-labelledby="wizard-step-title">
+              <header className="wizard-head">
+                <span className="eyebrow">
+                  Step {stepIndex + 1} of {SETUP_STEPS.length}
+                </span>
+                <h3 id="wizard-step-title" tabIndex={-1}>
+                  {stepMeta[step].title}
+                </h3>
+                <p>{stepMeta[step].sub}</p>
+              </header>
+              <div className="wizard-body">{stepMeta[step].body}</div>
+              {step !== "review" && currentIssues.length > 0 && (
+                <ul className="step-issues" role="status">
+                  {currentIssues.map((issue) => (
+                    <li key={issue.message}>{issue.message}</li>
                   ))}
-                </select>
-                <small>{taskKindDescription(currentTaskKind)}</small>
-              </label>
-              <label>
-                Evaluation configuration
-                <input
-                  value={form.baseConfigPath}
-                  placeholder="sample-data/config.json"
-                  onChange={(e) =>
-                    setForm({ ...form, baseConfigPath: e.target.value })
-                  }
-                />
-                <small>
-                  Advanced fixture path for schema, prompts, and grading rules.
-                  Leave blank to use the saved configuration or native editors.
-                  Sample path: <code>{sampleConfigPath}</code>
-                </small>
-              </label>
-              <div className="config-preset-actions">
+                </ul>
+              )}
+              <footer className="wizard-nav">
                 <button
                   type="button"
-                  className="button mini"
-                  disabled={exampleBusy}
-                  onClick={() => void loadSampleSettings()}
+                  className="button secondary"
+                  disabled={stepIndex === 0}
+                  onClick={() => setStep(SETUP_STEPS[stepIndex - 1])}
                 >
-                  {exampleBusy ? "Loading sample…" : "Load sample settings"}
+                  ← Back
                 </button>
-                {currentTaskKind !== "document-json" && (
+                {step !== "review" && (
                   <button
                     type="button"
-                    className="text-button"
-                    onClick={() =>
-                      setForm((current) => ({
-                        ...current,
-                        baseConfigPath: "",
-                      }))
-                    }
+                    className="button primary"
+                    disabled={currentIssues.length > 0}
+                    onClick={() => setStep(SETUP_STEPS[stepIndex + 1])}
                   >
-                    Use native editors
+                    Next →
                   </button>
                 )}
-              </div>
-              {form.baseConfigPath && (
-                <div className="alert warning" role="status">
-                  This fixture path remains active, so native schema, prompt,
-                  field-rule, and tool-definition edits are disabled and will
-                  not be used. Clear it to edit those values here.
-                </div>
-              )}
-              <label>
-                Dataset
-                <select
-                  required
-                  value={form.datasetVersion}
-                  onChange={(e) =>
-                    setForm({ ...form, datasetVersion: e.target.value })
-                  }
-                >
-                  <option value="">Select dataset</option>
-                  {matchingDatasets.map((d) => (
-                    <option key={d.version} value={d.version}>
-                      {d.name} · {d.version.slice(0, 8)}
-                    </option>
-                  ))}
-                </select>
-                {!matchingDatasets.length && (
-                  <small className="form-warning">
-                    No {TASK_KIND_LABELS[currentTaskKind].toLowerCase()} dataset
-                    is imported yet. Use a quick sample on Datasets.
-                  </small>
-                )}
-              </label>
+              </footer>
             </section>
-            <section
-              className="form-section"
-              aria-labelledby="setup-pipeline-heading"
-            >
-              <div className="section-heading">
-                <h3 id="setup-pipeline-heading">Pipeline</h3>
-                <p>Assign a model to each stage.</p>
-              </div>
-              {currentTaskKind === "document-json" && (
-                <div className="stage">
-                  <span>01</span>
-                  <div>
-                    <h3>OCR target</h3>
-                    <p>
-                      Vision model; optional for reference transcription runs.
-                    </p>
-                  </div>
-                  <select
-                    aria-label="OCR target"
-                    required={form.extractionSource === "ocr"}
-                    value={form.ocrTarget}
-                    onChange={(e) =>
-                      setForm({ ...form, ocrTarget: e.target.value })
-                    }
-                  >
-                    <option value="">Select target</option>
-                    {targets
-                      .filter((t) => t.supportsVision)
-                      .map((t) => (
-                        <option key={t.name}>{t.name}</option>
-                      ))}
-                  </select>
-                </div>
-              )}
-              <div className="stage">
-                <span>{currentTaskKind === "document-json" ? "02" : "01"}</span>
-                <div>
-                  <h3>
-                    {currentTaskKind === "text-json"
-                      ? "Text JSON target"
-                      : currentTaskKind === "tool-calling"
-                        ? "Tool-calling target"
-                        : "Extraction target"}
-                  </h3>
-                  <p>
-                    {currentTaskKind === "text-json"
-                      ? "Converts input text into structured JSON."
-                      : currentTaskKind === "tool-calling"
-                        ? "Proposes function calls without executing them."
-                        : "Converts transcription into structured JSON."}
-                  </p>
-                </div>
-                <select
-                  aria-label={`${TASK_KIND_LABELS[currentTaskKind]} target`}
-                  required
-                  value={form.extractionTarget}
-                  onChange={(e) =>
-                    setForm({ ...form, extractionTarget: e.target.value })
-                  }
-                >
-                  <option value="">Select target</option>
-                  {targets.map((t) => (
-                    <option key={t.name}>{t.name}</option>
-                  ))}
-                </select>
-                {currentTaskKind === "tool-calling" && (
-                  <small
-                    className={
-                      selectedExtractionTarget?.supportsTools
-                        ? "capability-check good"
-                        : "capability-check bad"
-                    }
-                  >
-                    {selectedExtractionTarget?.supportsTools
-                      ? "✓ Tools advertised by this target"
-                      : "⚠ Choose a target marked as tool-capable in Targets"}
-                  </small>
-                )}
-                {currentTaskKind === "text-json" && (
-                  <small className="capability-check">
-                    {selectedExtractionTarget?.supportsStructuredOutput
-                      ? "✓ Structured JSON advertised"
-                      : "Prompted JSON is available; choose a structured-output target for stronger guarantees"}
-                  </small>
-                )}
-              </div>
-              {currentTaskKind !== "tool-calling" && (
-                <div className="stage">
-                  <span>
-                    {currentTaskKind === "document-json" ? "03" : "02"}
-                  </span>
-                  <div>
-                    <h3>Optional judge</h3>
-                    <p>Stored separately from deterministic grading.</p>
-                  </div>
-                  <select
-                    aria-label="Semantic judge target"
-                    value={form.judgeTarget}
-                    onChange={(e) =>
-                      setForm({ ...form, judgeTarget: e.target.value })
-                    }
-                  >
-                    <option value="">No semantic judge</option>
-                    {targets.map((t) => (
-                      <option key={t.name}>{t.name}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-            </section>
-            {currentTaskKind === "text-json" && (
-              <section
-                className="form-section native-editor-section"
-                aria-labelledby="setup-text-json-heading"
-              >
-                <div className="section-heading">
-                  <h3 id="setup-text-json-heading">Text JSON instructions</h3>
-                  <p>
-                    These native settings replace receipt/document extraction
-                    prompts when no fixture path is selected.
-                  </p>
-                </div>
-                <label>
-                  JSON schema
-                  <textarea
-                    aria-label="JSON schema"
-                    className="json-editor"
-                    value={form.schema}
-                    disabled={Boolean(form.baseConfigPath)}
-                    onChange={(e) =>
-                      setForm({ ...form, schema: e.target.value })
-                    }
-                    spellCheck={false}
-                    aria-describedby="text-json-schema-help"
-                  />
-                  <small id="text-json-schema-help">
-                    Example object schema is prefilled. Edit it to match the
-                    selected text dataset.
-                  </small>
-                </label>
-                <label>
-                  Extraction prompt
-                  <textarea
-                    aria-label="Extraction prompt"
-                    value={form.stagePrompts.extraction}
-                    disabled={Boolean(form.baseConfigPath)}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        stagePrompts: {
-                          ...form.stagePrompts,
-                          extraction: e.target.value,
-                        },
-                      })
-                    }
-                    placeholder={DEFAULT_TEXT_PROMPT}
-                  />
-                </label>
-              </section>
+            {step !== "review" && (
+              <aside className="panel wizard-aside" aria-label="Your choices so far">
+                <span className="eyebrow">YOUR RUN</span>
+                {summary((target) => setStep(target))}
+                <p className="setup-hint">
+                  {issues.length
+                    ? `${issues.length} thing${issues.length === 1 ? "" : "s"} left before you can run.`
+                    : "Everything is ready. Review and run when you're done."}
+                </p>
+              </aside>
             )}
-            {currentTaskKind === "tool-calling" && (
-              <section
-                className="form-section native-editor-section"
-                aria-labelledby="setup-tools-heading"
-              >
-                <div className="section-heading">
-                  <h3 id="setup-tools-heading">Tool definitions</h3>
-                  <p>
-                    OpenAI function definitions are sent to the model as
-                    proposals; the runner never executes them.
-                  </p>
-                </div>
-                <label>
-                  Tools JSON
-                  <textarea
-                    aria-label="Tools JSON"
-                    className="json-editor tools-editor"
-                    value={form.tools}
-                    disabled={Boolean(form.baseConfigPath)}
-                    onChange={(e) =>
-                      setForm({ ...form, tools: e.target.value })
-                    }
-                    spellCheck={false}
-                    aria-describedby="tools-json-help"
-                  />
-                  <small id="tools-json-help">
-                    Use an array of{" "}
-                    <code>{`{ type: "function", function: { ... } }`}</code>{" "}
-                    definitions. A clear lookup-order example is prefilled.
-                  </small>
-                </label>
-                <label>
-                  Tool-calling instructions
-                  <textarea
-                    aria-label="Tool-calling instructions"
-                    value={form.stagePrompts.extraction}
-                    disabled={Boolean(form.baseConfigPath)}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        stagePrompts: {
-                          ...form.stagePrompts,
-                          extraction: e.target.value,
-                        },
-                      })
-                    }
-                    placeholder="Read the input and propose the appropriate tool calls. Do not execute tools."
-                    aria-describedby="tool-calling-prompt-help"
-                  />
-                  <small id="tool-calling-prompt-help">
-                    Tell the model when to call each function and what the
-                    arguments should represent. The runner only records calls;
-                    it never executes them.
-                  </small>
-                </label>
-                <div className="options tool-options">
-                  <label>
-                    Tool choice
-                    <select
-                      value={form.toolChoice}
-                      onChange={(e) =>
-                        setForm({
-                          ...form,
-                          toolChoice: e.target.value as ToolChoice,
-                        })
-                      }
-                    >
-                      <option value="auto">Auto</option>
-                      <option value="required">Required</option>
-                      <option value="none">None</option>
-                    </select>
-                  </label>
-                  <label>
-                    Tool call order
-                    <select
-                      value={form.toolCallOrder}
-                      onChange={(e) =>
-                        setForm({
-                          ...form,
-                          toolCallOrder: e.target.value as ToolCallOrder,
-                        })
-                      }
-                    >
-                      <option value="ordered">Ordered</option>
-                      <option value="unordered">Unordered</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="callout tool-safety">
-                  Tool calls are untrusted model output. Keep tools narrow, do
-                  not put secrets in definitions, and validate arguments in any
-                  downstream system before execution.
-                </div>
-              </section>
-            )}
-            {currentTaskKind !== "tool-calling" && (
-              <details className="advanced-editor">
-                <summary>Advanced grading rules</summary>
-                <label>
-                  Field rules JSON
-                  <textarea
-                    aria-label="Field rules JSON"
-                    className="json-editor"
-                    value={form.fieldRules}
-                    disabled={Boolean(form.baseConfigPath)}
-                    onChange={(e) =>
-                      setForm({ ...form, fieldRules: e.target.value })
-                    }
-                    spellCheck={false}
-                  />
-                  <small>
-                    Usually <code>[]</code> for text and document workflows;
-                    fixture configs may provide field-level grading rules.
-                  </small>
-                </label>
-              </details>
-            )}
-            <section
-              className="form-section"
-              aria-labelledby="setup-options-heading"
-            >
-              <div className="section-heading">
-                <h3 id="setup-options-heading">Run settings</h3>
-                <p>Set the evaluation mode and generation limits.</p>
-              </div>
-              <div className="options">
-                <label>
-                  Evaluation mode
-                  <select
-                    value={form.inferenceOnly ? "inference" : "graded"}
-                    onChange={(e) =>
-                      setForm({
-                        ...form,
-                        inferenceOnly: e.target.value === "inference",
-                      })
-                    }
-                  >
-                    <option value="graded">Graded evaluation</option>
-                    <option value="inference">
-                      Inference-only (outputs stored, not scored)
-                    </option>
-                  </select>
-                  <small>
-                    {form.inferenceOnly
-                      ? "Outputs are stored for review but are not scored."
-                      : "Outputs are stored for review and scored against the expected results."}
-                  </small>
-                </label>
-                {currentTaskKind === "document-json" && (
-                  <label>
-                    Extraction source
-                    <select
-                      value={form.extractionSource}
-                      onChange={(e) =>
-                        setForm({ ...form, extractionSource: e.target.value })
-                      }
-                    >
-                      <option value="ocr">OCR transcription</option>
-                      <option value="reference">Reference transcription</option>
-                    </select>
-                  </label>
-                )}
-                {currentTaskKind !== "tool-calling" && (
-                  <label>
-                    Output mode
-                    <select
-                      value={form.outputMode}
-                      onChange={(e) =>
-                        setForm({ ...form, outputMode: e.target.value })
-                      }
-                    >
-                      <option value="prompted-json">Prompted JSON</option>
-                      <option value="schema-constrained-json">
-                        Schema-constrained JSON
-                      </option>
-                    </select>
-                  </label>
-                )}
-                <label>
-                  Temperature
-                  <input
-                    type="number"
-                    min="0"
-                    max="2"
-                    step="0.1"
-                    value={form.temperature}
-                    onChange={(e) =>
-                      setForm({ ...form, temperature: e.target.value })
-                    }
-                  />
-                </label>
-                <label>
-                  Max tokens
-                  <input
-                    type="number"
-                    min="1"
-                    value={form.maxTokens}
-                    onChange={(e) =>
-                      setForm({ ...form, maxTokens: e.target.value })
-                    }
-                  />
-                </label>
-              </div>
-              {currentTaskKind !== "tool-calling" && (
-                <label>
-                  Judge rubric{" "}
-                  {form.judgeTarget && (
-                    <span className="optional">required with judge</span>
-                  )}
-                  <textarea
-                    required={Boolean(form.judgeTarget)}
-                    value={form.judgeRubric}
-                    onChange={(e) =>
-                      setForm({ ...form, judgeRubric: e.target.value })
-                    }
-                    placeholder="What should the semantic judge verify?"
-                  />
-                </label>
-              )}
-            </section>
-            <div className="setup-actions">
-              <button className="button secondary" type="submit">
-                {saving ? "Saving…" : "Save run configuration"}
-              </button>
-              {JSON.stringify(form) !== savedFormKey && (
-                <small className="execution-note" role="status">
-                  Unsaved changes. Starting a run will save this configuration
-                  first.
-                </small>
-              )}
             </div>
-          </fieldset>
-        </form>
-        <aside className="panel command-card">
-          <span className="eyebrow">READY TO RUN</span>
-          <h3>Run evaluation</h3>
-          <p>
-            Start this configuration and follow live progress, logs, and results
-            in Runs.
-          </p>
-          <div className="command-actions">
-            <button
-              className="button primary"
-              disabled={saving || starting || activeExecution.active}
-              onClick={() => void start()}
+          </div>
+        ) : (
+          <div className="setup-layout">
+            <form
+              className="panel setup-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void saveConfig();
+              }}
             >
-              {starting
-                ? "Starting…"
-                : activeExecution.active
-                  ? activeExecution.phase === "starting"
-                    ? "Preparing evaluation"
-                    : "Evaluation running"
-                  : "Run evaluation now"}
-            </button>
-            {activeExecution.canStop && (
-              <button
-                className="button secondary destructive"
-                disabled={activeExecution.phase === "stopping"}
-                onClick={() => void stop()}
-              >
-                {activeExecution.phase === "stopping"
-                  ? "Stopping…"
-                  : "Stop run"}
-              </button>
-            )}
-            {activeExecution.active && !activeExecution.canStop && (
-              <small className="execution-note">
-                A terminal-owned run is active. Stop it from that terminal.
-              </small>
-            )}
+              <section className="form-section">
+                <h3>1 · What are you evaluating?</h3>
+                {typeCards}
+              </section>
+              <section className="form-section">
+                <h3>2 · Data</h3>
+                {datasetChooser}
+                {scoringControl}
+              </section>
+              <section className="form-section">
+                <h3>3 · Model</h3>
+                {modelChooser}
+              </section>
+              <section className="form-section">
+                <h3>4 · Instructions</h3>
+                {instructions}
+              </section>
+              <section className="form-section">
+                <h3>5 · Grading</h3>
+                {grading}
+              </section>
+              {advancedFields}
+            </form>
+            <aside className="panel command-card">
+              <span className="eyebrow">SUMMARY</span>
+              <h3>Ready to run?</h3>
+              {summary()}
+              {experimentField}
+              {runActions}
+            </aside>
           </div>
-          <div className="callout">
-            Before running, make sure your configured targets are available.
-            Saved credentials are loaded from the encrypted local vault.
-          </div>
-          <details className="terminal-option">
-            <summary>Run from your terminal</summary>
-            <div className="command">
-              <code tabIndex={0} aria-label="Terminal run command">
-                {command}
-              </code>
-              <button onClick={() => void copy()} aria-label="Copy run command">
-                ⧉
-              </button>
-            </div>
-            <small>Config: {setup.configPath || "not saved yet"}</small>
-          </details>
-        </aside>
-      </div>
+        )}
+      </fieldset>
     </>
   );
 }
@@ -6799,4 +8092,5 @@ function Empty({
     </div>
   );
 }
+applyTheme(readTheme());
 createRoot(document.getElementById("root")!).render(<App />);

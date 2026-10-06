@@ -14,6 +14,17 @@ describe("grading", () => {
     );
     expect(result.passed).toBe(true);
   });
+  it("fails extra fields unless a rule ignores them", () => {
+    const expected = { category: "billing", urgency: "high" };
+    const actual = { category: "billing", urgency: "high", summary: "Charged twice." };
+    const strict = gradeJson(expected, actual, undefined, []);
+    expect(strict.passed).toBe(false);
+    expect(strict.failures[0]).toMatchObject({ path: "summary", kind: "extra" });
+    const ignored = gradeJson(expected, actual, undefined, [{ path: "summary", match: "ignore" }]);
+    expect(ignored.passed).toBe(true);
+    expect(ignored.fieldAccuracy).toBe(1);
+    expect(gradeJson({ ...expected, summary: "x" }, expected, undefined, [{ path: "summary", match: "ignore" }]).passed).toBe(true);
+  });
   it("reports malformed JSON and OCR references", () => {
     expect(gradeJson({}, undefined, undefined, []).failures[0].kind).toBe(
       "malformed-json",

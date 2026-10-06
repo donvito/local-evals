@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
@@ -270,6 +270,33 @@ describe("storage and server integration", () => {
       expect(traversal).not.toBe(200);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("moved data folders", () => {
+  it("resolves imported image paths from an old folder to this database's assets", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "evalforge-moved-"));
+    await mkdir(path.join(dir, "assets"));
+    await writeFile(path.join(dir, "assets", "abc.png"), "png");
+    const oldPath = path.join(dir, "renamed-away", ".localevals", "assets", "abc.png");
+    const db = new DatabaseStore(path.join(dir, "app.db"));
+    try {
+      db.saveDataset({
+        version: "moved",
+        name: "Moved",
+        cases: [
+          { caseId: "one", imagePath: oldPath, expected: {} },
+          { caseId: "two", imagePath: path.join(dir, "elsewhere", "missing.png"), expected: {} },
+        ],
+      } as any);
+      const [first, second] = db.getDataset("moved").cases;
+      expect(first.imagePath).toBe(path.join(dir, "assets", "abc.png"));
+      expect(second.imagePath).toBe(path.join(dir, "elsewhere", "missing.png"));
+      expect(db.listDatasets()[0].cases[0].imagePath).toBe(path.join(dir, "assets", "abc.png"));
+    } finally {
+      db.close();
       await rm(dir, { recursive: true, force: true });
     }
   });

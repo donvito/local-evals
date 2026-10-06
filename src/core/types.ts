@@ -25,7 +25,7 @@ export type ToolCallExpectation = {
 
 export type FieldRule = {
   path: string;
-  match?: "exact" | "normalized" | "number" | "date";
+  match?: "exact" | "normalized" | "number" | "date" | "ignore";
   tolerance?: number;
   required?: boolean;
   uniqueKey?: string;

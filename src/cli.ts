@@ -9,6 +9,7 @@ import { compareRuns, markdownReport } from "./core/reports.js";
 import { startServer } from "./server.js";
 import * as providers from "./core/providers.js";
 import { backupAppData, restoreAppData } from "./storage/backup.js";
+import { CLI_PREFIX, DEFAULT_DB_PATH, formatCommandHelp, formatHelp } from "./cli-help.js";
 
 function parse(args: string[]) {
   const positionals: string[] = [],
@@ -23,21 +24,19 @@ function parse(args: string[]) {
   }
   return { positionals, flags };
 }
-const usage = () =>
-  console.log(
-    "localevals\nUsage: npm run localevals -- <command> [options]\n  init\n  import <manifest.jsonl>\n  target add <target.json>\n  target list\n  target test <name> [--vision true]\n  run <manifest-or-dataset-version> <config.json> [--concurrency 1] [--threshold 0.9]\n  inspect [run-id]\n  compare <left-run> <right-run>\n  export <run-id> [--format json|markdown] [--out report.json]\n  serve [--port 4173]\nAll commands accept --db <path>.",
-  );
+const isHelpFlag = (value: string) => value === "--help" || value === "-h";
+function printHelp(topic?: string) {
+  if (!topic) return console.log(formatHelp());
+  const help = formatCommandHelp(topic);
+  if (!help) throw new Error(`Unknown command: ${topic}. Run "${CLI_PREFIX} help" to see all commands.`);
+  console.log(help);
+}
 export async function main(args = process.argv.slice(2)) {
   const [command, ...rest] = args;
-  if (!command || command === "help" || command === "--help") {
-    usage();
-    console.log(
-      "App data:\n  backup --out <new-backup-directory> [--db <path>]\n  restore <backup-directory> --to <new-data-directory>",
-    );
-    return;
-  }
+  if (!command || command === "help" || isHelpFlag(command)) return printHelp(rest[0]);
+  if (rest.some(isHelpFlag)) return printHelp(command);
   const { positionals: p, flags: f } = parse(rest);
-  const dbPath = path.resolve(f.db ?? ".localevals/evalforge.db"),
+  const dbPath = path.resolve(f.db ?? DEFAULT_DB_PATH),
     assetRoot = path.join(path.dirname(dbPath), "assets");
   if (command === "serve") {
     await startServer(
@@ -232,7 +231,7 @@ export async function main(args = process.argv.slice(2)) {
       }
       return;
     }
-    throw new Error("Unknown command: " + command);
+    throw new Error(`Unknown command: ${command}. Run "${CLI_PREFIX} help" to see all commands.`);
   } finally {
     db.close();
   }

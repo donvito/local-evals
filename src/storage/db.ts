@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { CaseResult, RunConfig } from "../core/types.js";
@@ -200,13 +200,28 @@ const MIGRATIONS: Array<[number, string]> = [
       ALTER TABLE dataset_jobs ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 600;
     `,
   ],
+  [
+    7,
+    `
+      CREATE TABLE experiments (
+        experiment_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      ALTER TABLE runs ADD COLUMN experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE SET NULL;
+      CREATE INDEX runs_experiment_id_idx ON runs(experiment_id);
+    `,
+  ],
 ];
 
 export class DatabaseStore {
   readonly db: SqliteDatabase;
   private readonly vault: CredentialVault;
+  private readonly assetRoot: string | null;
 
   constructor(path: string) {
+    this.assetRoot = path === ":memory:" ? null : join(dirname(resolve(path)), "assets");
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     if (path !== ":memory:" && existsSync(path)) {
       const probe = new Database(path, { readonly: true, fileMustExist: true });
@@ -261,6 +276,7 @@ export class DatabaseStore {
     config: RunConfig,
     datasetVersion: string,
     snapshot: object = {},
+    experimentId: string | null = null,
   ): void {
     registerSecrets(
       [config.ocrTarget, config.extractionTarget, config.judgeTarget].filter(
@@ -269,14 +285,14 @@ export class DatabaseStore {
     );
     const createdAt = new Date().toISOString();
     const insertRun = this.db.prepare(
-      "INSERT INTO runs (run_id, dataset_version, created_at) VALUES (?, ?, ?)",
+      "INSERT INTO runs (run_id, dataset_version, created_at, experiment_id) VALUES (?, ?, ?, ?)",
     );
     const insertConfig = this.db.prepare(
       "INSERT INTO config_snapshots (run_id, config_json) VALUES (?, ?)",
     );
 
     this.db.transaction(() => {
-      insertRun.run(runId, datasetVersion, createdAt);
+      insertRun.run(runId, datasetVersion, createdAt, experimentId);
       insertConfig.run(runId, serializeConfig(config));
       this.db
         .prepare(
@@ -310,10 +326,11 @@ export class DatabaseStore {
   listRuns() {
     const rows = this.db
       .prepare(
-        `
-      SELECT r.run_id, r.dataset_version, r.created_at, COUNT(c.case_id) AS case_count,
-        SUM(CASE WHEN json_extract(c.result_json, '$.grade.passed') = 1 THEN 1 ELSE 0 END) AS passed_count
-      FROM runs r LEFT JOIN case_results c ON c.run_id = r.run_id GROUP BY r.run_id ORDER BY r.created_at DESC
+      `
+      SELECT r.run_id, r.dataset_version, r.created_at, r.experiment_id, e.name AS experiment_name, COUNT(c.case_id) AS case_count,
+        SUM(CASE WHEN json_extract(c.result_json, '$.grade.passed') = 1 THEN 1 ELSE 0 END) AS passed_count,
+        json_extract(d.manifest_json, '$.name') AS dataset_name
+      FROM runs r LEFT JOIN experiments e ON e.experiment_id = r.experiment_id LEFT JOIN datasets d ON d.version = r.dataset_version LEFT JOIN case_results c ON c.run_id = r.run_id GROUP BY r.run_id ORDER BY r.created_at DESC
     `,
       )
       .all() as Array<Record<string, any>>;
@@ -322,7 +339,13 @@ export class DatabaseStore {
       return {
         runId: row.run_id,
         datasetVersion: row.dataset_version,
+        datasetName: row.dataset_name ?? null,
+        taskKind: run.config.taskKind ?? "document-json",
+        targetName: run.config.extractionTarget?.name ?? null,
+        modelName: run.config.extractionTarget?.model ?? null,
         createdAt: row.created_at,
+        experimentId: row.experiment_id ?? null,
+        experimentName: row.experiment_name ?? null,
         caseCount: row.case_count,
         passedCount: run.config.inferenceOnly ? null : (row.passed_count ?? 0),
         inferenceOnly: run.config.inferenceOnly === true,
@@ -337,8 +360,9 @@ export class DatabaseStore {
     const row = this.db
       .prepare(
         `
-      SELECT r.*, c.config_json
+      SELECT r.*, e.name AS experiment_name, c.config_json
       FROM runs r
+      LEFT JOIN experiments e ON e.experiment_id = r.experiment_id
       JOIN config_snapshots c ON c.run_id = r.run_id
       WHERE r.run_id = ?
     `,
@@ -353,10 +377,12 @@ export class DatabaseStore {
       | undefined;
     if (!row) return undefined;
     const config = JSON.parse(row.config_json) as RunConfig;
-    const cases = this.getRunCases(runId).map((item) => ({
-      ...item.result,
-      ocrGrade: item.ocrGrade,
-    }));
+    const cases = this.relocateCases({
+      cases: this.getRunCases(runId).map((item) => ({
+        ...item.result,
+        ocrGrade: item.ocrGrade,
+      })),
+    }).cases;
     const snapshot = JSON.parse(row.snapshot_json);
     let status = row.status;
     let error = row.error;
@@ -393,6 +419,8 @@ export class DatabaseStore {
       runId: row.run_id,
       datasetVersion: row.dataset_version,
       createdAt: row.created_at,
+      experimentId: row.experiment_id ?? null,
+      experimentName: row.experiment_name ?? null,
       config,
       cases,
       snapshot,
@@ -410,6 +438,90 @@ export class DatabaseStore {
           ...JSON.parse(a.attempt_json),
         })),
     };
+  }
+
+  /** Imported images keep absolute paths. If the data folder was moved or the
+   * project renamed, point them at the same file in this database's assets. */
+  private relocateAsset(file: string) {
+    if (!this.assetRoot || !isAbsolute(file) || existsSync(file)) return file;
+    const parts = file.split(/[\\/]/);
+    if (parts[parts.length - 2] !== "assets") return file;
+    const candidate = join(this.assetRoot, parts[parts.length - 1]);
+    return existsSync(candidate) ? candidate : file;
+  }
+  private relocateCases<T>(value: T): T {
+    const cases = (value as { cases?: unknown })?.cases;
+    if (Array.isArray(cases))
+      for (const item of cases)
+        if (item && typeof item.imagePath === "string") item.imagePath = this.relocateAsset(item.imagePath);
+    return value;
+  }
+
+  private normalizeExperimentName(name: string): string {
+    if (typeof name !== "string") throw new Error("Experiment name is required.");
+    const normalized = name.trim();
+    if (!normalized) throw new Error("Experiment name cannot be empty.");
+    if (normalized.length > 120) throw new Error("Experiment name must be 120 characters or fewer.");
+    return normalized;
+  }
+
+  listExperiments() {
+    return (this.db.prepare(`
+      SELECT e.experiment_id, e.name, e.created_at, e.updated_at, COUNT(r.run_id) AS run_count
+      FROM experiments e LEFT JOIN runs r ON r.experiment_id = e.experiment_id
+      GROUP BY e.experiment_id ORDER BY e.created_at DESC
+    `).all() as Array<any>).map((row) => ({
+      experimentId: row.experiment_id,
+      name: row.name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      runCount: Number(row.run_count ?? 0),
+    }));
+  }
+
+  createExperiment(name: string) {
+    const normalized = this.normalizeExperimentName(name);
+    const experimentId = randomUUID();
+    const now = new Date().toISOString();
+    try {
+      this.db.prepare("INSERT INTO experiments(experiment_id,name,created_at,updated_at) VALUES(?,?,?,?)").run(experimentId, normalized, now, now);
+    } catch (error: any) {
+      if (error?.code === "SQLITE_CONSTRAINT_UNIQUE") throw new Error("An experiment with that name already exists.");
+      throw error;
+    }
+    return this.getExperiment(experimentId)!;
+  }
+
+  getExperiment(experimentId: string) {
+    const row = this.db.prepare(`SELECT e.experiment_id, e.name, e.created_at, e.updated_at, COUNT(r.run_id) AS run_count FROM experiments e LEFT JOIN runs r ON r.experiment_id=e.experiment_id WHERE e.experiment_id=? GROUP BY e.experiment_id`).get(experimentId) as any;
+    return row ? { experimentId: row.experiment_id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at, runCount: Number(row.run_count ?? 0) } : undefined;
+  }
+
+  renameExperiment(experimentId: string, name: string) {
+    if (!this.getExperiment(experimentId)) throw new Error("Experiment not found.");
+    const normalized = this.normalizeExperimentName(name);
+    try {
+      this.db.prepare("UPDATE experiments SET name=?,updated_at=? WHERE experiment_id=?").run(normalized, new Date().toISOString(), experimentId);
+    } catch (error: any) {
+      if (error?.code === "SQLITE_CONSTRAINT_UNIQUE") throw new Error("An experiment with that name already exists.");
+      throw error;
+    }
+    return this.getExperiment(experimentId)!;
+  }
+
+  deleteExperiment(experimentId: string) {
+    if (!this.getExperiment(experimentId)) throw new Error("Experiment not found.");
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE runs SET experiment_id=NULL WHERE experiment_id=?").run(experimentId);
+      this.db.prepare("DELETE FROM experiments WHERE experiment_id=?").run(experimentId);
+    })();
+  }
+
+  setRunExperiment(runId: string, experimentId: string | null) {
+    if (!this.getRun(runId)) throw new Error("Run not found.");
+    if (experimentId !== null && !this.getExperiment(experimentId)) throw new Error("Experiment not found.");
+    this.db.prepare("UPDATE runs SET experiment_id=? WHERE run_id=?").run(experimentId, runId);
+    return this.getRun(runId)!;
   }
 
   updateRunSnapshot(runId: string, snapshot: object) {
@@ -511,13 +623,13 @@ export class DatabaseStore {
     return this.db
       .prepare("SELECT manifest_json FROM datasets ORDER BY rowid DESC")
       .all()
-      .map((r: any) => JSON.parse(r.manifest_json));
+      .map((r: any) => this.relocateCases(JSON.parse(r.manifest_json)));
   }
   getDataset(version: string): any {
     const row = this.db
       .prepare("SELECT manifest_json FROM datasets WHERE version=?")
       .get(version) as any;
-    return row ? JSON.parse(row.manifest_json) : undefined;
+    return row ? this.relocateCases(JSON.parse(row.manifest_json)) : undefined;
   }
   renameDataset(version: string, name: string): any {
     const trimmed = name.trim();
@@ -728,6 +840,10 @@ export class DatabaseStore {
       )
       .run(candidate.name, JSON.stringify(stored));
   }
+  deleteTarget(name: string) {
+    const result = this.db.prepare("DELETE FROM targets WHERE name=?").run(name);
+    if (!result.changes) throw new Error("Target not found.");
+  }
   listTargets(): any[] {
     return this.db
       .prepare("SELECT config_json FROM targets ORDER BY name")
@@ -861,6 +977,8 @@ type RunRow = {
   dataset_version: string;
   created_at: string;
   config_json: string;
+  experiment_id?: string | null;
+  experiment_name?: string | null;
 };
 
 type CaseResultRow = {

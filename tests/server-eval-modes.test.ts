@@ -1,5 +1,5 @@
 import { it, expect } from "vitest";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { startServer } from "../src/server.js";
@@ -228,6 +228,111 @@ it("respects fixture ownership, explicit detachment, and inherited tool semantic
     expect(
       (await (await fetch(url + "/api/setup")).json()).config.baseConfigPath,
     ).toBeUndefined();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("previews a configuration file and saves app settings as a new, credential-free file", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "evalforge-config-file-"));
+  const dbPath = path.join(dir, "app.db");
+  const db = new DatabaseStore(dbPath);
+  db.saveTarget({ name: "local", model: "model", baseUrl: "http://127.0.0.1:1234/v1" }, "secret-key");
+  db.saveDataset({
+    name: "Text",
+    version: "text-v1",
+    taskKind: "text-json",
+    cases: [{ caseId: "a", inputText: "name: Ada", expected: { name: "Ada" } }],
+  });
+  db.close();
+  const server = await startServer(dbPath, 0, dir);
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const save = (data: unknown) =>
+    fetch(url + "/api/config-file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    });
+  const setup = {
+    taskKind: "text-json",
+    datasetVersion: "text-v1",
+    extractionTarget: "local",
+    extractionSource: "reference",
+    outputMode: "prompted-json",
+    schema: { type: "object", properties: { name: { type: "string" } } },
+    stagePrompts: { extraction: "Return the name as JSON." },
+    fieldRules: [],
+  };
+  try {
+    const created = await save({ path: "configs/names.json", setup });
+    expect(created.status).toBe(200);
+    expect(await created.json()).toMatchObject({ path: path.join("configs", "names.json") });
+    const written = await readFile(path.join(dir, "configs", "names.json"), "utf8");
+    expect(written).not.toContain("secret-key");
+    expect(written).not.toContain("baseConfigPath");
+    expect(JSON.parse(written).stagePrompts.extraction).toBe("Return the name as JSON.");
+
+    const preview = await fetch(url + "/api/config-file?path=configs/names.json");
+    expect(preview.status).toBe(200);
+    const body = await preview.json();
+    expect(body.summary.stagePrompts.extraction).toBe("Return the name as JSON.");
+    expect(body.content.extractionTarget).toMatchObject({ name: "local", model: "model" });
+    expect(JSON.stringify(body)).not.toContain("secret-key");
+
+    const again = await save({ path: "configs/names.json", setup });
+    expect(again.status).toBe(409);
+    expect((await again.json()).exists).toBe(true);
+    expect((await save({ path: "configs/names.json", setup, overwrite: true })).status).toBe(200);
+
+    expect((await save({ path: "../outside.json", setup })).status).toBe(400);
+    expect((await save({ path: "configs/names.txt", setup })).status).toBe(400);
+    expect((await fetch(url + "/api/config-file?path=missing.json")).status).toBe(404);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("rejects saving settings whose schema is not a valid JSON Schema", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "evalforge-schema-check-"));
+  const dbPath = path.join(dir, "app.db");
+  const db = new DatabaseStore(dbPath);
+  db.saveTarget({ name: "local", model: "model", baseUrl: "http://127.0.0.1:1234/v1" });
+  db.saveDataset({
+    name: "Text",
+    version: "text-v1",
+    taskKind: "text-json",
+    cases: [{ caseId: "a", inputText: "name: Ada", expected: { name: "Ada" } }],
+  });
+  db.close();
+  const server = await startServer(dbPath, 0, dir);
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const setup = {
+    taskKind: "text-json",
+    datasetVersion: "text-v1",
+    extractionTarget: "local",
+    extractionSource: "reference",
+    outputMode: "prompted-json",
+    schema: { type: "object", properties: { name: { type: "text" } } },
+    stagePrompts: { extraction: "Return the name." },
+    fieldRules: [],
+  };
+  try {
+    for (const [route, body] of [
+      ["/api/setup/config", setup],
+      ["/api/config-file", { path: "configs/bad.json", setup }],
+    ] as const) {
+      const response = await fetch(url + route, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toMatch(/^The schema isn't valid at \/properties\/name\/type: /);
+    }
+    await expect(readFile(path.join(dir, "configs", "bad.json"))).rejects.toThrow();
+    await expect(readdir(path.join(dir, "configs"))).rejects.toThrow();
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(dir, { recursive: true, force: true });

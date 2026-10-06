@@ -237,6 +237,8 @@ function compareNode(
   count: { checks: number; passed: number },
 ): void {
   const rule = ruleAt(path, rules);
+  // "ignore" fields (free text such as a summary) are neither required nor compared.
+  if (rule?.match === "ignore") return;
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual))
       return leaf(expected, actual, path, rule, failures, count);
@@ -350,7 +352,10 @@ function compareNode(
         count,
       );
     for (const key of Object.keys(actual))
-      if (!Object.hasOwn(expected, key)) {
+      if (
+        !Object.hasOwn(expected, key) &&
+        ruleAt(path ? `${path}.${key}` : key, rules)?.match !== "ignore"
+      ) {
         count.checks += 1;
         addFailure(
           failures,
@@ -388,6 +393,58 @@ export function compileSchema(schema: object): any {
       : new AjvCtor({ allErrors: true });
   validator.addFormat("date", { type: "string", validate: schemaDate });
   return validator.compile(schema);
+}
+
+export type SchemaDefinitionError = { path: string; message: string };
+
+/** Every problem with a schema definition, checked the same way runs compile it. */
+export function schemaDefinitionErrors(schema: object): SchemaDefinitionError[] {
+  const schemaId = (schema as { $schema?: unknown }).$schema;
+  const Ajv2020Ctor = (Ajv2020Module as any).default ?? Ajv2020Module;
+  const AjvCtor = (AjvModule as any).default ?? AjvModule;
+  const validator =
+    typeof schemaId === "string" && schemaId.includes("2020-12")
+      ? new Ajv2020Ctor({ allErrors: true })
+      : new AjvCtor({ allErrors: true });
+  validator.addFormat("date", { type: "string", validate: schemaDate });
+  try {
+    if (!validator.validateSchema(schema)) {
+      const errors: any[] = validator.errors ?? [];
+      const byPath = new Map<string, any[]>();
+      for (const error of errors) {
+        const path = error.instancePath || "/";
+        byPath.set(path, [...(byPath.get(path) ?? []), error]);
+      }
+      // A bad keyword value produces overlapping errors (enum + type + anyOf).
+      // Keep the most specific one for each location.
+      return [...byPath].flatMap(([path, group]) => {
+        const enumError = group.find((error) => error.keyword === "enum");
+        const kept = enumError
+          ? [enumError]
+          : group.length > 1
+            ? group.filter((error) => !["anyOf", "oneOf"].includes(error.keyword))
+            : group;
+        return kept.map((error) => ({
+          path,
+          message: error.params?.allowedValues
+            ? `must be one of: ${error.params.allowedValues.join(", ")}`
+            : error.message,
+        }));
+      });
+    }
+    validator.compile(schema);
+    return [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      {
+        path: "/",
+        message: /no schema with key or ref/.test(message)
+          ? `Unsupported $schema ${JSON.stringify(schemaId)}. Use draft-07 or 2020-12.`
+          : message.replace(/^strict mode: /, ""),
+      },
+    ];
+  }
 }
 
 /** Validate schema configuration at startup, before any cases are graded. */

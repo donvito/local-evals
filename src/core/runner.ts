@@ -45,7 +45,9 @@ type ExtendedDb = DatabaseStore & {
     config: RunConfig,
     datasetVersion: string,
     snapshot?: unknown,
+    experimentId?: string | null,
   ) => void;
+  getExperiment?: (experimentId: string) => unknown;
   saveAttempt?: (
     runId: string,
     caseId: string,
@@ -69,6 +71,7 @@ export type RunnerOptions = {
     extraction: TargetConfig;
     judge?: TargetConfig;
   };
+  experimentId?: string | null;
 };
 
 function redacted<T>(value: T): T {
@@ -536,7 +539,7 @@ async function runCase(
           (signal) =>
             provider(
               judgeTarget,
-              `${config.judgeRubric}\n\nExpected:\n${JSON.stringify(item.expected)}\n\nActual:\n${extraction.text}`,
+              judgePrompt(config.judgeRubric ?? "", item.expected, extraction.text),
               undefined,
               "prompted-json",
               signal,
@@ -546,7 +549,7 @@ async function runCase(
           options,
           config,
         );
-        const parsed = JSON.parse(judge.text);
+        const parsed = parseJudgeReply(judge.text);
         const verdict = parsed?.verdict;
         const evidence = parsed?.evidence;
         if (
@@ -588,6 +591,34 @@ async function runCase(
   });
   return result;
 }
+const JUDGE_REPLY_FORMAT =
+  'Reply with only a JSON object and no other text, in exactly this shape:\n{"verdict": "pass" or "fail", "evidence": "one or two sentences explaining why"}';
+
+/** The judge sees the rubric, both answers, and the exact reply format it must use. */
+export function judgePrompt(rubric: string, expected: unknown, actual: string) {
+  return `${rubric}\n\nExpected:\n${JSON.stringify(expected)}\n\nActual:\n${actual}\n\n${JUDGE_REPLY_FORMAT}`;
+}
+
+/** Read a judge reply, tolerating code fences or a sentence around the JSON object. */
+export function parseJudgeReply(text: string): any {
+  const trimmed = text.trim();
+  const candidates = [
+    trimmed,
+    trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""),
+    trimmed.includes("{") ? trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1) : "",
+  ];
+  for (const candidate of candidates)
+    if (candidate)
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // try the next, less strict reading
+      }
+  throw new Error(
+    `The judge didn't reply with JSON. It started with: "${trimmed.slice(0, 60)}${trimmed.length > 60 ? "…" : ""}"`,
+  );
+}
+
 export async function runEvaluation(
   manifest: DatasetManifest,
   config: RunConfig,
@@ -595,6 +626,13 @@ export async function runEvaluation(
 ) {
   const runId = randomUUID();
   const db = options.db as ExtendedDb;
+  if (
+    options.experimentId !== undefined &&
+    options.experimentId !== null &&
+    db.getExperiment &&
+    !db.getExperiment(options.experimentId)
+  )
+    throw new Error("Experiment not found.");
   const taskKind = resolveTaskKind(manifest, config);
   const suppliedSchema = options.schema ?? config.schema;
   const normalizedConfig = {
@@ -753,6 +791,7 @@ export async function runEvaluation(
       effectiveConfig,
       effectiveConfig.datasetVersion,
       snapshot,
+      options.experimentId ?? null,
     );
     db.updateRunSnapshot?.(runId, snapshot);
     event(db, runId, "run_started", {

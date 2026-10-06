@@ -62,3 +62,24 @@ it("discovers models from a saved local target without exposing its credential",
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("deletes a saved target over HTTP", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "evalforge-target-delete-"));
+  const dbPath = path.join(dir, "app.db");
+  const db = new DatabaseStore(dbPath);
+  db.saveTarget(
+    { name: "remove-me", model: "m", baseUrl: "http://127.0.0.1:9/v1", provider: "openai-compatible" },
+    "secret",
+  );
+  db.close();
+  const server = await startServer(dbPath, 0, dir);
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    expect((await fetch(url + "/api/targets/remove-me", { method: "DELETE" })).status).toBe(200);
+    expect(await (await fetch(url + "/api/targets")).json()).toEqual([]);
+    expect((await fetch(url + "/api/targets/remove-me", { method: "DELETE" })).status).toBe(404);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});

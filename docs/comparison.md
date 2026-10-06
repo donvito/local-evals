@@ -4,6 +4,8 @@
 
 The app compares **evaluation runs on the same dataset**, not arbitrary datasets against one another. Use comparison to measure the effect of changing a model or prompt while keeping the evaluation inputs and grading rules fixed.
 
+You can [group related runs in an experiment](experiments.md) to find them together. A shared experiment name does not override the compatibility checks below.
+
 ## Compare in the app
 
 1. Run a baseline evaluation.

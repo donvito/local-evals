@@ -1,6 +1,6 @@
 import http from "node:http";
 import { networkInterfaces } from "node:os";
-import { readFile, realpath } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -25,6 +25,7 @@ import {
   fetchTargetModelCatalog,
 } from "./core/model-catalog.js";
 import { registerSecrets, sanitize } from "./core/security.js";
+import { checkExtractionSchema, checkToolDefinitions, type SchemaCheck } from "./core/schema-check.js";
 import * as providers from "./core/providers.js";
 import type { TaskKind } from "./core/types.js";
 
@@ -130,6 +131,25 @@ export async function startServer(
     toolChoice: config.toolChoice ?? "auto",
     toolCallOrder: config.toolCallOrder ?? "ordered",
   });
+  /** Credential-free run configuration, suitable for showing or writing to a file. */
+  const portableConfig = (config: any) => {
+    const target = (value: any) =>
+      value && typeof value === "object"
+        ? Object.fromEntries(
+            Object.entries(value).filter(
+              ([key]) => !/^(apiKey|apiKeyEncrypted|hasApiKey)$/.test(key),
+            ),
+          )
+        : value;
+    const { baseConfigPath: _base, schemaPath, ...rest } = config;
+    return {
+      ...rest,
+      ...(schemaPath && !rest.schema ? { schemaPath } : {}),
+      ...(rest.ocrTarget ? { ocrTarget: target(rest.ocrTarget) } : {}),
+      ...(rest.extractionTarget ? { extractionTarget: target(rest.extractionTarget) } : {}),
+      ...(rest.judgeTarget ? { judgeTarget: target(rest.judgeTarget) } : {}),
+    };
+  };
   const command = (version?: string) => {
     const dataset = version ? db.getDataset(version) : db.listDatasets()[0];
     return (
@@ -140,6 +160,152 @@ export async function startServer(
       " --db " +
       shellQuote(path.resolve(dbPath))
     );
+  };
+  const buildSetupConfig = async (input: any) => {
+    const targets = db.listTargets(),
+      pick = (name: string) => targets.find((t) => t.name === name);
+    const extractionTarget = pick(input.extractionTarget),
+      ocrTarget = pick(input.ocrTarget),
+      judgeTarget = input.judgeTarget ? pick(input.judgeTarget) : undefined;
+    const taskKind = input.taskKind ?? "document-json";
+    if (!["document-json", "text-json", "tool-calling"].includes(taskKind))
+      throw new Error("Choose a valid evaluation type.");
+    if (
+      !extractionTarget ||
+      (taskKind === "document-json" &&
+        input.extractionSource !== "reference" &&
+        !ocrTarget)
+    )
+      throw new Error("Select configured OCR and extraction targets.");
+    if (
+      !["ocr", "reference"].includes(input.extractionSource) ||
+      !["prompted-json", "schema-constrained-json"].includes(
+        input.outputMode,
+      )
+    )
+      throw new Error("Choose extraction source and output mode.");
+    let base: any;
+    let existing: any;
+    try {
+      existing = await loadConfig(configPath);
+    } catch {
+      existing = undefined;
+    }
+    const requestedBasePath =
+      typeof input.baseConfigPath === "string"
+        ? input.baseConfigPath.trim()
+        : "";
+    const baseConfigPath = Object.hasOwn(input, "baseConfigPath")
+      ? requestedBasePath || undefined
+      : existing?.baseConfigPath;
+    if (baseConfigPath) {
+      if (
+        existing &&
+        baseConfigPath === existing.baseConfigPath &&
+        !requestedBasePath
+      )
+        base = existing;
+      else
+        base = await loadConfig(
+          await projectFile(projectRoot, baseConfigPath),
+        );
+    } else if (existing && !requestedBasePath) {
+      base = existing;
+    } else {
+      try {
+        base = JSON.parse(await readFile(configPath, "utf8"));
+      } catch (e: any) {
+        if (e.code !== "ENOENT") throw e;
+        try {
+          base = JSON.parse(
+            await readFile(
+              path.join(projectRoot, "sample-data/config.json"),
+              "utf8",
+            ),
+          );
+          base.schema = JSON.parse(
+            await readFile(
+              path.join(projectRoot, "sample-data/schema.json"),
+              "utf8",
+            ),
+          );
+        } catch (sampleError: any) {
+          if (sampleError.code !== "ENOENT") throw sampleError;
+          base = { schemaVersion: "app-settings-v1", stagePrompts: { extraction: "" }, fieldRules: [] };
+        }
+      }
+    }
+    const datasetVersion = input.datasetVersion ?? base.datasetVersion;
+    const dataset = datasetVersion
+      ? db.getDataset(datasetVersion)
+      : undefined;
+    if (!dataset) throw new Error("Selected dataset not found.");
+    if (dataset && (dataset.taskKind ?? "document-json") !== taskKind)
+      throw new Error(
+        "The dataset does not match this evaluation type. Choose a matching dataset.",
+      );
+    if (input.judgeTarget && (!judgeTarget || !input.judgeRubric?.trim()))
+      throw new Error("A configured judge and rubric are required.");
+    const config = {
+      ...base,
+      schemaVersion: base.schemaVersion ?? "app-settings-v1",
+      taskKind,
+      baseConfigPath,
+      ocrTarget,
+      extractionTarget,
+      judgeTarget,
+      datasetVersion,
+      inferenceOnly:
+        typeof input.inferenceOnly === "boolean"
+          ? input.inferenceOnly
+          : base.inferenceOnly,
+      extractionSource: input.extractionSource,
+      outputMode: input.outputMode,
+      generation: input.generation ?? base.generation,
+      judgeRubric: input.judgeRubric ?? base.judgeRubric,
+      schema: baseConfigPath ? base.schema : (input.schema ?? base.schema),
+      fieldRules: baseConfigPath
+        ? (base.fieldRules ?? [])
+        : (input.fieldRules ?? base.fieldRules ?? []),
+      crossFieldRules:
+        (base.taskKind ?? "document-json") === taskKind
+          ? base.crossFieldRules
+          : [],
+      stagePrompts: baseConfigPath
+        ? base.stagePrompts
+        : (input.stagePrompts ?? base.stagePrompts),
+      tools:
+        taskKind === "tool-calling"
+          ? baseConfigPath
+            ? base.tools
+            : (input.tools ?? base.tools)
+          : undefined,
+      toolChoice:
+        taskKind === "tool-calling"
+          ? (input.toolChoice ?? base.toolChoice ?? "auto")
+          : undefined,
+      toolCallOrder:
+        taskKind === "tool-calling"
+          ? (input.toolCallOrder ?? base.toolCallOrder ?? "ordered")
+          : undefined,
+    };
+    const firstError = (check: SchemaCheck) => check.issues.find((issue) => issue.severity === "error");
+    const schemaProblem =
+      config.schema && typeof config.schema === "object"
+        ? firstError(checkExtractionSchema(JSON.stringify(config.schema)))
+        : undefined;
+    if (schemaProblem)
+      throw new Error(
+        `The schema isn't valid${schemaProblem.path === "/" ? "" : ` at ${schemaProblem.path}`}: ${schemaProblem.message}`,
+      );
+    const toolProblem =
+      taskKind === "tool-calling" && Array.isArray(config.tools) && config.tools.length
+        ? firstError(checkToolDefinitions(JSON.stringify(config.tools)))
+        : undefined;
+    if (toolProblem)
+      throw new Error(`The tool definitions aren't valid at ${toolProblem.path}: ${toolProblem.message}`);
+    validateRunConfig(config);
+    return config;
   };
   type ActiveRun = {
     controller: AbortController;
@@ -334,130 +500,77 @@ export async function startServer(
         });
         return;
       }
-      if (req.method === "POST" && url.pathname === "/api/setup/config") {
-        const input = await body(),
-          targets = db.listTargets(),
-          pick = (name: string) => targets.find((t) => t.name === name);
-        const extractionTarget = pick(input.extractionTarget),
-          ocrTarget = pick(input.ocrTarget),
-          judgeTarget = input.judgeTarget ? pick(input.judgeTarget) : undefined;
-        const taskKind = input.taskKind ?? "document-json";
-        if (!["document-json", "text-json", "tool-calling"].includes(taskKind))
-          throw new Error("Choose a valid evaluation type.");
+      if (req.method === "POST" && url.pathname === "/api/schema-check") {
+        const input = await body();
+        const text = typeof input.text === "string" ? input.text : "";
+        if (text.length > 1_000_000) throw new Error("That JSON is too large to check.");
+        json(
+          input.kind === "tools"
+            ? checkToolDefinitions(text)
+            : checkExtractionSchema(text, { fieldRules: input.fieldRules, required: input.required !== false }),
+        );
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/config-file") {
+        const requested = url.searchParams.get("path")?.trim();
+        if (!requested) throw new Error("Enter a configuration file path.");
+        const file = await projectFile(projectRoot, requested);
+        const config = await loadConfig(file);
+        json({
+          path: path.relative(await realpath(projectRoot), file),
+          summary: configSummary({ ...config, baseConfigPath: requested }),
+          content: portableConfig(config),
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/config-file") {
+        const input = await body();
+        const requested = typeof input.path === "string" ? input.path.trim() : "";
+        if (!requested.toLowerCase().endsWith(".json"))
+          throw new Error("Configuration files must end in .json.");
+        if (path.isAbsolute(requested))
+          throw new Error("Use a path inside the project folder, such as configs/receipts.json.");
+        const config = await buildSetupConfig({ ...(input.setup ?? {}), baseConfigPath: "" });
+        const root = await realpath(projectRoot);
+        const file = path.resolve(root, requested);
+        const relative = path.relative(root, file);
         if (
-          !extractionTarget ||
-          (taskKind === "document-json" &&
-            input.extractionSource !== "reference" &&
-            !ocrTarget)
+          !relative ||
+          relative.startsWith("..") ||
+          path.isAbsolute(relative) ||
+          relative.split(path.sep).some((part) => part === "node_modules" || part === ".git")
         )
-          throw new Error("Select configured OCR and extraction targets.");
-        if (
-          !["ocr", "reference"].includes(input.extractionSource) ||
-          !["prompted-json", "schema-constrained-json"].includes(
-            input.outputMode,
-          )
-        )
-          throw new Error("Choose extraction source and output mode.");
-        let base: any;
-        let existing: any;
-        try {
-          existing = await loadConfig(configPath);
-        } catch {
-          existing = undefined;
-        }
-        const requestedBasePath =
-          typeof input.baseConfigPath === "string"
-            ? input.baseConfigPath.trim()
-            : "";
-        const baseConfigPath = Object.hasOwn(input, "baseConfigPath")
-          ? requestedBasePath || undefined
-          : existing?.baseConfigPath;
-        if (baseConfigPath) {
-          if (
-            existing &&
-            baseConfigPath === existing.baseConfigPath &&
-            !requestedBasePath
-          )
-            base = existing;
-          else
-            base = await loadConfig(
-              await projectFile(projectRoot, baseConfigPath),
-            );
-        } else if (existing && !requestedBasePath) {
-          base = existing;
-        } else {
+          throw new Error("Use a path inside the project folder, such as configs/receipts.json.");
+        let ancestor = path.dirname(file);
+        for (;;) {
           try {
-            base = JSON.parse(await readFile(configPath, "utf8"));
-          } catch (e: any) {
-            if (e.code !== "ENOENT") throw e;
-            base = JSON.parse(
-              await readFile(
-                path.join(projectRoot, "sample-data/config.json"),
-                "utf8",
-              ),
-            );
-            base.schema = JSON.parse(
-              await readFile(
-                path.join(projectRoot, "sample-data/schema.json"),
-                "utf8",
-              ),
-            );
+            ancestor = await realpath(ancestor);
+            break;
+          } catch (error: any) {
+            if (error?.code !== "ENOENT") throw error;
+            ancestor = path.dirname(ancestor);
           }
         }
-        const datasetVersion = input.datasetVersion ?? base.datasetVersion;
-        const dataset = datasetVersion
-          ? db.getDataset(datasetVersion)
-          : undefined;
-        if (!dataset) throw new Error("Selected dataset not found.");
-        if (dataset && (dataset.taskKind ?? "document-json") !== taskKind)
-          throw new Error(
-            "The dataset does not match this evaluation type. Choose a matching dataset.",
-          );
-        if (input.judgeTarget && (!judgeTarget || !input.judgeRubric?.trim()))
-          throw new Error("A configured judge and rubric are required.");
-        const config = {
-          ...base,
-          taskKind,
-          baseConfigPath,
-          ocrTarget,
-          extractionTarget,
-          judgeTarget,
-          datasetVersion,
-          inferenceOnly:
-            typeof input.inferenceOnly === "boolean"
-              ? input.inferenceOnly
-              : base.inferenceOnly,
-          extractionSource: input.extractionSource,
-          outputMode: input.outputMode,
-          generation: input.generation ?? base.generation,
-          judgeRubric: input.judgeRubric ?? base.judgeRubric,
-          schema: baseConfigPath ? base.schema : (input.schema ?? base.schema),
-          fieldRules: baseConfigPath
-            ? (base.fieldRules ?? [])
-            : (input.fieldRules ?? base.fieldRules ?? []),
-          crossFieldRules:
-            (base.taskKind ?? "document-json") === taskKind
-              ? base.crossFieldRules
-              : [],
-          stagePrompts: baseConfigPath
-            ? base.stagePrompts
-            : (input.stagePrompts ?? base.stagePrompts),
-          tools:
-            taskKind === "tool-calling"
-              ? baseConfigPath
-                ? base.tools
-                : (input.tools ?? base.tools)
-              : undefined,
-          toolChoice:
-            taskKind === "tool-calling"
-              ? (input.toolChoice ?? base.toolChoice ?? "auto")
-              : undefined,
-          toolCallOrder:
-            taskKind === "tool-calling"
-              ? (input.toolCallOrder ?? base.toolCallOrder ?? "ordered")
-              : undefined,
-        };
-        validateRunConfig(config);
+        if (ancestor !== root && !ancestor.startsWith(root + path.sep))
+          throw new Error("Use a path inside the project folder, such as configs/receipts.json.");
+        await mkdir(path.dirname(file), { recursive: true });
+        let exists = false;
+        try {
+          await stat(file);
+          exists = true;
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        if (exists && input.overwrite !== true) {
+          json({ error: `${relative} already exists.`, exists: true }, 409);
+          return;
+        }
+        await saveJson(file, portableConfig(config));
+        json({ path: relative, overwritten: exists });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/setup/config") {
+        const config = await buildSetupConfig(await body());
         await saveJson(configPath, config);
         json({
           runCommand: command(config.datasetVersion),
@@ -481,6 +594,15 @@ export async function startServer(
             typeof apiKey === "string" ? apiKey : undefined,
           );
           json(db.getTarget(parts[2]) ?? { error: "Target not found." });
+          return;
+        }
+        if (req.method === "DELETE" && parts.length === 3) {
+          if (!db.getTarget(parts[2])) {
+            json({ error: "Target not found." }, 404);
+            return;
+          }
+          db.deleteTarget(parts[2]);
+          json({ deleted: true });
           return;
         }
         if (req.method === "POST" && parts[3] === "test") {
@@ -688,8 +810,63 @@ export async function startServer(
         void pumpGeneration().catch(() => undefined);
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/experiments") {
+        json(db.listExperiments());
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/experiments") {
+        const input = await body();
+        if (typeof input.name !== "string") throw new Error("Experiment name is required.");
+        json(db.createExperiment(input.name), 201);
+        return;
+      }
+      if (
+        req.method === "PATCH" &&
+        parts[0] === "api" &&
+        parts[1] === "experiments" &&
+        parts[2] &&
+        parts.length === 3
+      ) {
+        const input = await body();
+        if (typeof input.name !== "string") throw new Error("Experiment name is required.");
+        json(db.renameExperiment(parts[2], input.name));
+        return;
+      }
+      if (
+        req.method === "DELETE" &&
+        parts[0] === "api" &&
+        parts[1] === "experiments" &&
+        parts[2] &&
+        parts.length === 3
+      ) {
+        if (!db.getExperiment(parts[2])) {
+          json({ error: "Experiment not found." }, 404);
+          return;
+        }
+        db.deleteExperiment(parts[2]);
+        json({ deleted: true });
+        return;
+      }
+      if (
+        req.method === "PUT" &&
+        parts[0] === "api" &&
+        parts[1] === "runs" &&
+        parts[2] &&
+        parts[3] === "experiment" &&
+        parts.length === 4
+      ) {
+        const input = await body();
+        if (input.experimentId !== null && typeof input.experimentId !== "string")
+          throw new Error("experimentId must be a string or null.");
+        json(db.setRunExperiment(parts[2], input.experimentId ?? null));
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/runs/start") {
         const input = await body();
+        if (input.experimentId !== undefined && input.experimentId !== null && typeof input.experimentId !== "string")
+          throw new Error("experimentId must be a string or null.");
+        if (input.experimentId !== undefined && input.experimentId !== null && !db.getExperiment(input.experimentId))
+          throw new Error("Experiment not found.");
         const persisted = db
           .listRuns()
           .find((run: any) => ["running", "pending"].includes(run.status));
@@ -747,6 +924,7 @@ export async function startServer(
               resolveStarted();
             },
             onProgress: () => undefined,
+            experimentId: input.experimentId ?? null,
           })
             .then((result) => {
               run.runId ??= result.runId;
@@ -978,7 +1156,9 @@ export async function startServer(
         {
           error:
             error.code === "ENOENT"
-              ? "File not found. Build the dashboard with npm run build."
+              ? typeof error.path === "string" && !error.path.startsWith(dashboardRoot)
+                ? `File not found: ${path.relative(projectRoot, error.path) || error.path}`
+                : "File not found. Build the dashboard with npm run build."
               : (error.message ?? String(error)),
         },
         error.code === "ENOENT" ? 404 : 400,
