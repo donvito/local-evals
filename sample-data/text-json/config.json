@@ -81,5 +81,6 @@
         "description": "Optional. One short sentence describing the request. Free text, so grading ignores it."
       }
     }
-  }
+  },
+  "judgeRubric": "You are reviewing a customer support triage. Compare the actual answer with the expected answer.\n\nPass if:\n- category, sentiment, and needsHuman match the expected values;\n- urgency matches, or is one level off only where the message could reasonably be read either way;\n- orderNumber is the same order, ignoring spacing and case, or both are null;\n- summary, if present, is accurate and adds nothing the customer did not say.\n\nFail if the answer would route the request to the wrong team or miss that a human is needed."
 }

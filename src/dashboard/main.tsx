@@ -93,10 +93,12 @@ type Target = {
   apiKeyEnv?: string;
   apiKey?: string;
   hasApiKey?: boolean;
+  keySource?: "model" | "provider";
   supportsVision?: boolean;
   supportsStructuredOutput?: boolean;
   supportsTools?: boolean;
 };
+type ProviderKey = { baseUrl: string; updatedAt: string; models: string[] };
 type CaseResult = {
   caseId: string;
   imagePath?: string;
@@ -831,6 +833,17 @@ const importDatasetPath = (datasetPath: string) =>
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ path: datasetPath }),
+  });
+const ADD_DATASET_MODES = [
+  ["sample", "⚡", "Quick sample", "One click. Best for learning."],
+  ["import", "⇪", "Import a file", "A dataset ZIP, or a JSONL or JSON manifest."],
+  ["generate", "✦", "Generate", "A model drafts text or tool-calling cases."],
+] as const;
+const importDatasetZipFile = (file: File) =>
+  api<Dataset>(`/api/datasets/import-zip?name=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: file,
   });
 const schemaFieldsMissing = (schemaText: string, dataset?: Dataset) => {
   const schema = parseEditorJson(schemaText) as { properties?: Record<string, unknown> } | undefined;
@@ -2948,10 +2961,12 @@ function Datasets({
 }) {
   const [path, setPath] = useState("");
   const [importBusy, setImportBusy] = useState(false);
+  const [zipDragging, setZipDragging] = useState(false);
   const [generationSubmitting, setGenerationSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const [messageKind, setMessageKind] = useState<Notice["kind"]>("success");
   const [createOpen, setCreateOpen] = useState(false);
+  const addDialog = useRef<HTMLDialogElement>(null);
   const [addMode, setAddMode] = useState<"sample" | "import" | "generate">("sample");
   const [jobs, setJobs] = useState<DatasetJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
@@ -3449,11 +3464,22 @@ function Datasets({
   useEffect(() => {
     if (!generateTarget && targets[0]?.name) setGenerateTarget(targets[0].name);
   }, [generateTarget, targets]);
-  const importPath = async (datasetPath: string, label: string) => {
+  const importPath = (datasetPath: string, label: string) =>
+    runImport(() => importDatasetPath(datasetPath), label);
+  const uploadZip = (file?: File) => {
+    if (!file || importBusy) return;
+    if (!/\.zip$/i.test(file.name)) {
+      setMessageKind("error");
+      setMessage("Choose a .zip file. For a JSONL or JSON manifest, enter its path below.");
+      return;
+    }
+    void runImport(() => importDatasetZipFile(file), file.name);
+  };
+  const runImport = async (request: () => Promise<Dataset>, label: string) => {
     setImportBusy(true);
     setMessage("");
     try {
-      const imported = await importDatasetPath(datasetPath);
+      const imported = await request();
       await onRefresh();
       setSelectedVersion(imported.version);
       setPath("");
@@ -3534,7 +3560,243 @@ function Datasets({
     taskKind,
     path: SAMPLE_DATASETS[taskKind],
   }));
-  const addPanelOpen = createOpen || (!datasets.length && !jobs.length && !jobsLoading);
+  const addInline = !datasets.length && !jobs.length && !jobsLoading;
+  useEffect(() => {
+    const node = addDialog.current;
+    if (!node) return;
+    if (createOpen && !addInline && !node.open) node.showModal();
+    else if ((!createOpen || addInline) && node.open) node.close();
+  }, [createOpen, addInline]);
+  const messageNotice = message ? (
+    <div
+      className={`import-message ${messageKind}`}
+      role={messageKind === "error" ? "alert" : "status"}
+      aria-live="polite"
+    >
+      {message}
+      <button
+        type="button"
+        aria-label="Dismiss dataset message"
+        onClick={() => setMessage("")}
+      >
+        ×
+      </button>
+    </div>
+  ) : null;
+  const addPanel = (
+    <div className="add-dataset" id="dataset-create-panel">
+      <div className="add-dataset-head">
+        <h3>Add a dataset</h3>
+        {(datasets.length > 0 || jobs.length > 0) && (
+          <button type="button" className="text-button" onClick={() => setCreateOpen(false)}>
+            Close
+          </button>
+        )}
+      </div>
+      <div className="add-dataset-tabs">
+        <div className="add-dataset-modes" role="tablist" aria-label="How to add a dataset">
+          {ADD_DATASET_MODES.map(([mode, icon, title, text]) => (
+            <button
+              key={mode}
+              type="button"
+              role="tab"
+              aria-selected={addMode === mode}
+              title={text}
+              className={`add-dataset-mode${addMode === mode ? " selected" : ""}`}
+              onClick={() => setAddMode(mode)}
+            >
+              <span className="add-dataset-icon" aria-hidden="true">{icon}</span>
+              {title}
+            </button>
+          ))}
+        </div>
+        <p className="add-dataset-hint">
+          {ADD_DATASET_MODES.find(([mode]) => mode === addMode)?.[3]}
+        </p>
+      </div>
+      {addMode === "sample" && (
+        <div className="add-dataset-body sample-imports">
+          {sampleDatasets.map((sample) => (
+            <button
+              key={sample.taskKind}
+              type="button"
+              className="button secondary"
+              disabled={importBusy}
+              onClick={() => void importPath(sample.path, TASK_KIND_LABELS[sample.taskKind])}
+            >
+              {TASK_KIND_LABELS[sample.taskKind]} sample
+            </button>
+          ))}
+        </div>
+      )}
+      {addMode === "import" && (
+        <div className="import-pane" aria-busy={importBusy}>
+          <div className="import-zip-row">
+            <div
+              className={`zip-drop${zipDragging ? " dragging" : ""}`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setZipDragging(true);
+              }}
+              onDragLeave={() => setZipDragging(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setZipDragging(false);
+                uploadZip(event.dataTransfer.files[0]);
+              }}
+            >
+              <span className="zip-drop-icon" aria-hidden="true">⇪</span>
+              <strong>
+                {importBusy ? "Importing…" : zipDragging ? "Release to import" : "Drop a dataset ZIP here"}
+              </strong>
+              <label className={`button secondary${importBusy ? " disabled" : ""}`}>
+                Choose ZIP file
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  className="sr-only"
+                  disabled={importBusy}
+                  onChange={(event) => {
+                    uploadZip(event.target.files?.[0]);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              <small>Up to 512 MB</small>
+            </div>
+            <aside className="zip-anatomy" aria-label="What goes in a dataset ZIP">
+              <span className="eyebrow">What&apos;s inside</span>
+              <pre aria-hidden="true">{`my-dataset.zip
+├─ manifest.jsonl
+├─ assets/
+│  └─ receipt-001.jpeg
+└─ README.md  (optional)`}</pre>
+              <p>
+                One case per line in <code>manifest.jsonl</code>, each pointing to an image in the ZIP.
+              </p>
+              <div className="zip-anatomy-actions">
+                <a className="button secondary mini" href="/api/datasets/example.zip" download>
+                  Download example
+                </a>
+                <a
+                  className="text-button"
+                  href="#help/dataset-zip"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Format guide (opens in a new tab)"
+                >
+                  Format guide <span aria-hidden="true">↗</span>
+                </a>
+              </div>
+            </aside>
+          </div>
+          <div className="import-divider" role="separator">
+            <span>or</span>
+          </div>
+          <form className="import-path" onSubmit={importDataset}>
+            <label htmlFor="dataset-import-path">Import from a project path</label>
+            <div className="import-path-row">
+              <input
+                id="dataset-import-path"
+                required
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="datasets/receipts/manifest.jsonl"
+              />
+              <button className="button primary" disabled={importBusy}>
+                {importBusy ? "Importing…" : "Import"}
+              </button>
+            </div>
+            <small>A .jsonl, .json, or .zip file, relative to the project folder.</small>
+          </form>
+        </div>
+      )}
+      {addMode === "generate" && (
+        <form
+          className="add-dataset-body dataset-create-fields"
+          onSubmit={generateDataset}
+          aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
+        >
+          <div className="field">
+            <span className="field-label" id="generate-model-label">Model</span>
+            <Dropdown
+              labelledBy="generate-model-label"
+              value={generateTarget}
+              onChange={setGenerateTarget}
+              options={targetOptions(targets).slice(1)}
+              placeholder="Choose a model"
+            />
+            {!targets.length && <small>Add a model in Providers first.</small>}
+          </div>
+          <div className="field">
+            <span className="field-label" id="generate-type-label">Type</span>
+            <Dropdown
+              labelledBy="generate-type-label"
+              value={generateTaskKind}
+              onChange={(kind) => setGenerateTaskKind(kind as "text-json" | "tool-calling")}
+              options={[
+                { value: "text-json", label: "Text → JSON", detail: "Inputs with expected JSON fields" },
+                { value: "tool-calling", label: "Tool calling", detail: "Requests with expected tool calls" },
+              ]}
+            />
+          </div>
+          <label className="dataset-create-brief">
+            What should the cases cover?
+            <textarea
+              value={generateBrief}
+              onChange={(event) => setGenerateBrief(event.target.value)}
+              placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
+              rows={3}
+            />
+          </label>
+          <label>
+            Number of cases
+            <input
+              type="number"
+              min="1"
+              max="50"
+              required
+              value={generateCount}
+              onChange={(event) => setGenerateCount(event.target.value)}
+            />
+          </label>
+          <AdvancedOptions>
+            <label>
+              <span>
+                Dataset name <span className="optional">optional</span>
+              </span>
+              <input
+                value={generateName}
+                onChange={(event) => setGenerateName(event.target.value)}
+                placeholder="Support intents — generated"
+              />
+            </label>
+            <label>
+              Time limit (minutes)
+              <input
+                type="number"
+                min="0.5"
+                max="60"
+                step="0.5"
+                required
+                value={generateTimeoutMinutes}
+                onChange={(event) => setGenerateTimeoutMinutes(event.target.value)}
+              />
+              <small>Counts from when generation starts, not while waiting in the queue.</small>
+            </label>
+          </AdvancedOptions>
+          <p className="setup-hint">Images can't be generated. Import document datasets from files.</p>
+          <button className="button primary" type="submit" disabled={generationSubmitting || !targets.length}>
+            {generationSubmitting
+              ? "Starting…"
+              : activeGenerationJob || queuedGenerationCount
+                ? "Add to queue"
+                : "Generate dataset"}
+          </button>
+        </form>
+      )}
+    </div>
+  );
   return (
     <>
       <PageTitle
@@ -3542,190 +3804,37 @@ function Datasets({
         title="Datasets"
         sub="The examples your model answers, with optional expected answers."
         action={
-          addPanelOpen ? undefined : (
+          addInline ? undefined : (
             <button
               type="button"
               className="button primary"
               onClick={() => setCreateOpen(true)}
-              aria-controls="dataset-create-panel"
+              aria-haspopup="dialog"
             >
               Add dataset
             </button>
           )
         }
       />
-      <section className="panel dataset-panel">
-        {addPanelOpen ? (
-          <div className="add-dataset" id="dataset-create-panel">
-            <div className="add-dataset-head">
-              <h3>Add a dataset</h3>
-              {(datasets.length > 0 || jobs.length > 0) && (
-                <button type="button" className="text-button" onClick={() => setCreateOpen(false)}>
-                  Close
-                </button>
-              )}
-            </div>
-            <div className="add-dataset-modes" role="tablist" aria-label="How to add a dataset">
-              {(
-                [
-                  ["sample", "⚡", "Quick sample", "One click. Best for learning."],
-                  ["import", "⇪", "Import a file", "A JSONL or JSON manifest."],
-                  ["generate", "✦", "Generate", "A model drafts the cases."],
-                ] as const
-              ).map(([mode, icon, title, text]) => (
-                <button
-                  key={mode}
-                  type="button"
-                  role="tab"
-                  aria-selected={addMode === mode}
-                  className={`add-dataset-mode${addMode === mode ? " selected" : ""}`}
-                  onClick={() => setAddMode(mode)}
-                >
-                  <span className="add-dataset-icon" aria-hidden="true">{icon}</span>
-                  <strong>{title}</strong>
-                  <span>{text}</span>
-                </button>
-              ))}
-            </div>
-            {addMode === "sample" && (
-              <div className="add-dataset-body sample-imports">
-                {sampleDatasets.map((sample) => (
-                  <button
-                    key={sample.taskKind}
-                    type="button"
-                    className="button secondary"
-                    disabled={importBusy}
-                    onClick={() => void importPath(sample.path, TASK_KIND_LABELS[sample.taskKind])}
-                  >
-                    {TASK_KIND_LABELS[sample.taskKind]} sample
-                  </button>
-                ))}
-              </div>
-            )}
-            {addMode === "import" && (
-              <form className="add-dataset-body" onSubmit={importDataset} aria-busy={importBusy}>
-                <label htmlFor="dataset-import-path">
-                  File path
-                  <div className="inline-form">
-                    <input
-                      id="dataset-import-path"
-                      required
-                      value={path}
-                      onChange={(e) => setPath(e.target.value)}
-                      placeholder="datasets/receipts.jsonl"
-                    />
-                    <button className="button primary" disabled={importBusy}>
-                      {importBusy ? "Importing…" : "Import"}
-                    </button>
-                  </div>
-                  <small>
-                    Relative to the project folder. See Help → Use your own data for the file format.
-                  </small>
-                </label>
-              </form>
-            )}
-            {addMode === "generate" && (
-              <form
-                className="add-dataset-body dataset-create-fields"
-                onSubmit={generateDataset}
-                aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
-              >
-                <div className="field">
-                  <span className="field-label" id="generate-model-label">Model</span>
-                  <Dropdown
-                    labelledBy="generate-model-label"
-                    value={generateTarget}
-                    onChange={setGenerateTarget}
-                    options={targetOptions(targets).slice(1)}
-                    placeholder="Choose a model"
-                  />
-                  {!targets.length && <small>Add a model in Providers first.</small>}
-                </div>
-                <div className="field">
-                  <span className="field-label" id="generate-type-label">Type</span>
-                  <Dropdown
-                    labelledBy="generate-type-label"
-                    value={generateTaskKind}
-                    onChange={(kind) => setGenerateTaskKind(kind as "text-json" | "tool-calling")}
-                    options={[
-                      { value: "text-json", label: "Text → JSON", detail: "Inputs with expected JSON fields" },
-                      { value: "tool-calling", label: "Tool calling", detail: "Requests with expected tool calls" },
-                    ]}
-                  />
-                </div>
-                <label className="dataset-create-brief">
-                  What should the cases cover?
-                  <textarea
-                    value={generateBrief}
-                    onChange={(event) => setGenerateBrief(event.target.value)}
-                    placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
-                    rows={3}
-                  />
-                </label>
-                <label>
-                  Number of cases
-                  <input
-                    type="number"
-                    min="1"
-                    max="50"
-                    required
-                    value={generateCount}
-                    onChange={(event) => setGenerateCount(event.target.value)}
-                  />
-                </label>
-                <AdvancedOptions>
-                  <label>
-                    <span>
-                      Dataset name <span className="optional">optional</span>
-                    </span>
-                    <input
-                      value={generateName}
-                      onChange={(event) => setGenerateName(event.target.value)}
-                      placeholder="Support intents — generated"
-                    />
-                  </label>
-                  <label>
-                    Time limit (minutes)
-                    <input
-                      type="number"
-                      min="0.5"
-                      max="60"
-                      step="0.5"
-                      required
-                      value={generateTimeoutMinutes}
-                      onChange={(event) => setGenerateTimeoutMinutes(event.target.value)}
-                    />
-                    <small>Counts from when generation starts, not while waiting in the queue.</small>
-                  </label>
-                </AdvancedOptions>
-                <p className="setup-hint">Images can't be generated. Import document datasets from files.</p>
-                <button className="button primary" type="submit" disabled={generationSubmitting || !targets.length}>
-                  {generationSubmitting
-                    ? "Starting…"
-                    : activeGenerationJob || queuedGenerationCount
-                      ? "Add to queue"
-                      : "Generate dataset"}
-                </button>
-              </form>
-            )}
-          </div>
-        ) : null}
-        {message && (
-          <div
-            className={`import-message ${messageKind}`}
-            role={messageKind === "error" ? "alert" : "status"}
-            aria-live="polite"
-          >
-            {message}
-            <button
-              type="button"
-              aria-label="Dismiss dataset message"
-              onClick={() => setMessage("")}
-            >
-              ×
-            </button>
-          </div>
+      <dialog
+        ref={addDialog}
+        className="add-dataset-dialog"
+        aria-label="Add a dataset"
+        onClose={() => setCreateOpen(false)}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) addDialog.current?.close();
+        }}
+      >
+        {createOpen && !addInline && (
+          <>
+            {addPanel}
+            {messageKind === "error" && messageNotice}
+          </>
         )}
+      </dialog>
+      <section className="panel dataset-panel">
+        {addInline && addPanel}
+        {!(createOpen && !addInline && messageKind === "error") && messageNotice}
         {datasets.length || jobsLoading || jobsError || jobs.length ? (
           <div className="dataset-library">
             <div className="dataset-library-layout">
@@ -5091,6 +5200,27 @@ const targetNameFromModel = (model: string, taken: string[]) => {
   for (let index = 2; taken.includes(name); index++) name = `${base}-${index}`;
   return name;
 };
+const normalizeBaseUrl = (value: string) => {
+  const trimmed = value.trim();
+  try {
+    const url = new URL(trimmed);
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+};
+const keyProviderLabel = (baseUrl: string) => {
+  const url = normalizeBaseUrl(baseUrl);
+  const preset = PROVIDER_PRESETS.find((item) => item.baseUrl && item.baseUrl === url);
+  if (preset) return preset.label;
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+const hasProviderKey = (keys: ProviderKey[], baseUrl: string) =>
+  Boolean(baseUrl.trim()) && keys.some((key) => key.baseUrl === normalizeBaseUrl(baseUrl));
 type TargetTestResult = { ok: boolean; message: string };
 const targetMissingKey = (target: Target) =>
   presetForTarget(target).needsKey && !target.hasApiKey && !target.apiKeyEnv;
@@ -5422,25 +5552,42 @@ function ActionsMenu({
 
 function TargetForm({
   initial,
+  initialPresetId,
   targets,
+  providerKeys: suppliedKeys,
   onSaved,
   onCancel,
   onNotice,
 }: {
   initial?: Target;
+  /** Provider preselected for a new model. */
+  initialPresetId?: string;
   targets: Target[];
+  /** Saved provider keys; loaded by the form itself when the parent doesn't supply them. */
+  providerKeys?: ProviderKey[];
   onSaved: (target: Target, test?: TargetTestResult) => void;
   onCancel?: () => void;
   onNotice: (message: string, kind?: Notice["kind"]) => void;
 }) {
   const isEdit = Boolean(initial);
+  const startPreset = PROVIDER_PRESETS.find((item) => item.id === initialPresetId) ?? PROVIDER_PRESETS[0];
   const [preset, setPreset] = useState<ProviderPreset>(() =>
-    initial ? presetForTarget(initial) : PROVIDER_PRESETS[0],
+    initial ? presetForTarget(initial) : startPreset,
   );
   const [editing, setEditing] = useState<Target>(() =>
-    initial ? { ...initial, apiKey: "" } : emptyTarget(PROVIDER_PRESETS[0]),
+    initial ? { ...initial, apiKey: "" } : emptyTarget(startPreset),
   );
   const [nameTouched, setNameTouched] = useState(isEdit);
+  const [ownKeyOpen, setOwnKeyOpen] = useState(false);
+  const [useSharedKey, setUseSharedKey] = useState(false);
+  const [loadedKeys, setLoadedKeys] = useState<ProviderKey[]>([]);
+  useEffect(() => {
+    if (suppliedKeys) return;
+    void api<ProviderKey[]>("/api/provider-keys")
+      .then(setLoadedKeys)
+      .catch(() => setLoadedKeys([]));
+  }, [suppliedKeys]);
+  const providerKeys = suppliedKeys ?? loadedKeys;
   const [busy, setBusy] = useState<"" | "save" | "test">("");
   const [result, setResult] = useState<TargetTestResult | null>(null);
   const takenNames = targets.map((target) => target.name).filter((name) => name !== initial?.name);
@@ -5477,12 +5624,20 @@ function TargetForm({
         : {}),
     });
   };
+  const sharedKey = hasProviderKey(providerKeys, editing.baseUrl);
+  const ownKey = editing.keySource === "model" && !useSharedKey;
+  const keyLabel = preset.id === "other" ? keyProviderLabel(editing.baseUrl) : preset.label;
   const persist = async () => {
     const name = editing.name.trim() || targetNameFromModel(editing.model, takenNames);
     return api<Target>(`/api/targets/${encodeURIComponent(name)}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...editing, name }),
+      body: JSON.stringify({
+        ...editing,
+        name,
+        keyScope: sharedKey ? "model" : "provider",
+        ...(useSharedKey && !editing.apiKey?.trim() ? { clearApiKey: true } : {}),
+      }),
     });
   };
   const submit = async (withTest: boolean) => {
@@ -5490,7 +5645,7 @@ function TargetForm({
       setResult({ ok: false, message: editing.model.trim() ? "Enter the server URL under Advanced options." : "Enter a model ID." });
       return;
     }
-    if (preset.needsKey && !editing.hasApiKey && !editing.apiKeyEnv && !editing.apiKey?.trim()) {
+    if (preset.needsKey && !sharedKey && !editing.hasApiKey && !editing.apiKeyEnv && !editing.apiKey?.trim()) {
       setResult({ ok: false, message: `${preset.label} needs an API key. Paste it above.` });
       return;
     }
@@ -5510,7 +5665,8 @@ function TargetForm({
       setBusy("");
     }
   };
-  const keyNeeded = preset.needsKey && !editing.hasApiKey;
+  const keyNeeded = preset.needsKey && !sharedKey && !editing.hasApiKey;
+  const showKeyInput = !sharedKey || ownKey || ownKeyOpen;
   return (
     <form
       className="target-form"
@@ -5535,28 +5691,59 @@ function TargetForm({
         ))}
       </fieldset>
       <fieldset className="target-form-fields" disabled={Boolean(busy)}>
-        {(preset.needsKey || editing.hasApiKey || preset.id === "other") && (
-          <label>
-            <span>
-              API key <span className="optional">{preset.needsKey ? "required" : "optional"}</span>
-            </span>
-            <input
-              type="password"
-              required={keyNeeded}
-              autoComplete="off"
-              value={editing.apiKey || ""}
-              onChange={(event) => update({ apiKey: event.target.value })}
-              placeholder={
-                editing.hasApiKey
-                  ? "Saved — enter a new key to replace it"
-                  : preset.id === "other"
-                    ? "Paste the key, if your server needs one"
-                    : `Paste your ${preset.label} key`
-              }
-            />
-            <small>Encrypted on this computer and never shown again.</small>
-          </label>
-        )}
+        {(preset.needsKey || editing.hasApiKey || sharedKey || preset.id === "other") &&
+          (showKeyInput ? (
+            <label>
+              <span>
+                {sharedKey ? "API key for this model only" : "API key"}{" "}
+                <span className="optional">{preset.needsKey && !sharedKey ? "required" : "optional"}</span>
+              </span>
+              <input
+                type="password"
+                required={keyNeeded}
+                autoComplete="off"
+                value={editing.apiKey || ""}
+                onChange={(event) => update({ apiKey: event.target.value })}
+                placeholder={
+                  ownKey || (!sharedKey && editing.hasApiKey)
+                    ? "Saved — enter a new key to replace it"
+                    : sharedKey
+                      ? "Paste a key for this model"
+                      : preset.id === "other"
+                        ? "Paste the key, if your server needs one"
+                        : `Paste your ${preset.label} key`
+                }
+              />
+              <small>
+                {sharedKey
+                  ? `Overrides your saved ${keyLabel} key for this model. `
+                  : `Saved once for every ${keyLabel} model, encrypted on this computer. `}
+                {sharedKey && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    onClick={() => {
+                      setOwnKeyOpen(false);
+                      setUseSharedKey(true);
+                      update({ apiKey: "" });
+                    }}
+                  >
+                    Use the saved key instead
+                  </button>
+                )}
+              </small>
+            </label>
+          ) : (
+            <div className="key-status" role="status">
+              <span aria-hidden="true">✓</span>
+              <span>
+                Uses your saved <strong>{keyLabel}</strong> key.{" "}
+                <button type="button" className="link-button" onClick={() => setOwnKeyOpen(true)}>
+                  Use a different key for this model
+                </button>
+              </span>
+            </div>
+          ))}
         {discoveryEndpoint ? (
           <ModelPicker
             value={editing.model}
@@ -5641,6 +5828,233 @@ function TargetForm({
   );
 }
 
+function ProviderKeysPanel({
+  keys,
+  targets,
+  onChanged,
+  onNotice,
+  onAddModel,
+}: {
+  keys: ProviderKey[];
+  targets: Target[];
+  onChanged: () => Promise<void>;
+  onNotice: (message: string, kind?: Notice["kind"]) => void;
+  onAddModel: (presetId: string) => void;
+}) {
+  const [editingUrl, setEditingUrl] = useState("");
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("local-evals-providers-panel");
+      if (saved) return saved === "open";
+    } catch {
+      /* Panel preference is best-effort. */
+    }
+    return true;
+  });
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    try {
+      window.localStorage.setItem("local-evals-providers-panel", next ? "open" : "closed");
+    } catch {
+      /* Panel preference is best-effort. */
+    }
+  };
+  const rows = [
+    ...PROVIDER_PRESETS.map((preset) => ({
+      id: preset.id,
+      label: preset.label,
+      hint: preset.hint,
+      baseUrl: preset.baseUrl,
+      keyed: preset.needsKey,
+      models: targets.filter((target) => presetForTarget(target).id === preset.id).length,
+    })),
+    ...keys
+      .filter((key) => !PROVIDER_PRESETS.some((preset) => preset.baseUrl === key.baseUrl))
+      .map((key) => ({
+        id: key.baseUrl,
+        label: keyProviderLabel(key.baseUrl),
+        hint: "Custom server",
+        baseUrl: key.baseUrl,
+        keyed: true,
+        models: key.models.length,
+      })),
+  ];
+  const save = async (baseUrl: string) => {
+    if (!value.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/provider-keys", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl, apiKey: value }),
+      });
+      setEditingUrl("");
+      setValue("");
+      await onChanged();
+      onNotice(`${keyProviderLabel(baseUrl)} key saved. Every ${keyProviderLabel(baseUrl)} model uses it.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not save the key", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (key: ProviderKey) => {
+    const label = keyProviderLabel(key.baseUrl);
+    if (
+      !window.confirm(
+        `Remove the saved ${label} key?${key.models.length ? `\n\n${key.models.length} model${key.models.length === 1 ? "" : "s"} will need a key again.` : ""}`,
+      )
+    )
+      return;
+    try {
+      await api(`/api/provider-keys?baseUrl=${encodeURIComponent(key.baseUrl)}`, { method: "DELETE" });
+      await onChanged();
+      onNotice(`${label} key removed.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not remove the key", "error");
+    }
+  };
+  return (
+    <section className={`provider-keys${open ? "" : " collapsed"}`} aria-labelledby="provider-keys-title">
+      <button
+        type="button"
+        className="provider-keys-head"
+        aria-expanded={open}
+        aria-controls="provider-keys-list"
+        onClick={toggle}
+      >
+        <span className="provider-keys-chevron" aria-hidden="true">
+          ›
+        </span>
+        <strong id="provider-keys-title" className="provider-keys-title">
+          Supported providers
+        </strong>
+        {open ? (
+          <p>Cloud providers need an API key, saved once and used by all their models. Local servers need none.</p>
+        ) : (
+          <span className="provider-keys-summary">
+            {rows
+              .filter((row) => row.models > 0 || keys.some((key) => key.baseUrl === row.baseUrl))
+              .map((row) => (
+                <span key={row.id} className="muted-chip">
+                  {row.label}
+                  {keys.some((key) => key.baseUrl === row.baseUrl) ? " ✓" : ""} · {row.models}
+                </span>
+              ))}
+            {targets.some(targetMissingKey) && (
+              <span className="test-badge error">
+                {targets.filter(targetMissingKey).length} need a key
+              </span>
+            )}
+            <span className="provider-keys-more">Show all {rows.length}</span>
+          </span>
+        )}
+      </button>
+      {open && (
+      <>
+      <ul id="provider-keys-list">
+        {rows.map(({ id, label, hint, baseUrl, keyed, models }) => {
+          const key = baseUrl ? keys.find((item) => item.baseUrl === baseUrl) : undefined;
+          const waiting = targets.filter(
+            (target) => baseUrl && normalizeBaseUrl(target.baseUrl) === baseUrl && targetMissingKey(target),
+          ).length;
+          const isPreset = PROVIDER_PRESETS.some((preset) => preset.id === id);
+          return (
+            <li key={id}>
+              <div className="provider-key-name">
+                <span>
+                  <strong>{label}</strong>
+                  <small>
+                    {hint}
+                    {models > 0 && ` · ${models} model${models === 1 ? "" : "s"}`}
+                  </small>
+                </span>
+                <span className={`test-badge ${key ? "ok" : waiting ? "error" : ""}`}>
+                  {key
+                    ? "✓ Key saved"
+                    : waiting
+                      ? `${waiting} model${waiting === 1 ? "" : "s"} need a key`
+                      : keyed
+                        ? "No key yet"
+                        : id === "other"
+                          ? "Key optional"
+                          : "No key needed"}
+                </span>
+              </div>
+              {keyed && editingUrl === baseUrl ? (
+                <form
+                  className="provider-key-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void save(baseUrl);
+                  }}
+                >
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    autoFocus
+                    aria-label={`${label} API key`}
+                    placeholder={`Paste your ${label} key`}
+                    value={value}
+                    onChange={(event) => setValue(event.target.value)}
+                  />
+                  <button className="button primary mini" disabled={busy || !value.trim()}>
+                    {busy ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => {
+                      setEditingUrl("");
+                      setValue("");
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </form>
+              ) : (
+                <div className="provider-key-actions">
+                  {keyed && (
+                    <button
+                      type="button"
+                      className="button secondary mini"
+                      onClick={() => {
+                        setEditingUrl(baseUrl);
+                        setValue("");
+                      }}
+                    >
+                      {key ? "Replace key" : "Add key"}
+                    </button>
+                  )}
+                  {key && (
+                    <button type="button" className="text-button destructive" onClick={() => void remove(key)}>
+                      Remove
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={`Add a ${label} model`}
+                    onClick={() => onAddModel(isPreset ? id : "other")}
+                  >
+                    + Model
+                  </button>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <small>Keys are encrypted on this computer and never shown again.</small>
+      </>
+      )}
+    </section>
+  );
+}
+
 function Targets({
   targets,
   setTargets,
@@ -5651,11 +6065,53 @@ function Targets({
   onNotice: (message: string, kind?: Notice["kind"]) => void;
 }) {
   const [formFor, setFormFor] = useState<Target | "new" | null>(null);
+  const [newPresetId, setNewPresetId] = useState<string>(PROVIDER_PRESETS[0].id);
+  const [query, setQuery] = useState("");
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const visibleTargets = terms.length
+    ? targets.filter((target) => {
+        const text = [
+          target.name,
+          target.model,
+          presetForTarget(target).label,
+          target.baseUrl,
+          target.supportsVision ? `${CAPABILITY_LABELS.supportsVision} reads images vision` : "",
+          target.supportsStructuredOutput ? `${CAPABILITY_LABELS.supportsStructuredOutput} json structured` : "",
+          target.supportsTools ? `${CAPABILITY_LABELS.supportsTools} tool calling` : "",
+          targetMissingKey(target) ? "needs api key" : "",
+        ]
+          .join(" ")
+          .toLowerCase();
+        return terms.every((term) => text.includes(term));
+      })
+    : targets;
+  const formPanel = useRef<HTMLElement>(null);
+  const addModel = (presetId = PROVIDER_PRESETS[0].id) => {
+    setNewPresetId(presetId);
+    setFormFor("new");
+    window.requestAnimationFrame(() => formPanel.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+  };
   const [testing, setTesting] = useState("");
   const [results, setResults] = useState<Record<string, TargetTestResult>>({});
+  const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
   const showForm = formFor !== null || !targets.length;
   const upsert = (target: Target) =>
     setTargets([...targets.filter((item) => item.name !== target.name), target].sort((a, b) => a.name.localeCompare(b.name)));
+  const refreshKeys = async () => {
+    try {
+      const [keys, latest] = await Promise.all([
+        api<ProviderKey[]>("/api/provider-keys"),
+        api<Target[]>("/api/targets"),
+      ]);
+      setProviderKeys(keys);
+      setTargets(latest);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not load API keys", "error");
+    }
+  };
+  useEffect(() => {
+    void refreshKeys();
+  }, []);
   const runTest = async (target: Target) => {
     setTesting(target.name);
     const result = await testTarget(target.name, Boolean(target.supportsVision));
@@ -5664,7 +6120,15 @@ function Targets({
     setTesting("");
   };
   const removeKey = async (target: Target) => {
-    if (!window.confirm(`Remove the saved API key for “${target.name}”?`)) return;
+    const shared = hasProviderKey(providerKeys, target.baseUrl);
+    if (
+      !window.confirm(
+        shared
+          ? `Remove the key saved for “${target.name}” only? It will use your saved ${keyProviderLabel(target.baseUrl)} key instead.`
+          : `Remove the saved API key for “${target.name}”?`,
+      )
+    )
+      return;
     try {
       upsert(
         await api<Target>(`/api/targets/${encodeURIComponent(target.name)}`, {
@@ -5695,18 +6159,50 @@ function Targets({
         eyebrow="PREPARE"
         title="Providers"
         sub="Connect the models you want to evaluate. Local servers and cloud providers both work."
-        action={
-          targets.length > 0 && formFor === null ? (
-            <button className="button primary" type="button" onClick={() => setFormFor("new")}>
-              Add model
-            </button>
-          ) : undefined
-        }
+      />
+      <ProviderKeysPanel
+        keys={providerKeys}
+        targets={targets}
+        onChanged={refreshKeys}
+        onNotice={onNotice}
+        onAddModel={addModel}
       />
       <div className={`targets-layout${showForm ? "" : " list-only"}`}>
         {targets.length > 0 && (
-          <section className="target-list" aria-label="Connected models">
-            {targets.map((target) => {
+          <section className="target-list-wrap" aria-labelledby="target-list-title">
+            <div className="target-list-head">
+              <h3 id="target-list-title">
+                Models{" "}
+                <span className="count-chip">
+                  {terms.length ? `${visibleTargets.length} of ${targets.length}` : targets.length}
+                </span>
+              </h3>
+              {targets.length > 2 && (
+                <input
+                  type="search"
+                  className="target-search"
+                  aria-label="Search models"
+                  placeholder="Search by name, model ID, provider, or capability"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              )}
+              {formFor === null && (
+                <button className="button primary mini" type="button" onClick={() => addModel()}>
+                  + Add model
+                </button>
+              )}
+            </div>
+            {terms.length > 0 && !visibleTargets.length && (
+              <p className="target-search-empty">
+                No models match “{query.trim()}”.{" "}
+                <button type="button" className="link-button" onClick={() => setQuery("")}>
+                  Clear search
+                </button>
+              </p>
+            )}
+            <div className="target-list">
+            {visibleTargets.map((target) => {
               const result = results[target.name];
               return (
                 <article className="target-card" key={target.name}>
@@ -5736,7 +6232,10 @@ function Targets({
                       .map((key) => (
                         <li key={key}>{CAPABILITY_LABELS[key]}</li>
                       ))}
-                    {target.hasApiKey && <li className="muted-chip">Key saved</li>}
+                    {target.keySource === "provider" && (
+                      <li className="muted-chip">Uses {keyProviderLabel(target.baseUrl)} key</li>
+                    )}
+                    {target.keySource === "model" && <li className="muted-chip">Own key</li>}
                   </ul>
                   <footer>
                     <button className="button mini" type="button" disabled={testing === target.name} onClick={() => void runTest(target)}>
@@ -5748,7 +6247,16 @@ function Targets({
                     <ActionsMenu
                       label={`More actions for ${target.name}`}
                       items={[
-                        ...(target.hasApiKey ? [{ label: "Remove saved key", onSelect: () => void removeKey(target) }] : []),
+                        ...(target.keySource === "model"
+                          ? [
+                              {
+                                label: hasProviderKey(providerKeys, target.baseUrl)
+                                  ? `Use saved ${keyProviderLabel(target.baseUrl)} key`
+                                  : "Remove saved key",
+                                onSelect: () => void removeKey(target),
+                              },
+                            ]
+                          : []),
                         { label: "Delete", destructive: true, onSelect: () => void remove(target) },
                       ]}
                     />
@@ -5756,19 +6264,27 @@ function Targets({
                 </article>
               );
             })}
+            </div>
           </section>
         )}
         {showForm && (
-          <section className="panel target-form-panel" aria-label={formFor && formFor !== "new" ? "Edit model" : "Add a model"}>
+          <section
+            ref={formPanel}
+            className="panel target-form-panel"
+            aria-label={formFor && formFor !== "new" ? "Edit model" : "Add a model"}
+          >
             <h3>{formFor && formFor !== "new" ? `Edit ${formFor.name}` : targets.length ? "Add a model" : "Connect your first model"}</h3>
             <TargetForm
-              key={formFor && formFor !== "new" ? formFor.name : "new"}
+              key={formFor && formFor !== "new" ? formFor.name : `new-${newPresetId}`}
               initial={formFor && formFor !== "new" ? formFor : undefined}
+              initialPresetId={newPresetId}
               targets={targets}
+              providerKeys={providerKeys}
               onNotice={onNotice}
               onCancel={targets.length ? () => setFormFor(null) : undefined}
               onSaved={(target, test) => {
                 upsert(target);
+                void refreshKeys();
                 if (test) setResults((current) => ({ ...current, [target.name]: test }));
                 if (!test || test.ok) {
                   onNotice(test ? `“${target.name}” saved and connected.` : `“${target.name}” saved.`);
@@ -6576,6 +7092,24 @@ function SetupPanel({
       toolChoice: example.toolChoice ?? current.toolChoice,
       toolCallOrder: example.toolCallOrder ?? current.toolCallOrder,
     }));
+  };
+  const loadExampleRubric = async () => {
+    if (
+      form.judgeRubric.trim() &&
+      !window.confirm("Replace your judge instructions with the example? Your current text will be lost.")
+    )
+      return;
+    setExampleBusy(true);
+    try {
+      const example = await api<SetupConfig>(`/api/examples/${encodeURIComponent(currentTaskKind)}`);
+      if (!example.judgeRubric?.trim()) throw new Error("This evaluation type has no example judge instructions.");
+      setForm((current) => ({ ...current, judgeRubric: example.judgeRubric! }));
+      onNotice("Example judge instructions loaded. Adjust them for your data.");
+    } catch (err) {
+      onNotice(err instanceof Error ? err.message : "Could not load the example", "error");
+    } finally {
+      setExampleBusy(false);
+    }
   };
   const loadSampleSettings = async () => {
     setExampleBusy(true);
@@ -7692,6 +8226,18 @@ function SetupPanel({
                   placeholder="Is the vendor the legal entity rather than a brand name? Is every field supported by the document?"
                 />
               </label>
+            )}
+            {form.judgeTarget && (
+              <div className="config-preset-actions">
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={exampleBusy}
+                  onClick={() => void loadExampleRubric()}
+                >
+                  {exampleBusy ? "Loading example…" : "Use example"}
+                </button>
+              </div>
             )}
           </section>
         </>

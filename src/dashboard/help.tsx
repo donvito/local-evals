@@ -400,7 +400,7 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
             <div>
               <span className="help-choice-icon" aria-hidden="true">⇪</span>
               <strong>Import a file</strong>
-              <span>A JSONL or JSON manifest with your own cases.</span>
+              <span>A dataset ZIP, or a JSONL or JSON manifest with your own cases.</span>
             </div>
             <div>
               <span className="help-choice-icon" aria-hidden="true">✦</span>
@@ -440,8 +440,9 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
             <>
               <p>
                 In <strong>Datasets</strong>, select <strong>Add dataset</strong>,
-                then <strong>Import a file</strong>, and enter the file path.
-                You can also do this in the Data step of the guided setup. Use a path relative to the project
+                then <strong>Import a file</strong>. Drop or choose a dataset ZIP,
+                or enter the path of a manifest or ZIP.
+                You can also enter a path in the Data step of the guided setup. Use a path relative to the project
                 folder, such as <code>datasets/receipts.jsonl</code>. Keep
                 private files in <code>datasets/</code>, which Git ignores.
               </p>
@@ -451,6 +452,62 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
                 again creates a new version, so earlier runs stay comparable.
               </p>
               {open("datasets", "Open Datasets")}
+            </>
+          ),
+        },
+        {
+          id: "dataset-zip",
+          title: "Dataset ZIP files",
+          keywords: "zip upload archive bundle example folder layout images manifest drag drop",
+          body: (
+            <>
+              <p>
+                A dataset ZIP bundles a manifest with the images it lists, so
+                one file holds the whole dataset:
+              </p>
+              <HelpCode>
+                {`my-receipts.zip
+├── manifest.jsonl     one case per line (or manifest.json)
+├── assets/
+│   ├── receipt-001.jpeg
+│   └── receipt-002.png
+├── README.md          optional, ignored
+└── AGENTS.md          optional, ignored`}
+              </HelpCode>
+              <ul>
+                <li>
+                  Each <code>imagePath</code> is relative to the manifest and
+                  must point to a PNG or JPEG inside the ZIP, such as{" "}
+                  <code>assets/receipt-001.jpeg</code>.
+                </li>
+                <li>
+                  The manifest can also sit inside one top-level folder, as
+                  when you compress a folder in Finder or Explorer. If it isn&apos;t
+                  named <code>manifest.jsonl</code> or <code>manifest.json</code>,
+                  it must be the only <code>.jsonl</code>/<code>.json</code> file there.
+                </li>
+                <li>
+                  A JSONL dataset is named after the ZIP. In{" "}
+                  <code>manifest.json</code>, set <code>name</code> to choose one.
+                </li>
+                <li>
+                  Uploads can be up to 512 MB. Standard ZIPs work; encrypted
+                  ZIPs and symlinks are rejected.
+                </li>
+              </ul>
+              <p>
+                The quickest start is the example: three synthetic invoices,
+                their manifest, a <code>README.md</code> describing every field,
+                and an <code>AGENTS.md</code> with step-by-step rules for an AI
+                coding agent building a new dataset from it. Replace the images,
+                edit the manifest, and zip the files again, or hand the example
+                to your agent.
+              </p>
+              <p>
+                <a className="button secondary" href="/api/datasets/example.zip" download>
+                  Download example ZIP
+                </a>
+              </p>
             </>
           ),
         },
@@ -466,7 +523,10 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
               </HelpCode>
               <p>
                 Give each case a unique <code>caseId</code>. Images must be PNG
-                or JPEG, stored inside the manifest's folder.{" "}
+                or JPEG, stored inside the manifest's folder (for example{" "}
+                <code>datasets/receipts/assets/</code> next to{" "}
+                <code>datasets/receipts/manifest.jsonl</code>). To add images,
+                copy them there, add a line for each, and import again.{" "}
                 <code>referenceTranscription</code> is optional and enables OCR
                 scoring or extraction from reference text.
               </p>
@@ -804,16 +864,23 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
         {
           id: "api-keys",
           title: "How API keys are stored",
-          keywords: "credentials secret encrypted vault apiKeyEnv",
+          keywords: "credentials secret encrypted vault apiKeyEnv shared provider key openrouter once",
           body: (
-            <p>
-              Keys entered in Providers are encrypted with a key file stored next
-              to the database (<code>{`${DEFAULT_DB_PATH}.credentials.key`}</code>).
-              Keep that file private: anyone with it and the database can read
-              your saved keys. Target files used with the CLI must reference an
-              environment variable with <code>apiKeyEnv</code> instead of
-              containing a key.
-            </p>
+            <>
+              <p>
+                Each provider's key is saved once, in <strong>Providers → API keys</strong> or
+                the first time you add one of its models. Every model on the same server URL
+                uses it, so adding another OpenRouter model needs no key. To use a different
+                key for one model, edit it and choose <strong>Use a different key for this model</strong>.
+              </p>
+              <p>
+                Keys are encrypted with a key file stored next to the database
+                (<code>{`${DEFAULT_DB_PATH}.credentials.key`}</code>). Keep that file private:
+                anyone with it and the database can read your saved keys. Target files used with
+                the CLI must reference an environment variable with <code>apiKeyEnv</code> instead
+                of containing a key.
+              </p>
+            </>
           ),
         },
         {

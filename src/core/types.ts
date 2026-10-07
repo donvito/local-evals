@@ -79,6 +79,8 @@ export type TargetConfig = {
   /** Runtime-only decrypted credential; never serialize or persist this field. */
   apiKey?: string;
   hasApiKey?: boolean;
+  /** Where a saved key comes from: this model's own key or the shared provider key. */
+  keySource?: "model" | "provider";
 };
 
 export type RunConfig = {

@@ -32,5 +32,6 @@
   ],
   "crossFieldRules": [
     { "name": "line item amounts equal subtotal", "type": "sum_equals", "fields": ["lineItems.0.amount", "lineItems.1.amount"], "total": "subtotal", "tolerance": 0.01 }
-  ]
+  ],
+  "judgeRubric": "You are reviewing invoice data extracted from a document. Compare the actual answer with the expected answer.\n\nPass if:\n- vendor and billTo name the same companies, ignoring case, punctuation, and legal suffixes such as Inc. or Co.;\n- invoiceNumber, purchaseOrder, and date refer to the same values, even if formatted differently;\n- every line item is present with the same quantity, unit price, and amount, in any order;\n- subtotal, tax, and total match within one cent.\n\nFail if any value is missing, invented, or taken from the wrong part of the document (for example a remit-to address used as billTo)."
 }

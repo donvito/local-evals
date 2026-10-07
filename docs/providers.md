@@ -7,9 +7,15 @@ A target is a named provider endpoint and model. Configure targets in **Provider
 ## Add a target in the app
 
 1. Open **Providers** and fill in the target name, provider type, base URL, and model ID.
-2. Enter an API key if the endpoint requires one.
+2. Enter an API key if the endpoint requires one. You only do this once per provider (see below).
 3. Set the capabilities supported by that model and endpoint: Vision, Structured JSON, or Tool calling.
 4. Save the target and use its test action to check connectivity.
+
+### API keys are saved once per provider
+
+The **API keys** panel at the top of Providers holds one key per provider, such as OpenRouter or OpenAI. The key you enter while adding a model is saved there too, and every model with the same base URL uses it, so later models need no key. Use **Replace** to rotate a key for all of them at once, or **Remove** to delete it (models that relied on it then show **Needs API key**).
+
+To use a different key for a single model, edit it and choose **Use a different key for this model**; that model keeps its own key until you choose **Use the saved key instead**. Databases created before shared keys move each model's key into the provider's shared key the first time they open; a model whose key differed from the others keeps it as its own.
 
 Choose a vision-capable target for document OCR. Extraction can use a separate text model or the same endpoint. Tool-call evaluations require a model that supports tools.
 

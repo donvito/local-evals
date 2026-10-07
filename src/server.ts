@@ -5,12 +5,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { DatabaseStore } from "./storage/db.js";
+import { DatabaseStore, normalizeBaseUrl } from "./storage/db.js";
 import {
   datasetJsonl,
   generatedManifest,
   importManifest,
 } from "./core/manifest.js";
+import {
+  exampleDatasetZip,
+  importDatasetZip,
+  MAX_DATASET_ZIP_BYTES,
+} from "./core/dataset-zip.js";
 import { compareRuns, markdownReport } from "./core/reports.js";
 import { runEvaluation } from "./core/runner.js";
 import {
@@ -137,7 +142,7 @@ export async function startServer(
       value && typeof value === "object"
         ? Object.fromEntries(
             Object.entries(value).filter(
-              ([key]) => !/^(apiKey|apiKeyEncrypted|hasApiKey)$/.test(key),
+              ([key]) => !/^(apiKey|apiKeyEncrypted|hasApiKey|keySource)$/.test(key),
             ),
           )
         : value;
@@ -582,17 +587,51 @@ export async function startServer(
         json(db.listTargets());
         return;
       }
+      if (url.pathname === "/api/provider-keys") {
+        if (req.method === "GET") {
+          const targets = db.listTargets();
+          json(
+            db.listProviderKeys().map((entry) => ({
+              ...entry,
+              models: targets
+                .filter((target) => target.keySource === "provider" && normalizeBaseUrl(target.baseUrl) === entry.baseUrl)
+                .map((target) => target.name),
+            })),
+          );
+          return;
+        }
+        if (req.method === "PUT") {
+          const input = await body();
+          if (typeof input.baseUrl !== "string" || typeof input.apiKey !== "string")
+            throw new Error("Provide baseUrl and apiKey.");
+          db.saveProviderKey(input.baseUrl, input.apiKey);
+          json({ baseUrl: normalizeBaseUrl(input.baseUrl), saved: true });
+          return;
+        }
+        if (req.method === "DELETE") {
+          const baseUrl = url.searchParams.get("baseUrl") ?? "";
+          if (!db.deleteProviderKey(baseUrl)) {
+            json({ error: "No saved key for that provider." }, 404);
+            return;
+          }
+          json({ deleted: true });
+          return;
+        }
+      }
       if (parts[0] === "api" && parts[1] === "targets" && parts[2]) {
         if (req.method === "PUT" && parts.length === 3) {
           const input = await body();
-          const { apiKey, clearApiKey, ...value } = input;
-          if (clearApiKey) {
-            db.clearTargetCredential?.(parts[2]);
-          }
+          const { apiKey, clearApiKey, keyScope, ...value } = input;
+          const sharedKey = keyScope !== "model" && typeof apiKey === "string" && apiKey.trim() ? apiKey : undefined;
+          if (clearApiKey) db.clearTargetCredential(parts[2]);
           db.saveTarget(
             { ...value, name: parts[2] },
-            typeof apiKey === "string" ? apiKey : undefined,
+            !sharedKey && typeof apiKey === "string" ? apiKey : undefined,
           );
+          if (sharedKey) {
+            db.saveProviderKey(value.baseUrl, sharedKey);
+            db.clearTargetCredential(parts[2]);
+          }
           json(db.getTarget(parts[2]) ?? { error: "Target not found." });
           return;
         }
@@ -759,14 +798,55 @@ export async function startServer(
         res.end(datasetJsonl(dataset));
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/datasets/example.zip") {
+        const zip = await exampleDatasetZip(path.join(projectRoot, "sample-data"));
+        res.setHeader("content-type", "application/zip");
+        res.setHeader(
+          "content-disposition",
+          'attachment; filename="localevals-example-dataset.zip"',
+        );
+        res.end(zip);
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/datasets/import") {
         const input = await body();
         const file = await projectFile(projectRoot, input.path);
-        const dataset = await importManifest(
-          file,
-          path.join(storageRoot, "assets"),
-          { allowMissingExpected: true },
-        );
+        const dataset = /\.zip$/i.test(file)
+          ? await importDatasetZip(await readFile(file), path.join(storageRoot, "assets"), {
+              allowMissingExpected: true,
+              name: path.basename(file).replace(/\.zip$/i, ""),
+            })
+          : await importManifest(file, path.join(storageRoot, "assets"), {
+              allowMissingExpected: true,
+            });
+        db.saveDataset(dataset);
+        json(dataset);
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/datasets/import-zip") {
+        if (!/^application\/(zip|x-zip-compressed|octet-stream)\b/.test(req.headers["content-type"] ?? ""))
+          throw new Error("Upload the ZIP with content-type application/zip.");
+        const tooLarge = `The ZIP is larger than ${MAX_DATASET_ZIP_BYTES / 1024 ** 2} MB.`;
+        if (Number(req.headers["content-length"] ?? 0) > MAX_DATASET_ZIP_BYTES) {
+          json({ error: tooLarge }, 413);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req as AsyncIterable<Buffer>) {
+          size += chunk.length;
+          if (size > MAX_DATASET_ZIP_BYTES) {
+            json({ error: tooLarge }, 413);
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        }
+        const name = (url.searchParams.get("name") ?? "").replace(/\.zip$/i, "").trim().slice(0, 120);
+        const dataset = await importDatasetZip(Buffer.concat(chunks), path.join(storageRoot, "assets"), {
+          allowMissingExpected: true,
+          name: name || "Uploaded dataset",
+        });
         db.saveDataset(dataset);
         json(dataset);
         return;
