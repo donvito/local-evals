@@ -27,12 +27,18 @@ export const CLI_COMMANDS: CliCommand[] = [
   },
   {
     name: "import",
-    args: "<manifest>",
+    args: "<manifest-or-zip>",
     group: "Datasets & models",
-    summary: "Import a dataset manifest (.jsonl or .json)",
+    summary: "Import a dataset manifest (.jsonl or .json) or dataset ZIP",
     description:
       "Imports cases and copies their images into local storage. Expected answers are optional, so unlabeled data can be used for inference-only runs.",
-    examples: [`${CLI_PREFIX} import sample-data/manifest.jsonl`],
+    notes: [
+      "A dataset ZIP holds manifest.jsonl (or manifest.json) at its top level, or inside one folder, plus the images it lists. Download an example (with README.md and AGENTS.md) from Datasets → Add dataset → Import a file.",
+    ],
+    examples: [
+      `${CLI_PREFIX} import sample-data/manifest.jsonl`,
+      `${CLI_PREFIX} import ~/Downloads/my-receipts.zip`,
+    ],
   },
   {
     name: "target add",

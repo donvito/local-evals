@@ -832,6 +832,17 @@ const importDatasetPath = (datasetPath: string) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ path: datasetPath }),
   });
+const ADD_DATASET_MODES = [
+  ["sample", "⚡", "Quick sample", "One click. Best for learning."],
+  ["import", "⇪", "Import a file", "A dataset ZIP, or a JSONL or JSON manifest."],
+  ["generate", "✦", "Generate", "A model drafts text or tool-calling cases."],
+] as const;
+const importDatasetZipFile = (file: File) =>
+  api<Dataset>(`/api/datasets/import-zip?name=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: file,
+  });
 const schemaFieldsMissing = (schemaText: string, dataset?: Dataset) => {
   const schema = parseEditorJson(schemaText) as { properties?: Record<string, unknown> } | undefined;
   const properties =
@@ -2948,10 +2959,12 @@ function Datasets({
 }) {
   const [path, setPath] = useState("");
   const [importBusy, setImportBusy] = useState(false);
+  const [zipDragging, setZipDragging] = useState(false);
   const [generationSubmitting, setGenerationSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const [messageKind, setMessageKind] = useState<Notice["kind"]>("success");
   const [createOpen, setCreateOpen] = useState(false);
+  const addDialog = useRef<HTMLDialogElement>(null);
   const [addMode, setAddMode] = useState<"sample" | "import" | "generate">("sample");
   const [jobs, setJobs] = useState<DatasetJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
@@ -3449,11 +3462,22 @@ function Datasets({
   useEffect(() => {
     if (!generateTarget && targets[0]?.name) setGenerateTarget(targets[0].name);
   }, [generateTarget, targets]);
-  const importPath = async (datasetPath: string, label: string) => {
+  const importPath = (datasetPath: string, label: string) =>
+    runImport(() => importDatasetPath(datasetPath), label);
+  const uploadZip = (file?: File) => {
+    if (!file || importBusy) return;
+    if (!/\.zip$/i.test(file.name)) {
+      setMessageKind("error");
+      setMessage("Choose a .zip file. For a JSONL or JSON manifest, enter its path below.");
+      return;
+    }
+    void runImport(() => importDatasetZipFile(file), file.name);
+  };
+  const runImport = async (request: () => Promise<Dataset>, label: string) => {
     setImportBusy(true);
     setMessage("");
     try {
-      const imported = await importDatasetPath(datasetPath);
+      const imported = await request();
       await onRefresh();
       setSelectedVersion(imported.version);
       setPath("");
@@ -3534,7 +3558,243 @@ function Datasets({
     taskKind,
     path: SAMPLE_DATASETS[taskKind],
   }));
-  const addPanelOpen = createOpen || (!datasets.length && !jobs.length && !jobsLoading);
+  const addInline = !datasets.length && !jobs.length && !jobsLoading;
+  useEffect(() => {
+    const node = addDialog.current;
+    if (!node) return;
+    if (createOpen && !addInline && !node.open) node.showModal();
+    else if ((!createOpen || addInline) && node.open) node.close();
+  }, [createOpen, addInline]);
+  const messageNotice = message ? (
+    <div
+      className={`import-message ${messageKind}`}
+      role={messageKind === "error" ? "alert" : "status"}
+      aria-live="polite"
+    >
+      {message}
+      <button
+        type="button"
+        aria-label="Dismiss dataset message"
+        onClick={() => setMessage("")}
+      >
+        ×
+      </button>
+    </div>
+  ) : null;
+  const addPanel = (
+    <div className="add-dataset" id="dataset-create-panel">
+      <div className="add-dataset-head">
+        <h3>Add a dataset</h3>
+        {(datasets.length > 0 || jobs.length > 0) && (
+          <button type="button" className="text-button" onClick={() => setCreateOpen(false)}>
+            Close
+          </button>
+        )}
+      </div>
+      <div className="add-dataset-tabs">
+        <div className="add-dataset-modes" role="tablist" aria-label="How to add a dataset">
+          {ADD_DATASET_MODES.map(([mode, icon, title, text]) => (
+            <button
+              key={mode}
+              type="button"
+              role="tab"
+              aria-selected={addMode === mode}
+              title={text}
+              className={`add-dataset-mode${addMode === mode ? " selected" : ""}`}
+              onClick={() => setAddMode(mode)}
+            >
+              <span className="add-dataset-icon" aria-hidden="true">{icon}</span>
+              {title}
+            </button>
+          ))}
+        </div>
+        <p className="add-dataset-hint">
+          {ADD_DATASET_MODES.find(([mode]) => mode === addMode)?.[3]}
+        </p>
+      </div>
+      {addMode === "sample" && (
+        <div className="add-dataset-body sample-imports">
+          {sampleDatasets.map((sample) => (
+            <button
+              key={sample.taskKind}
+              type="button"
+              className="button secondary"
+              disabled={importBusy}
+              onClick={() => void importPath(sample.path, TASK_KIND_LABELS[sample.taskKind])}
+            >
+              {TASK_KIND_LABELS[sample.taskKind]} sample
+            </button>
+          ))}
+        </div>
+      )}
+      {addMode === "import" && (
+        <div className="import-pane" aria-busy={importBusy}>
+          <div className="import-zip-row">
+            <div
+              className={`zip-drop${zipDragging ? " dragging" : ""}`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setZipDragging(true);
+              }}
+              onDragLeave={() => setZipDragging(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setZipDragging(false);
+                uploadZip(event.dataTransfer.files[0]);
+              }}
+            >
+              <span className="zip-drop-icon" aria-hidden="true">⇪</span>
+              <strong>
+                {importBusy ? "Importing…" : zipDragging ? "Release to import" : "Drop a dataset ZIP here"}
+              </strong>
+              <label className={`button secondary${importBusy ? " disabled" : ""}`}>
+                Choose ZIP file
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  className="sr-only"
+                  disabled={importBusy}
+                  onChange={(event) => {
+                    uploadZip(event.target.files?.[0]);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              <small>Up to 512 MB</small>
+            </div>
+            <aside className="zip-anatomy" aria-label="What goes in a dataset ZIP">
+              <span className="eyebrow">What&apos;s inside</span>
+              <pre aria-hidden="true">{`my-dataset.zip
+├─ manifest.jsonl
+├─ assets/
+│  └─ receipt-001.jpeg
+└─ README.md  (optional)`}</pre>
+              <p>
+                One case per line in <code>manifest.jsonl</code>, each pointing to an image in the ZIP.
+              </p>
+              <div className="zip-anatomy-actions">
+                <a className="button secondary mini" href="/api/datasets/example.zip" download>
+                  Download example
+                </a>
+                <a
+                  className="text-button"
+                  href="#help/dataset-zip"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label="Format guide (opens in a new tab)"
+                >
+                  Format guide <span aria-hidden="true">↗</span>
+                </a>
+              </div>
+            </aside>
+          </div>
+          <div className="import-divider" role="separator">
+            <span>or</span>
+          </div>
+          <form className="import-path" onSubmit={importDataset}>
+            <label htmlFor="dataset-import-path">Import from a project path</label>
+            <div className="import-path-row">
+              <input
+                id="dataset-import-path"
+                required
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="datasets/receipts/manifest.jsonl"
+              />
+              <button className="button primary" disabled={importBusy}>
+                {importBusy ? "Importing…" : "Import"}
+              </button>
+            </div>
+            <small>A .jsonl, .json, or .zip file, relative to the project folder.</small>
+          </form>
+        </div>
+      )}
+      {addMode === "generate" && (
+        <form
+          className="add-dataset-body dataset-create-fields"
+          onSubmit={generateDataset}
+          aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
+        >
+          <div className="field">
+            <span className="field-label" id="generate-model-label">Model</span>
+            <Dropdown
+              labelledBy="generate-model-label"
+              value={generateTarget}
+              onChange={setGenerateTarget}
+              options={targetOptions(targets).slice(1)}
+              placeholder="Choose a model"
+            />
+            {!targets.length && <small>Add a model in Providers first.</small>}
+          </div>
+          <div className="field">
+            <span className="field-label" id="generate-type-label">Type</span>
+            <Dropdown
+              labelledBy="generate-type-label"
+              value={generateTaskKind}
+              onChange={(kind) => setGenerateTaskKind(kind as "text-json" | "tool-calling")}
+              options={[
+                { value: "text-json", label: "Text → JSON", detail: "Inputs with expected JSON fields" },
+                { value: "tool-calling", label: "Tool calling", detail: "Requests with expected tool calls" },
+              ]}
+            />
+          </div>
+          <label className="dataset-create-brief">
+            What should the cases cover?
+            <textarea
+              value={generateBrief}
+              onChange={(event) => setGenerateBrief(event.target.value)}
+              placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
+              rows={3}
+            />
+          </label>
+          <label>
+            Number of cases
+            <input
+              type="number"
+              min="1"
+              max="50"
+              required
+              value={generateCount}
+              onChange={(event) => setGenerateCount(event.target.value)}
+            />
+          </label>
+          <AdvancedOptions>
+            <label>
+              <span>
+                Dataset name <span className="optional">optional</span>
+              </span>
+              <input
+                value={generateName}
+                onChange={(event) => setGenerateName(event.target.value)}
+                placeholder="Support intents — generated"
+              />
+            </label>
+            <label>
+              Time limit (minutes)
+              <input
+                type="number"
+                min="0.5"
+                max="60"
+                step="0.5"
+                required
+                value={generateTimeoutMinutes}
+                onChange={(event) => setGenerateTimeoutMinutes(event.target.value)}
+              />
+              <small>Counts from when generation starts, not while waiting in the queue.</small>
+            </label>
+          </AdvancedOptions>
+          <p className="setup-hint">Images can't be generated. Import document datasets from files.</p>
+          <button className="button primary" type="submit" disabled={generationSubmitting || !targets.length}>
+            {generationSubmitting
+              ? "Starting…"
+              : activeGenerationJob || queuedGenerationCount
+                ? "Add to queue"
+                : "Generate dataset"}
+          </button>
+        </form>
+      )}
+    </div>
+  );
   return (
     <>
       <PageTitle
@@ -3542,190 +3802,37 @@ function Datasets({
         title="Datasets"
         sub="The examples your model answers, with optional expected answers."
         action={
-          addPanelOpen ? undefined : (
+          addInline ? undefined : (
             <button
               type="button"
               className="button primary"
               onClick={() => setCreateOpen(true)}
-              aria-controls="dataset-create-panel"
+              aria-haspopup="dialog"
             >
               Add dataset
             </button>
           )
         }
       />
-      <section className="panel dataset-panel">
-        {addPanelOpen ? (
-          <div className="add-dataset" id="dataset-create-panel">
-            <div className="add-dataset-head">
-              <h3>Add a dataset</h3>
-              {(datasets.length > 0 || jobs.length > 0) && (
-                <button type="button" className="text-button" onClick={() => setCreateOpen(false)}>
-                  Close
-                </button>
-              )}
-            </div>
-            <div className="add-dataset-modes" role="tablist" aria-label="How to add a dataset">
-              {(
-                [
-                  ["sample", "⚡", "Quick sample", "One click. Best for learning."],
-                  ["import", "⇪", "Import a file", "A JSONL or JSON manifest."],
-                  ["generate", "✦", "Generate", "A model drafts the cases."],
-                ] as const
-              ).map(([mode, icon, title, text]) => (
-                <button
-                  key={mode}
-                  type="button"
-                  role="tab"
-                  aria-selected={addMode === mode}
-                  className={`add-dataset-mode${addMode === mode ? " selected" : ""}`}
-                  onClick={() => setAddMode(mode)}
-                >
-                  <span className="add-dataset-icon" aria-hidden="true">{icon}</span>
-                  <strong>{title}</strong>
-                  <span>{text}</span>
-                </button>
-              ))}
-            </div>
-            {addMode === "sample" && (
-              <div className="add-dataset-body sample-imports">
-                {sampleDatasets.map((sample) => (
-                  <button
-                    key={sample.taskKind}
-                    type="button"
-                    className="button secondary"
-                    disabled={importBusy}
-                    onClick={() => void importPath(sample.path, TASK_KIND_LABELS[sample.taskKind])}
-                  >
-                    {TASK_KIND_LABELS[sample.taskKind]} sample
-                  </button>
-                ))}
-              </div>
-            )}
-            {addMode === "import" && (
-              <form className="add-dataset-body" onSubmit={importDataset} aria-busy={importBusy}>
-                <label htmlFor="dataset-import-path">
-                  File path
-                  <div className="inline-form">
-                    <input
-                      id="dataset-import-path"
-                      required
-                      value={path}
-                      onChange={(e) => setPath(e.target.value)}
-                      placeholder="datasets/receipts.jsonl"
-                    />
-                    <button className="button primary" disabled={importBusy}>
-                      {importBusy ? "Importing…" : "Import"}
-                    </button>
-                  </div>
-                  <small>
-                    Relative to the project folder. See Help → Use your own data for the file format.
-                  </small>
-                </label>
-              </form>
-            )}
-            {addMode === "generate" && (
-              <form
-                className="add-dataset-body dataset-create-fields"
-                onSubmit={generateDataset}
-                aria-busy={generationSubmitting || Boolean(activeGenerationJob)}
-              >
-                <div className="field">
-                  <span className="field-label" id="generate-model-label">Model</span>
-                  <Dropdown
-                    labelledBy="generate-model-label"
-                    value={generateTarget}
-                    onChange={setGenerateTarget}
-                    options={targetOptions(targets).slice(1)}
-                    placeholder="Choose a model"
-                  />
-                  {!targets.length && <small>Add a model in Providers first.</small>}
-                </div>
-                <div className="field">
-                  <span className="field-label" id="generate-type-label">Type</span>
-                  <Dropdown
-                    labelledBy="generate-type-label"
-                    value={generateTaskKind}
-                    onChange={(kind) => setGenerateTaskKind(kind as "text-json" | "tool-calling")}
-                    options={[
-                      { value: "text-json", label: "Text → JSON", detail: "Inputs with expected JSON fields" },
-                      { value: "tool-calling", label: "Tool calling", detail: "Requests with expected tool calls" },
-                    ]}
-                  />
-                </div>
-                <label className="dataset-create-brief">
-                  What should the cases cover?
-                  <textarea
-                    value={generateBrief}
-                    onChange={(event) => setGenerateBrief(event.target.value)}
-                    placeholder="Classify support messages by urgency and topic. Include ambiguous and edge cases."
-                    rows={3}
-                  />
-                </label>
-                <label>
-                  Number of cases
-                  <input
-                    type="number"
-                    min="1"
-                    max="50"
-                    required
-                    value={generateCount}
-                    onChange={(event) => setGenerateCount(event.target.value)}
-                  />
-                </label>
-                <AdvancedOptions>
-                  <label>
-                    <span>
-                      Dataset name <span className="optional">optional</span>
-                    </span>
-                    <input
-                      value={generateName}
-                      onChange={(event) => setGenerateName(event.target.value)}
-                      placeholder="Support intents — generated"
-                    />
-                  </label>
-                  <label>
-                    Time limit (minutes)
-                    <input
-                      type="number"
-                      min="0.5"
-                      max="60"
-                      step="0.5"
-                      required
-                      value={generateTimeoutMinutes}
-                      onChange={(event) => setGenerateTimeoutMinutes(event.target.value)}
-                    />
-                    <small>Counts from when generation starts, not while waiting in the queue.</small>
-                  </label>
-                </AdvancedOptions>
-                <p className="setup-hint">Images can't be generated. Import document datasets from files.</p>
-                <button className="button primary" type="submit" disabled={generationSubmitting || !targets.length}>
-                  {generationSubmitting
-                    ? "Starting…"
-                    : activeGenerationJob || queuedGenerationCount
-                      ? "Add to queue"
-                      : "Generate dataset"}
-                </button>
-              </form>
-            )}
-          </div>
-        ) : null}
-        {message && (
-          <div
-            className={`import-message ${messageKind}`}
-            role={messageKind === "error" ? "alert" : "status"}
-            aria-live="polite"
-          >
-            {message}
-            <button
-              type="button"
-              aria-label="Dismiss dataset message"
-              onClick={() => setMessage("")}
-            >
-              ×
-            </button>
-          </div>
+      <dialog
+        ref={addDialog}
+        className="add-dataset-dialog"
+        aria-label="Add a dataset"
+        onClose={() => setCreateOpen(false)}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) addDialog.current?.close();
+        }}
+      >
+        {createOpen && !addInline && (
+          <>
+            {addPanel}
+            {messageKind === "error" && messageNotice}
+          </>
         )}
+      </dialog>
+      <section className="panel dataset-panel">
+        {addInline && addPanel}
+        {!(createOpen && !addInline && messageKind === "error") && messageNotice}
         {datasets.length || jobsLoading || jobsError || jobs.length ? (
           <div className="dataset-library">
             <div className="dataset-library-layout">
@@ -6577,6 +6684,24 @@ function SetupPanel({
       toolCallOrder: example.toolCallOrder ?? current.toolCallOrder,
     }));
   };
+  const loadExampleRubric = async () => {
+    if (
+      form.judgeRubric.trim() &&
+      !window.confirm("Replace your judge instructions with the example? Your current text will be lost.")
+    )
+      return;
+    setExampleBusy(true);
+    try {
+      const example = await api<SetupConfig>(`/api/examples/${encodeURIComponent(currentTaskKind)}`);
+      if (!example.judgeRubric?.trim()) throw new Error("This evaluation type has no example judge instructions.");
+      setForm((current) => ({ ...current, judgeRubric: example.judgeRubric! }));
+      onNotice("Example judge instructions loaded. Adjust them for your data.");
+    } catch (err) {
+      onNotice(err instanceof Error ? err.message : "Could not load the example", "error");
+    } finally {
+      setExampleBusy(false);
+    }
+  };
   const loadSampleSettings = async () => {
     setExampleBusy(true);
     try {
@@ -7692,6 +7817,18 @@ function SetupPanel({
                   placeholder="Is the vendor the legal entity rather than a brand name? Is every field supported by the document?"
                 />
               </label>
+            )}
+            {form.judgeTarget && (
+              <div className="config-preset-actions">
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={exampleBusy}
+                  onClick={() => void loadExampleRubric()}
+                >
+                  {exampleBusy ? "Loading example…" : "Use example"}
+                </button>
+              </div>
             )}
           </section>
         </>

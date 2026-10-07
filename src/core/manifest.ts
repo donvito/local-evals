@@ -148,6 +148,8 @@ async function resolveImage(
     throw new Error(`Case ${item.caseId}: imagePath must be a relative path.`);
   if (path.isAbsolute(item.imagePath))
     throw new Error("Image paths must be relative to the manifest directory.");
+  if (!path.resolve(base, item.imagePath).startsWith(base + path.sep))
+    throw new Error("Image path escapes dataset directory.");
   const resolved = await realpath(path.resolve(base, item.imagePath));
   if (!resolved.startsWith(base + path.sep))
     throw new Error("Image path escapes dataset directory.");

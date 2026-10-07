@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseStore } from "./storage/db.js";
 import { importManifest } from "./core/manifest.js";
+import { importDatasetZip } from "./core/dataset-zip.js";
 import { runEvaluation } from "./core/runner.js";
 import { loadConfig, saveJson } from "./core/project.js";
 import { sanitize, registerSecrets } from "./core/security.js";
@@ -68,8 +69,13 @@ export async function main(args = process.argv.slice(2)) {
       return;
     }
     if (command === "import") {
-      if (!p[0]) throw new Error("Provide a manifest path.");
-      const m = await importManifest(p[0], assetRoot, { allowMissingExpected: true });
+      if (!p[0]) throw new Error("Provide a manifest or dataset ZIP path.");
+      const m = /\.zip$/i.test(p[0])
+        ? await importDatasetZip(await readFile(p[0]), assetRoot, {
+            allowMissingExpected: true,
+            name: path.basename(p[0]).replace(/\.zip$/i, ""),
+          })
+        : await importManifest(p[0], assetRoot, { allowMissingExpected: true });
       db.saveDataset(m);
       console.log(
         JSON.stringify({ version: m.version, cases: m.cases.length }, null, 2),

@@ -11,6 +11,11 @@ import {
   generatedManifest,
   importManifest,
 } from "./core/manifest.js";
+import {
+  exampleDatasetZip,
+  importDatasetZip,
+  MAX_DATASET_ZIP_BYTES,
+} from "./core/dataset-zip.js";
 import { compareRuns, markdownReport } from "./core/reports.js";
 import { runEvaluation } from "./core/runner.js";
 import {
@@ -759,14 +764,55 @@ export async function startServer(
         res.end(datasetJsonl(dataset));
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/datasets/example.zip") {
+        const zip = await exampleDatasetZip(path.join(projectRoot, "sample-data"));
+        res.setHeader("content-type", "application/zip");
+        res.setHeader(
+          "content-disposition",
+          'attachment; filename="localevals-example-dataset.zip"',
+        );
+        res.end(zip);
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/datasets/import") {
         const input = await body();
         const file = await projectFile(projectRoot, input.path);
-        const dataset = await importManifest(
-          file,
-          path.join(storageRoot, "assets"),
-          { allowMissingExpected: true },
-        );
+        const dataset = /\.zip$/i.test(file)
+          ? await importDatasetZip(await readFile(file), path.join(storageRoot, "assets"), {
+              allowMissingExpected: true,
+              name: path.basename(file).replace(/\.zip$/i, ""),
+            })
+          : await importManifest(file, path.join(storageRoot, "assets"), {
+              allowMissingExpected: true,
+            });
+        db.saveDataset(dataset);
+        json(dataset);
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/datasets/import-zip") {
+        if (!/^application\/(zip|x-zip-compressed|octet-stream)\b/.test(req.headers["content-type"] ?? ""))
+          throw new Error("Upload the ZIP with content-type application/zip.");
+        const tooLarge = `The ZIP is larger than ${MAX_DATASET_ZIP_BYTES / 1024 ** 2} MB.`;
+        if (Number(req.headers["content-length"] ?? 0) > MAX_DATASET_ZIP_BYTES) {
+          json({ error: tooLarge }, 413);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req as AsyncIterable<Buffer>) {
+          size += chunk.length;
+          if (size > MAX_DATASET_ZIP_BYTES) {
+            json({ error: tooLarge }, 413);
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        }
+        const name = (url.searchParams.get("name") ?? "").replace(/\.zip$/i, "").trim().slice(0, 120);
+        const dataset = await importDatasetZip(Buffer.concat(chunks), path.join(storageRoot, "assets"), {
+          allowMissingExpected: true,
+          name: name || "Uploaded dataset",
+        });
         db.saveDataset(dataset);
         json(dataset);
         return;
