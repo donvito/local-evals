@@ -93,10 +93,12 @@ type Target = {
   apiKeyEnv?: string;
   apiKey?: string;
   hasApiKey?: boolean;
+  keySource?: "model" | "provider";
   supportsVision?: boolean;
   supportsStructuredOutput?: boolean;
   supportsTools?: boolean;
 };
+type ProviderKey = { baseUrl: string; updatedAt: string; models: string[] };
 type CaseResult = {
   caseId: string;
   imagePath?: string;
@@ -5198,6 +5200,27 @@ const targetNameFromModel = (model: string, taken: string[]) => {
   for (let index = 2; taken.includes(name); index++) name = `${base}-${index}`;
   return name;
 };
+const normalizeBaseUrl = (value: string) => {
+  const trimmed = value.trim();
+  try {
+    const url = new URL(trimmed);
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+};
+const keyProviderLabel = (baseUrl: string) => {
+  const url = normalizeBaseUrl(baseUrl);
+  const preset = PROVIDER_PRESETS.find((item) => item.baseUrl && item.baseUrl === url);
+  if (preset) return preset.label;
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+const hasProviderKey = (keys: ProviderKey[], baseUrl: string) =>
+  Boolean(baseUrl.trim()) && keys.some((key) => key.baseUrl === normalizeBaseUrl(baseUrl));
 type TargetTestResult = { ok: boolean; message: string };
 const targetMissingKey = (target: Target) =>
   presetForTarget(target).needsKey && !target.hasApiKey && !target.apiKeyEnv;
@@ -5529,25 +5552,42 @@ function ActionsMenu({
 
 function TargetForm({
   initial,
+  initialPresetId,
   targets,
+  providerKeys: suppliedKeys,
   onSaved,
   onCancel,
   onNotice,
 }: {
   initial?: Target;
+  /** Provider preselected for a new model. */
+  initialPresetId?: string;
   targets: Target[];
+  /** Saved provider keys; loaded by the form itself when the parent doesn't supply them. */
+  providerKeys?: ProviderKey[];
   onSaved: (target: Target, test?: TargetTestResult) => void;
   onCancel?: () => void;
   onNotice: (message: string, kind?: Notice["kind"]) => void;
 }) {
   const isEdit = Boolean(initial);
+  const startPreset = PROVIDER_PRESETS.find((item) => item.id === initialPresetId) ?? PROVIDER_PRESETS[0];
   const [preset, setPreset] = useState<ProviderPreset>(() =>
-    initial ? presetForTarget(initial) : PROVIDER_PRESETS[0],
+    initial ? presetForTarget(initial) : startPreset,
   );
   const [editing, setEditing] = useState<Target>(() =>
-    initial ? { ...initial, apiKey: "" } : emptyTarget(PROVIDER_PRESETS[0]),
+    initial ? { ...initial, apiKey: "" } : emptyTarget(startPreset),
   );
   const [nameTouched, setNameTouched] = useState(isEdit);
+  const [ownKeyOpen, setOwnKeyOpen] = useState(false);
+  const [useSharedKey, setUseSharedKey] = useState(false);
+  const [loadedKeys, setLoadedKeys] = useState<ProviderKey[]>([]);
+  useEffect(() => {
+    if (suppliedKeys) return;
+    void api<ProviderKey[]>("/api/provider-keys")
+      .then(setLoadedKeys)
+      .catch(() => setLoadedKeys([]));
+  }, [suppliedKeys]);
+  const providerKeys = suppliedKeys ?? loadedKeys;
   const [busy, setBusy] = useState<"" | "save" | "test">("");
   const [result, setResult] = useState<TargetTestResult | null>(null);
   const takenNames = targets.map((target) => target.name).filter((name) => name !== initial?.name);
@@ -5584,12 +5624,20 @@ function TargetForm({
         : {}),
     });
   };
+  const sharedKey = hasProviderKey(providerKeys, editing.baseUrl);
+  const ownKey = editing.keySource === "model" && !useSharedKey;
+  const keyLabel = preset.id === "other" ? keyProviderLabel(editing.baseUrl) : preset.label;
   const persist = async () => {
     const name = editing.name.trim() || targetNameFromModel(editing.model, takenNames);
     return api<Target>(`/api/targets/${encodeURIComponent(name)}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...editing, name }),
+      body: JSON.stringify({
+        ...editing,
+        name,
+        keyScope: sharedKey ? "model" : "provider",
+        ...(useSharedKey && !editing.apiKey?.trim() ? { clearApiKey: true } : {}),
+      }),
     });
   };
   const submit = async (withTest: boolean) => {
@@ -5597,7 +5645,7 @@ function TargetForm({
       setResult({ ok: false, message: editing.model.trim() ? "Enter the server URL under Advanced options." : "Enter a model ID." });
       return;
     }
-    if (preset.needsKey && !editing.hasApiKey && !editing.apiKeyEnv && !editing.apiKey?.trim()) {
+    if (preset.needsKey && !sharedKey && !editing.hasApiKey && !editing.apiKeyEnv && !editing.apiKey?.trim()) {
       setResult({ ok: false, message: `${preset.label} needs an API key. Paste it above.` });
       return;
     }
@@ -5617,7 +5665,8 @@ function TargetForm({
       setBusy("");
     }
   };
-  const keyNeeded = preset.needsKey && !editing.hasApiKey;
+  const keyNeeded = preset.needsKey && !sharedKey && !editing.hasApiKey;
+  const showKeyInput = !sharedKey || ownKey || ownKeyOpen;
   return (
     <form
       className="target-form"
@@ -5642,28 +5691,59 @@ function TargetForm({
         ))}
       </fieldset>
       <fieldset className="target-form-fields" disabled={Boolean(busy)}>
-        {(preset.needsKey || editing.hasApiKey || preset.id === "other") && (
-          <label>
-            <span>
-              API key <span className="optional">{preset.needsKey ? "required" : "optional"}</span>
-            </span>
-            <input
-              type="password"
-              required={keyNeeded}
-              autoComplete="off"
-              value={editing.apiKey || ""}
-              onChange={(event) => update({ apiKey: event.target.value })}
-              placeholder={
-                editing.hasApiKey
-                  ? "Saved — enter a new key to replace it"
-                  : preset.id === "other"
-                    ? "Paste the key, if your server needs one"
-                    : `Paste your ${preset.label} key`
-              }
-            />
-            <small>Encrypted on this computer and never shown again.</small>
-          </label>
-        )}
+        {(preset.needsKey || editing.hasApiKey || sharedKey || preset.id === "other") &&
+          (showKeyInput ? (
+            <label>
+              <span>
+                {sharedKey ? "API key for this model only" : "API key"}{" "}
+                <span className="optional">{preset.needsKey && !sharedKey ? "required" : "optional"}</span>
+              </span>
+              <input
+                type="password"
+                required={keyNeeded}
+                autoComplete="off"
+                value={editing.apiKey || ""}
+                onChange={(event) => update({ apiKey: event.target.value })}
+                placeholder={
+                  ownKey || (!sharedKey && editing.hasApiKey)
+                    ? "Saved — enter a new key to replace it"
+                    : sharedKey
+                      ? "Paste a key for this model"
+                      : preset.id === "other"
+                        ? "Paste the key, if your server needs one"
+                        : `Paste your ${preset.label} key`
+                }
+              />
+              <small>
+                {sharedKey
+                  ? `Overrides your saved ${keyLabel} key for this model. `
+                  : `Saved once for every ${keyLabel} model, encrypted on this computer. `}
+                {sharedKey && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    onClick={() => {
+                      setOwnKeyOpen(false);
+                      setUseSharedKey(true);
+                      update({ apiKey: "" });
+                    }}
+                  >
+                    Use the saved key instead
+                  </button>
+                )}
+              </small>
+            </label>
+          ) : (
+            <div className="key-status" role="status">
+              <span aria-hidden="true">✓</span>
+              <span>
+                Uses your saved <strong>{keyLabel}</strong> key.{" "}
+                <button type="button" className="link-button" onClick={() => setOwnKeyOpen(true)}>
+                  Use a different key for this model
+                </button>
+              </span>
+            </div>
+          ))}
         {discoveryEndpoint ? (
           <ModelPicker
             value={editing.model}
@@ -5748,6 +5828,233 @@ function TargetForm({
   );
 }
 
+function ProviderKeysPanel({
+  keys,
+  targets,
+  onChanged,
+  onNotice,
+  onAddModel,
+}: {
+  keys: ProviderKey[];
+  targets: Target[];
+  onChanged: () => Promise<void>;
+  onNotice: (message: string, kind?: Notice["kind"]) => void;
+  onAddModel: (presetId: string) => void;
+}) {
+  const [editingUrl, setEditingUrl] = useState("");
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("local-evals-providers-panel");
+      if (saved) return saved === "open";
+    } catch {
+      /* Panel preference is best-effort. */
+    }
+    return true;
+  });
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    try {
+      window.localStorage.setItem("local-evals-providers-panel", next ? "open" : "closed");
+    } catch {
+      /* Panel preference is best-effort. */
+    }
+  };
+  const rows = [
+    ...PROVIDER_PRESETS.map((preset) => ({
+      id: preset.id,
+      label: preset.label,
+      hint: preset.hint,
+      baseUrl: preset.baseUrl,
+      keyed: preset.needsKey,
+      models: targets.filter((target) => presetForTarget(target).id === preset.id).length,
+    })),
+    ...keys
+      .filter((key) => !PROVIDER_PRESETS.some((preset) => preset.baseUrl === key.baseUrl))
+      .map((key) => ({
+        id: key.baseUrl,
+        label: keyProviderLabel(key.baseUrl),
+        hint: "Custom server",
+        baseUrl: key.baseUrl,
+        keyed: true,
+        models: key.models.length,
+      })),
+  ];
+  const save = async (baseUrl: string) => {
+    if (!value.trim()) return;
+    setBusy(true);
+    try {
+      await api("/api/provider-keys", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl, apiKey: value }),
+      });
+      setEditingUrl("");
+      setValue("");
+      await onChanged();
+      onNotice(`${keyProviderLabel(baseUrl)} key saved. Every ${keyProviderLabel(baseUrl)} model uses it.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not save the key", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (key: ProviderKey) => {
+    const label = keyProviderLabel(key.baseUrl);
+    if (
+      !window.confirm(
+        `Remove the saved ${label} key?${key.models.length ? `\n\n${key.models.length} model${key.models.length === 1 ? "" : "s"} will need a key again.` : ""}`,
+      )
+    )
+      return;
+    try {
+      await api(`/api/provider-keys?baseUrl=${encodeURIComponent(key.baseUrl)}`, { method: "DELETE" });
+      await onChanged();
+      onNotice(`${label} key removed.`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not remove the key", "error");
+    }
+  };
+  return (
+    <section className={`provider-keys${open ? "" : " collapsed"}`} aria-labelledby="provider-keys-title">
+      <button
+        type="button"
+        className="provider-keys-head"
+        aria-expanded={open}
+        aria-controls="provider-keys-list"
+        onClick={toggle}
+      >
+        <span className="provider-keys-chevron" aria-hidden="true">
+          ›
+        </span>
+        <strong id="provider-keys-title" className="provider-keys-title">
+          Supported providers
+        </strong>
+        {open ? (
+          <p>Cloud providers need an API key, saved once and used by all their models. Local servers need none.</p>
+        ) : (
+          <span className="provider-keys-summary">
+            {rows
+              .filter((row) => row.models > 0 || keys.some((key) => key.baseUrl === row.baseUrl))
+              .map((row) => (
+                <span key={row.id} className="muted-chip">
+                  {row.label}
+                  {keys.some((key) => key.baseUrl === row.baseUrl) ? " ✓" : ""} · {row.models}
+                </span>
+              ))}
+            {targets.some(targetMissingKey) && (
+              <span className="test-badge error">
+                {targets.filter(targetMissingKey).length} need a key
+              </span>
+            )}
+            <span className="provider-keys-more">Show all {rows.length}</span>
+          </span>
+        )}
+      </button>
+      {open && (
+      <>
+      <ul id="provider-keys-list">
+        {rows.map(({ id, label, hint, baseUrl, keyed, models }) => {
+          const key = baseUrl ? keys.find((item) => item.baseUrl === baseUrl) : undefined;
+          const waiting = targets.filter(
+            (target) => baseUrl && normalizeBaseUrl(target.baseUrl) === baseUrl && targetMissingKey(target),
+          ).length;
+          const isPreset = PROVIDER_PRESETS.some((preset) => preset.id === id);
+          return (
+            <li key={id}>
+              <div className="provider-key-name">
+                <span>
+                  <strong>{label}</strong>
+                  <small>
+                    {hint}
+                    {models > 0 && ` · ${models} model${models === 1 ? "" : "s"}`}
+                  </small>
+                </span>
+                <span className={`test-badge ${key ? "ok" : waiting ? "error" : ""}`}>
+                  {key
+                    ? "✓ Key saved"
+                    : waiting
+                      ? `${waiting} model${waiting === 1 ? "" : "s"} need a key`
+                      : keyed
+                        ? "No key yet"
+                        : id === "other"
+                          ? "Key optional"
+                          : "No key needed"}
+                </span>
+              </div>
+              {keyed && editingUrl === baseUrl ? (
+                <form
+                  className="provider-key-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void save(baseUrl);
+                  }}
+                >
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    autoFocus
+                    aria-label={`${label} API key`}
+                    placeholder={`Paste your ${label} key`}
+                    value={value}
+                    onChange={(event) => setValue(event.target.value)}
+                  />
+                  <button className="button primary mini" disabled={busy || !value.trim()}>
+                    {busy ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => {
+                      setEditingUrl("");
+                      setValue("");
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </form>
+              ) : (
+                <div className="provider-key-actions">
+                  {keyed && (
+                    <button
+                      type="button"
+                      className="button secondary mini"
+                      onClick={() => {
+                        setEditingUrl(baseUrl);
+                        setValue("");
+                      }}
+                    >
+                      {key ? "Replace key" : "Add key"}
+                    </button>
+                  )}
+                  {key && (
+                    <button type="button" className="text-button destructive" onClick={() => void remove(key)}>
+                      Remove
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="text-button"
+                    aria-label={`Add a ${label} model`}
+                    onClick={() => onAddModel(isPreset ? id : "other")}
+                  >
+                    + Model
+                  </button>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <small>Keys are encrypted on this computer and never shown again.</small>
+      </>
+      )}
+    </section>
+  );
+}
+
 function Targets({
   targets,
   setTargets,
@@ -5758,11 +6065,53 @@ function Targets({
   onNotice: (message: string, kind?: Notice["kind"]) => void;
 }) {
   const [formFor, setFormFor] = useState<Target | "new" | null>(null);
+  const [newPresetId, setNewPresetId] = useState<string>(PROVIDER_PRESETS[0].id);
+  const [query, setQuery] = useState("");
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const visibleTargets = terms.length
+    ? targets.filter((target) => {
+        const text = [
+          target.name,
+          target.model,
+          presetForTarget(target).label,
+          target.baseUrl,
+          target.supportsVision ? `${CAPABILITY_LABELS.supportsVision} reads images vision` : "",
+          target.supportsStructuredOutput ? `${CAPABILITY_LABELS.supportsStructuredOutput} json structured` : "",
+          target.supportsTools ? `${CAPABILITY_LABELS.supportsTools} tool calling` : "",
+          targetMissingKey(target) ? "needs api key" : "",
+        ]
+          .join(" ")
+          .toLowerCase();
+        return terms.every((term) => text.includes(term));
+      })
+    : targets;
+  const formPanel = useRef<HTMLElement>(null);
+  const addModel = (presetId = PROVIDER_PRESETS[0].id) => {
+    setNewPresetId(presetId);
+    setFormFor("new");
+    window.requestAnimationFrame(() => formPanel.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+  };
   const [testing, setTesting] = useState("");
   const [results, setResults] = useState<Record<string, TargetTestResult>>({});
+  const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
   const showForm = formFor !== null || !targets.length;
   const upsert = (target: Target) =>
     setTargets([...targets.filter((item) => item.name !== target.name), target].sort((a, b) => a.name.localeCompare(b.name)));
+  const refreshKeys = async () => {
+    try {
+      const [keys, latest] = await Promise.all([
+        api<ProviderKey[]>("/api/provider-keys"),
+        api<Target[]>("/api/targets"),
+      ]);
+      setProviderKeys(keys);
+      setTargets(latest);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Could not load API keys", "error");
+    }
+  };
+  useEffect(() => {
+    void refreshKeys();
+  }, []);
   const runTest = async (target: Target) => {
     setTesting(target.name);
     const result = await testTarget(target.name, Boolean(target.supportsVision));
@@ -5771,7 +6120,15 @@ function Targets({
     setTesting("");
   };
   const removeKey = async (target: Target) => {
-    if (!window.confirm(`Remove the saved API key for “${target.name}”?`)) return;
+    const shared = hasProviderKey(providerKeys, target.baseUrl);
+    if (
+      !window.confirm(
+        shared
+          ? `Remove the key saved for “${target.name}” only? It will use your saved ${keyProviderLabel(target.baseUrl)} key instead.`
+          : `Remove the saved API key for “${target.name}”?`,
+      )
+    )
+      return;
     try {
       upsert(
         await api<Target>(`/api/targets/${encodeURIComponent(target.name)}`, {
@@ -5802,18 +6159,50 @@ function Targets({
         eyebrow="PREPARE"
         title="Providers"
         sub="Connect the models you want to evaluate. Local servers and cloud providers both work."
-        action={
-          targets.length > 0 && formFor === null ? (
-            <button className="button primary" type="button" onClick={() => setFormFor("new")}>
-              Add model
-            </button>
-          ) : undefined
-        }
+      />
+      <ProviderKeysPanel
+        keys={providerKeys}
+        targets={targets}
+        onChanged={refreshKeys}
+        onNotice={onNotice}
+        onAddModel={addModel}
       />
       <div className={`targets-layout${showForm ? "" : " list-only"}`}>
         {targets.length > 0 && (
-          <section className="target-list" aria-label="Connected models">
-            {targets.map((target) => {
+          <section className="target-list-wrap" aria-labelledby="target-list-title">
+            <div className="target-list-head">
+              <h3 id="target-list-title">
+                Models{" "}
+                <span className="count-chip">
+                  {terms.length ? `${visibleTargets.length} of ${targets.length}` : targets.length}
+                </span>
+              </h3>
+              {targets.length > 2 && (
+                <input
+                  type="search"
+                  className="target-search"
+                  aria-label="Search models"
+                  placeholder="Search by name, model ID, provider, or capability"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              )}
+              {formFor === null && (
+                <button className="button primary mini" type="button" onClick={() => addModel()}>
+                  + Add model
+                </button>
+              )}
+            </div>
+            {terms.length > 0 && !visibleTargets.length && (
+              <p className="target-search-empty">
+                No models match “{query.trim()}”.{" "}
+                <button type="button" className="link-button" onClick={() => setQuery("")}>
+                  Clear search
+                </button>
+              </p>
+            )}
+            <div className="target-list">
+            {visibleTargets.map((target) => {
               const result = results[target.name];
               return (
                 <article className="target-card" key={target.name}>
@@ -5843,7 +6232,10 @@ function Targets({
                       .map((key) => (
                         <li key={key}>{CAPABILITY_LABELS[key]}</li>
                       ))}
-                    {target.hasApiKey && <li className="muted-chip">Key saved</li>}
+                    {target.keySource === "provider" && (
+                      <li className="muted-chip">Uses {keyProviderLabel(target.baseUrl)} key</li>
+                    )}
+                    {target.keySource === "model" && <li className="muted-chip">Own key</li>}
                   </ul>
                   <footer>
                     <button className="button mini" type="button" disabled={testing === target.name} onClick={() => void runTest(target)}>
@@ -5855,7 +6247,16 @@ function Targets({
                     <ActionsMenu
                       label={`More actions for ${target.name}`}
                       items={[
-                        ...(target.hasApiKey ? [{ label: "Remove saved key", onSelect: () => void removeKey(target) }] : []),
+                        ...(target.keySource === "model"
+                          ? [
+                              {
+                                label: hasProviderKey(providerKeys, target.baseUrl)
+                                  ? `Use saved ${keyProviderLabel(target.baseUrl)} key`
+                                  : "Remove saved key",
+                                onSelect: () => void removeKey(target),
+                              },
+                            ]
+                          : []),
                         { label: "Delete", destructive: true, onSelect: () => void remove(target) },
                       ]}
                     />
@@ -5863,19 +6264,27 @@ function Targets({
                 </article>
               );
             })}
+            </div>
           </section>
         )}
         {showForm && (
-          <section className="panel target-form-panel" aria-label={formFor && formFor !== "new" ? "Edit model" : "Add a model"}>
+          <section
+            ref={formPanel}
+            className="panel target-form-panel"
+            aria-label={formFor && formFor !== "new" ? "Edit model" : "Add a model"}
+          >
             <h3>{formFor && formFor !== "new" ? `Edit ${formFor.name}` : targets.length ? "Add a model" : "Connect your first model"}</h3>
             <TargetForm
-              key={formFor && formFor !== "new" ? formFor.name : "new"}
+              key={formFor && formFor !== "new" ? formFor.name : `new-${newPresetId}`}
               initial={formFor && formFor !== "new" ? formFor : undefined}
+              initialPresetId={newPresetId}
               targets={targets}
+              providerKeys={providerKeys}
               onNotice={onNotice}
               onCancel={targets.length ? () => setFormFor(null) : undefined}
               onSaved={(target, test) => {
                 upsert(target);
+                void refreshKeys();
                 if (test) setResults((current) => ({ ...current, [target.name]: test }));
                 if (!test || test.ok) {
                   onNotice(test ? `“${target.name}” saved and connected.` : `“${target.name}” saved.`);

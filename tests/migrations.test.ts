@@ -49,7 +49,7 @@ describe("database migrations", () => {
       const store = new DatabaseStore(file);
       expect(store.getRun("legacy")?.runId).toBe("legacy");
       expect(store.getRunCases("legacy")).toHaveLength(1);
-      expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 7 });
+      expect(store.db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 8 });
       store.close();
 
       const after = await readdir(directory);
@@ -100,7 +100,7 @@ describe("database migrations", () => {
   it("rejects a database newer than the supported schema before changing it", async () => {
     const { directory, file } = await createOldDatabase(5);
     const future = new Database(file);
-    future.prepare("INSERT INTO schema_migrations VALUES(8, 'future')").run();
+    future.prepare("INSERT INTO schema_migrations VALUES(9, 'future')").run();
     future.close();
     try {
       expect(() => new DatabaseStore(file)).toThrow(/newer than supported/);

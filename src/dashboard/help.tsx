@@ -864,16 +864,23 @@ function buildGuide(onTab: (tab: HelpDestination) => void): HelpSection[] {
         {
           id: "api-keys",
           title: "How API keys are stored",
-          keywords: "credentials secret encrypted vault apiKeyEnv",
+          keywords: "credentials secret encrypted vault apiKeyEnv shared provider key openrouter once",
           body: (
-            <p>
-              Keys entered in Providers are encrypted with a key file stored next
-              to the database (<code>{`${DEFAULT_DB_PATH}.credentials.key`}</code>).
-              Keep that file private: anyone with it and the database can read
-              your saved keys. Target files used with the CLI must reference an
-              environment variable with <code>apiKeyEnv</code> instead of
-              containing a key.
-            </p>
+            <>
+              <p>
+                Each provider's key is saved once, in <strong>Providers → API keys</strong> or
+                the first time you add one of its models. Every model on the same server URL
+                uses it, so adding another OpenRouter model needs no key. To use a different
+                key for one model, edit it and choose <strong>Use a different key for this model</strong>.
+              </p>
+              <p>
+                Keys are encrypted with a key file stored next to the database
+                (<code>{`${DEFAULT_DB_PATH}.credentials.key`}</code>). Keep that file private:
+                anyone with it and the database can read your saved keys. Target files used with
+                the CLI must reference an environment variable with <code>apiKeyEnv</code> instead
+                of containing a key.
+              </p>
+            </>
           ),
         },
         {

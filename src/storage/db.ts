@@ -213,7 +213,28 @@ const MIGRATIONS: Array<[number, string]> = [
       CREATE INDEX runs_experiment_id_idx ON runs(experiment_id);
     `,
   ],
+  [
+    8,
+    `
+      CREATE TABLE provider_keys (
+        base_url TEXT PRIMARY KEY,
+        key_encrypted TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  ],
 ];
+
+/** Provider keys are shared by every model whose server URL matches after normalizing. */
+export function normalizeBaseUrl(value: string): string {
+  const trimmed = String(value ?? "").trim();
+  try {
+    const url = new URL(trimmed);
+    return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
 
 export class DatabaseStore {
   readonly db: SqliteDatabase;
@@ -816,6 +837,7 @@ export class DatabaseStore {
     delete candidate.apiKey;
     delete candidate.apiKeyEncrypted;
     delete candidate.hasApiKey;
+    delete candidate.keySource;
     validateTarget(candidate);
     const existing = this.db
       .prepare("SELECT config_json FROM targets WHERE name=?")
@@ -857,28 +879,98 @@ export class DatabaseStore {
     if (!row?.config_json) return undefined;
     const stored = JSON.parse(row.config_json);
     const target = this.publicTarget(stored);
-    if (includeSecret && stored.apiKeyEncrypted)
-      target.apiKey = this.vault.decrypt(stored.apiKeyEncrypted);
+    if (includeSecret) {
+      const encrypted = stored.apiKeyEncrypted ?? this.providerKeyEncrypted(stored.baseUrl);
+      if (encrypted) target.apiKey = this.vault.decrypt(encrypted);
+    }
     return target;
+  }
+  listProviderKeys(): Array<{ baseUrl: string; updatedAt: string }> {
+    return (
+      this.db
+        .prepare("SELECT base_url, updated_at FROM provider_keys ORDER BY base_url")
+        .all() as Array<{ base_url: string; updated_at: string }>
+    ).map((row) => ({ baseUrl: row.base_url, updatedAt: row.updated_at }));
+  }
+  saveProviderKey(baseUrl: string, apiKey: string): void {
+    const key = apiKey.trim();
+    const url = normalizeBaseUrl(baseUrl);
+    if (!url) throw new Error("A server URL is required.");
+    if (!key) throw new Error("Paste an API key.");
+    this.db
+      .prepare(
+        "INSERT INTO provider_keys VALUES(?,?,?) ON CONFLICT(base_url) DO UPDATE SET key_encrypted=excluded.key_encrypted, updated_at=excluded.updated_at",
+      )
+      .run(url, this.vault.encrypt(key), new Date().toISOString());
+  }
+  deleteProviderKey(baseUrl: string): boolean {
+    return (
+      this.db.prepare("DELETE FROM provider_keys WHERE base_url=?").run(normalizeBaseUrl(baseUrl)).changes > 0
+    );
+  }
+  private providerKeyEncrypted(baseUrl: unknown): string | undefined {
+    if (typeof baseUrl !== "string" || !baseUrl) return undefined;
+    const row = this.db
+      .prepare("SELECT key_encrypted FROM provider_keys WHERE base_url=?")
+      .get(normalizeBaseUrl(baseUrl)) as { key_encrypted: string } | undefined;
+    return row?.key_encrypted;
   }
   resolveTarget(target: any): any {
     const stored = this.getTarget(target.name, true);
     if (!stored) return target;
     const current = { ...stored };
     delete current.hasApiKey;
+    delete current.keySource;
     return { ...target, ...current };
   }
   clearTargetCredential(name: string): void {
     const target = this.getTarget(name);
     if (!target) return;
-    const { hasApiKey, ...withoutFlag } = target;
+    const { hasApiKey, keySource, ...withoutFlag } = target;
     this.db
       .prepare("UPDATE targets SET config_json=? WHERE name=?")
       .run(JSON.stringify(withoutFlag), name);
   }
   private publicTarget(stored: any): any {
     const { apiKeyEncrypted, ...target } = stored;
-    return { ...target, ...(apiKeyEncrypted ? { hasApiKey: true } : {}) };
+    const keySource = apiKeyEncrypted
+      ? "model"
+      : this.providerKeyEncrypted(stored.baseUrl)
+        ? "provider"
+        : undefined;
+    return { ...target, ...(keySource ? { hasApiKey: true, keySource } : {}) };
+  }
+  /**
+   * One-time move of per-model keys into shared provider keys: for each server
+   * URL, the first model's key becomes the provider key, and models holding the
+   * same key drop their copy. Models with a different key keep it as an override.
+   */
+  private promoteTargetKeys(): void {
+    const rows = this.db.prepare("SELECT name, config_json FROM targets ORDER BY name").all() as Array<{
+      name: string;
+      config_json: string;
+    }>;
+    const update = this.db.prepare("UPDATE targets SET config_json=? WHERE name=?");
+    const shared = new Map<string, string>();
+    for (const row of rows) {
+      const stored = JSON.parse(row.config_json);
+      if (!stored.apiKeyEncrypted || typeof stored.baseUrl !== "string") continue;
+      let key: string;
+      try {
+        key = this.vault.decrypt(stored.apiKeyEncrypted);
+      } catch {
+        continue;
+      }
+      const url = normalizeBaseUrl(stored.baseUrl);
+      if (!shared.has(url) && !this.providerKeyEncrypted(url)) {
+        this.saveProviderKey(url, key);
+        shared.set(url, key);
+      }
+      if (shared.get(url) === key) {
+        delete stored.apiKeyEncrypted;
+        update.run(JSON.stringify(stored), row.name);
+      }
+    }
   }
 
   getRunCases(runId: string): StoredCaseResult[] {
@@ -946,6 +1038,7 @@ export class DatabaseStore {
       )) {
         if (appliedVersions.has(version)) continue;
         this.db.exec(sql);
+        if (version === 8) this.promoteTargetKeys();
         insertMigration.run(version, new Date().toISOString());
       }
     });

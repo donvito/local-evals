@@ -103,6 +103,9 @@ async function copyTree(source: string, target: string): Promise<void> {
 
 function sqliteHasEncryptedTargets(db: Database.Database): boolean {
   try {
+    if ((db.prepare("SELECT COUNT(*) AS n FROM provider_keys").get() as { n: number }).n > 0) return true;
+  } catch { /* Older databases have no provider_keys table. */ }
+  try {
     const rows = db.prepare("SELECT config_json FROM targets").all() as Array<{ config_json: string }>;
     return rows.some((row) => {
       try { return Boolean((JSON.parse(row.config_json) as any).apiKeyEncrypted); }
