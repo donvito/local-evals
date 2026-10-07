@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { backupAppData, restoreAppData } from "../src/storage/backup.js";
 import { CredentialVault } from "../src/core/vault.js";
@@ -29,18 +29,36 @@ describe("app data backup", () => {
     const source = await fixture(), backup = join(source.root, "backup"), dest = join(source.root, "restored");
     try {
       await backupAppData(source.dbPath, backup); const { dbPath } = await restoreAppData(backup, dest);
+      const restoredAsset = join(await realpath(dirname(dbPath)), "assets", "a.png");
       const db = new Database(dbPath, { readonly: true });
       try {
       const restored = new CredentialVault(`${dbPath}.credentials.key`);
       expect(restored.decrypt(JSON.parse(db.prepare("SELECT config_json FROM targets").get().config_json).apiKeyEncrypted)).toBe("secret-value");
       expect(db.prepare("SELECT status FROM runs").get()).toEqual({ status: "interrupted" });
       expect(db.prepare("SELECT status FROM dataset_jobs").get()).toEqual({ status: "queued" });
-      expect(JSON.parse(db.prepare("SELECT manifest_json FROM datasets").get().manifest_json).cases[0].imagePath).toBe(join(dest, "assets", "a.png"));
+      expect(JSON.parse(db.prepare("SELECT manifest_json FROM datasets").get().manifest_json).cases[0].imagePath).toBe(restoredAsset);
       const result = JSON.parse(db.prepare("SELECT result_json FROM case_results").get().result_json);
-      expect(result.imagePath).toBe(join(dest, "assets", "a.png"));
+      expect(result.imagePath).toBe(restoredAsset);
       expect(result.originalImagePath).toBe(join(source.source, "assets", "a.png"));
       } finally { db.close(); }
       await expect(restoreAppData(backup, dest)).rejects.toThrow(/already exists/);
+    } finally { await rm(source.root, { recursive: true, force: true }); }
+  });
+  it("remaps image paths saved through a symlinked data folder", async () => {
+    const source = await fixture(), alias = join(source.root, "alias"), dest = join(source.root, "restored");
+    try {
+      await symlink(source.source, alias, process.platform === "win32" ? "junction" : "dir");
+      const viaAlias = join(alias, "assets", "a.png");
+      const db = new Database(source.dbPath);
+      db.prepare("UPDATE datasets SET manifest_json=?").run(JSON.stringify({ cases: [{ imagePath: viaAlias }] }));
+      db.close();
+      const backup = join(source.root, "backup");
+      await backupAppData(join(alias, "source.db"), backup);
+      const { dbPath } = await restoreAppData(backup, dest);
+      const restored = new Database(dbPath, { readonly: true });
+      try {
+        expect(JSON.parse(restored.prepare("SELECT manifest_json FROM datasets").get().manifest_json).cases[0].imagePath).toBe(join(await realpath(dirname(dbPath)), "assets", "a.png"));
+      } finally { restored.close(); }
     } finally { await rm(source.root, { recursive: true, force: true }); }
   });
   it("refuses corruption, overwrite, traversal, and symlink inputs", async () => {

@@ -19,6 +19,8 @@ type InventoryEntry = { path: string; sha256: string; size: number };
 type BackupManifest = {
   formatVersion: 1;
   sourceAssetRoot: string;
+  /** Other spellings of the asset folder (e.g. before resolving symlinks); older backups omit it. */
+  sourceAssetAliases?: string[];
   sourceDbFilename: string;
   files: InventoryEntry[];
 };
@@ -160,26 +162,33 @@ async function verifyBundle(root: string, manifest: BackupManifest): Promise<voi
   }
 }
 
-function relocateImagePaths(value: unknown, sourceRoot: string, destinationRoot: string): unknown {
-  if (Array.isArray(value)) return value.map((item) => relocateImagePaths(item, sourceRoot, destinationRoot));
+/** macOS exposes /var, /tmp, and /etc through /private; treat both spellings as one path. */
+function comparable(value: string): string {
+  return normalized(value).replace(/^\/private(?=\/(?:var|tmp|etc)(?:\/|$))/, "");
+}
+
+function relocateImagePaths(value: unknown, sourceRoots: string[], destinationRoot: string): unknown {
+  if (Array.isArray(value)) return value.map((item) => relocateImagePaths(item, sourceRoots, destinationRoot));
   if (!value || typeof value !== "object") return value;
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
     if (key === "imagePath" && typeof child === "string" && portableAbsolute(child)) {
-      const candidate = normalized(child);
-      const source = normalized(sourceRoot);
-      if (candidate === source || candidate.startsWith(`${source}/`)) {
+      const candidate = comparable(child);
+      const source = sourceRoots
+        .map(comparable)
+        .find((root) => candidate === root || candidate.startsWith(`${root}/`));
+      if (source !== undefined) {
         const suffix = candidate.slice(source.length).replace(/^\//, "");
         output[key] = join(destinationRoot, suffix.replaceAll("/", sep));
         continue;
       }
     }
-    output[key] = relocateImagePaths(child, sourceRoot, destinationRoot);
+    output[key] = relocateImagePaths(child, sourceRoots, destinationRoot);
   }
   return output;
 }
 
-async function rewriteDatabase(dbPath: string, sourceRoot: string, destinationRoot: string): Promise<void> {
+async function rewriteDatabase(dbPath: string, sourceRoots: string[], destinationRoot: string): Promise<void> {
   const db = new Database(dbPath);
   try {
     db.pragma("foreign_keys = ON");
@@ -194,7 +203,7 @@ async function rewriteDatabase(dbPath: string, sourceRoot: string, destinationRo
         for (const row of rows) {
           let parsed: unknown;
           try { parsed = JSON.parse(row.value); } catch { continue; }
-          update.run(JSON.stringify(relocateImagePaths(parsed, sourceRoot, destinationRoot)), row.rowid);
+          update.run(JSON.stringify(relocateImagePaths(parsed, sourceRoots, destinationRoot)), row.rowid);
         }
       }
     }
@@ -242,7 +251,14 @@ export async function backupAppData(dbPath: string, outDir: string): Promise<{ d
     if (await stat(assets).then(() => true, () => false)) await copyTree(assets, join(stage, "assets"));
     const config = join(sourceRoot, "dashboard-config.json");
     if (await stat(config).then(() => true, () => false)) { await ensureNoSymlink(config); await copyFile(config, join(stage, "dashboard-config.json")); await chmod(join(stage, "dashboard-config.json"), 0o600); }
-    const manifest: BackupManifest = { formatVersion: 1, sourceAssetRoot: normalized(await realpath(assets).catch(() => assets)), sourceDbFilename: sourceDb.slice(sourceDb.lastIndexOf(sep) + 1), files: await makeInventory(stage) };
+    const resolvedAssets = normalized(await realpath(assets).catch(() => assets));
+    const manifest: BackupManifest = {
+      formatVersion: 1,
+      sourceAssetRoot: resolvedAssets,
+      sourceAssetAliases: [normalized(assets)].filter((alias) => alias !== resolvedAssets),
+      sourceDbFilename: sourceDb.slice(sourceDb.lastIndexOf(sep) + 1),
+      files: await makeInventory(stage),
+    };
     await writeFile(join(stage, "manifest.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
     await chmod(join(stage, "manifest.json"), 0o600);
     await publishDirectory(stage, output);
@@ -268,7 +284,10 @@ export async function restoreAppData(backupDir: string, destinationDir: string):
     if (key) { await writeFile(join(stage, KEY_NAME), key, { mode: 0o600 }); await chmod(join(stage, KEY_NAME), 0o600); }
     if (await stat(join(bundle, "assets")).then(() => true, () => false)) await copyTree(join(bundle, "assets"), join(stage, "assets"));
     if (await stat(join(bundle, "dashboard-config.json")).then(() => true, () => false)) { await copyFile(join(bundle, "dashboard-config.json"), join(stage, "dashboard-config.json")); await chmod(join(stage, "dashboard-config.json"), 0o600); }
-    await rewriteDatabase(join(stage, DB_NAME), manifest.sourceAssetRoot, join(destination, "assets"));
+    const aliases = Array.isArray(manifest.sourceAssetAliases)
+      ? manifest.sourceAssetAliases.filter((alias): alias is string => typeof alias === "string")
+      : [];
+    await rewriteDatabase(join(stage, DB_NAME), [manifest.sourceAssetRoot, ...aliases], join(destination, "assets"));
     await publishDirectory(stage, destination);
     return { dbPath: join(destination, DB_NAME) };
   } catch (error) { await rm(stage, { recursive: true, force: true }).catch(() => undefined); throw error; }
