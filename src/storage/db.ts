@@ -1024,15 +1024,17 @@ export class DatabaseStore {
       );
     `);
 
-    const applied = this.db
-      .prepare("SELECT version FROM schema_migrations")
-      .all() as Array<{ version: number }>;
-    const appliedVersions = new Set(applied.map(({ version }) => version));
     const insertMigration = this.db.prepare(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     );
 
+    // Read the applied versions inside a write-locked transaction so another
+    // process opening the same database can't apply the same migration twice.
     const applyMigrations = this.db.transaction(() => {
+      const applied = this.db
+        .prepare("SELECT version FROM schema_migrations")
+        .all() as Array<{ version: number }>;
+      const appliedVersions = new Set(applied.map(({ version }) => version));
       for (const [version, sql] of [...MIGRATIONS].sort(
         (a, b) => a[0] - b[0],
       )) {
@@ -1042,7 +1044,7 @@ export class DatabaseStore {
         insertMigration.run(version, new Date().toISOString());
       }
     });
-    applyMigrations();
+    applyMigrations.immediate();
   }
 
   private backupBeforeMigrations(): void {
